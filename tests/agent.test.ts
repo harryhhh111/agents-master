@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type OpenAI from 'openai'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AgentCore, type AgentEvent } from '../src/agent/loop.js'
 import { executeTool, type ToolContext } from '../src/agent/tools.js'
 import type { AgentBackend, DetachedRunHandle } from '../src/backends/AgentBackend.js'
@@ -39,14 +39,15 @@ interface FakeReply {
 }
 
 /** 脚本化假 LLM：按队列依次返回响应，记录每次请求的 messages */
-function fakeLlm(replies: FakeReply[]) {
+function fakeLlm(replies: Array<FakeReply | (() => FakeReply)>) {
   const calls: OpenAI.Chat.ChatCompletionCreateParams[] = []
   const client = {
     chat: {
       completions: {
         create: async (req: OpenAI.Chat.ChatCompletionCreateParams) => {
           calls.push(structuredClone(req))
-          const reply = replies.shift()
+          const entry = replies.shift()
+          const reply = typeof entry === 'function' ? entry() : entry
           if (!reply) throw new Error('假 LLM 的响应队列已空')
           return {
             choices: [
@@ -402,5 +403,122 @@ describe('ledger', () => {
     expect(lines).toHaveLength(2)
     expect(JSON.parse(lines[0]!)).toMatchObject({ direction: 'user->codex', summary: '第一条' })
     expect(JSON.parse(lines[1]!)).toMatchObject({ pending: ['是否送审'] })
+  })
+})
+
+describe('run 完成自动注入', () => {
+  it('回合结束后 run 完成 → 注入通知并叫醒新回合', async () => {
+    let resolveDone!: (r: import('../src/backends/AgentBackend.js').AgentRunResult) => void
+    const donePromise = new Promise<import('../src/backends/AgentBackend.js').AgentRunResult>(
+      res => {
+        resolveDone = res
+      },
+    )
+    const deferredBackend: AgentBackend = {
+      name: 'kimi',
+      run: async () => {
+        throw new Error('测试只用 runDetached')
+      },
+      runDetached: (): DetachedRunHandle => ({
+        pid: 9999,
+        artifactStdoutPath: path.join(tmp, 'deferred-stdout.log'),
+        artifactStderrPath: path.join(tmp, 'deferred-stderr.log'),
+        done: donePromise,
+        cancel: () => {},
+      }),
+    }
+    const { client, calls } = fakeLlm([
+      { toolCalls: [{ id: 't1', name: 'run_kimi', args: JSON.stringify({ prompt: '干活' }) }] },
+      { content: '已派活，等完成通知' },
+      { content: '收到完成通知，验收通过' },
+    ])
+    const events: AgentEvent[] = []
+    const core = new AgentCore({
+      config: testConfig(),
+      projectName: 'proj',
+      llm: client,
+      backends: { kimi: deferredBackend, codex: deferredBackend },
+      stateDir: tmp,
+      askUser: async () => 'ok',
+      onEvent: e => events.push(e),
+    })
+
+    await core.handleUserMessage('派活给 kimi')
+    expect(calls).toHaveLength(2) // 第一回合正常结束，此时 run 还没完成
+
+    resolveDone({ stdout: '', stderr: '', exitCode: 0, durationMs: 5, sessionId: 's1', warnings: [] })
+
+    await vi.waitFor(() => expect(calls).toHaveLength(3))
+    const thirdCallMessages = calls[2]!.messages as Array<{ role: string; content?: unknown }>
+    const notice = thirdCallMessages.find(
+      m => m.role === 'user' && String(m.content).includes('[后台任务完成]'),
+    )
+    expect(notice).toBeTruthy()
+    expect(events.some(e => e.type === 'run_done')).toBe(true)
+    expect(events.some(e => e.type === 'text' && e.text.includes('验收通过'))).toBe(true)
+  })
+})
+
+describe('run 完成注入的消息顺序安全性', () => {
+  it('check_run 等待期间 run 完成 → 通知排在 tool 响应之后，不破坏 tool_calls 配对', async () => {
+    let resolveDone!: (r: import('../src/backends/AgentBackend.js').AgentRunResult) => void
+    const donePromise = new Promise<import('../src/backends/AgentBackend.js').AgentRunResult>(
+      res => {
+        resolveDone = res
+      },
+    )
+    const deferredBackend: AgentBackend = {
+      name: 'kimi',
+      run: async () => {
+        throw new Error('测试只用 runDetached')
+      },
+      runDetached: (): DetachedRunHandle => ({
+        pid: 8888,
+        artifactStdoutPath: path.join(tmp, 'mid-stdout.log'),
+        artifactStderrPath: path.join(tmp, 'mid-stderr.log'),
+        done: donePromise,
+        cancel: () => {},
+      }),
+    }
+    let core!: AgentCore
+    const { client, calls } = fakeLlm([
+      { toolCalls: [{ id: 't1', name: 'run_kimi', args: JSON.stringify({ prompt: '干活' }) }] },
+      () => ({
+        toolCalls: [
+          {
+            id: 't2',
+            name: 'check_run',
+            args: JSON.stringify({ runId: core.context.runs.list()[0]!.runId }),
+          },
+        ],
+      }),
+      { content: '验收通过' },
+    ])
+    const events: AgentEvent[] = []
+    core = new AgentCore({
+      config: testConfig(),
+      projectName: 'proj',
+      llm: client,
+      backends: { kimi: deferredBackend, codex: deferredBackend },
+      stateDir: tmp,
+      askUser: async () => 'ok',
+      onEvent: e => events.push(e),
+    })
+
+    const turn = core.handleUserMessage('派活给 kimi 并等它完成')
+    // 等到第二轮 LLM 已请求（check_run 工具正在 await done），再让 run 完成
+    await vi.waitFor(() => expect(calls.length).toBe(2))
+    resolveDone({ stdout: '', stderr: '', exitCode: 0, durationMs: 5, sessionId: 's2', warnings: [] })
+    await turn
+
+    expect(calls).toHaveLength(3)
+    expect(events.filter(e => e.type === 'error')).toEqual([])
+    const msgs = calls[2]!.messages as Array<{ role: string; tool_call_id?: string; content?: unknown }>
+    const toolIdx = msgs.findIndex(m => m.role === 'tool' && m.tool_call_id === 't2')
+    const noticeIdx = msgs.findIndex(
+      m => m.role === 'user' && String(m.content).includes('[后台任务完成]'),
+    )
+    expect(toolIdx).toBeGreaterThan(-1)
+    expect(noticeIdx).toBeGreaterThan(toolIdx) // 通知必须在 tool 响应之后
   })
 })

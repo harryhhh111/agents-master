@@ -67,13 +67,14 @@ export const toolDefinitions: OpenAI.Chat.ChatCompletionTool[] = [
     function: {
       name: 'check_run',
       description:
-        '查询 run_kimi/run_codex 启动的后台任务状态。支持长轮询：默认等待 wait_ms（30 秒）' +
-        '直到任务结束或超时再返回，不要密集轮询。返回退出码、耗时和 artifact 尾部。',
+        '查询 run_kimi/run_codex 启动的后台任务状态。进程一结束会立即返回（事件唤醒），' +
+        'wait_ms 只是任务未结束时的兜底等待：默认 300000（5 分钟），上限 600000（10 分钟）。' +
+        '任务未结束时不要密集调用，安心等。',
       parameters: {
         type: 'object',
         properties: {
           runId: { type: 'string', description: 'run_kimi/run_codex 返回的 runId' },
-          wait_ms: { type: 'number', description: '长轮询等待毫秒数，默认 30000，上限 120000' },
+          wait_ms: { type: 'number', description: '兜底等待毫秒数，默认 300000，上限 600000' },
         },
         required: ['runId'],
       },
@@ -221,7 +222,7 @@ async function runBackend(ctx: ToolContext, cli: CliName, prompt: string): Promi
       artifactStdoutPath: handle.artifactStdoutPath,
       artifactStderrPath: handle.artifactStderrPath,
       resumedSession: pin?.sessionId ?? null,
-      note: '任务已在后台运行，用 check_run 轮询；session 内对话用 read_session_updates 跟踪。',
+      note: '任务已在后台运行；完成时会自动收到 [后台任务完成] 通知，无需轮询。只有你主动想看进度时才用 check_run。',
     }),
     fullPath: handle.artifactStdoutPath,
   }
@@ -230,9 +231,10 @@ async function runBackend(ctx: ToolContext, cli: CliName, prompt: string): Promi
 async function checkRun(ctx: ToolContext, runId: string, waitMs?: number): Promise<ToolResult> {
   const record = ctx.runs.get(runId)
   if (!record) return { text: `错误: 未知 runId ${runId}` }
-  // 长轮询：任务还在跑就等到结束或 wait_ms 超时，避免密集轮询烧 token
+  // 长轮询：任务还在跑就等到结束或 wait_ms 兜底超时。done 一 resolve 立即返回，
+  // 所以默认 5 分钟的等待只在任务挂死时才会真的等满
   if (record.status === 'running') {
-    const wait = Math.min(Math.max(waitMs ?? 30_000, 0), 120_000)
+    const wait = Math.min(Math.max(waitMs ?? 300_000, 0), 600_000)
     await Promise.race([
       record.handle.done.catch(() => undefined),
       new Promise(resolve => setTimeout(resolve, wait)),

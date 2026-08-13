@@ -73,6 +73,15 @@ export function reduceChat(items: ChatItem[], action: ChatAction): ChatItem[] {
         }
         case 'ask':
           return [...items, { id, kind: 'ask', question: e.question, context: e.context }]
+        case 'run_done':
+          return [
+            ...items,
+            {
+              id,
+              kind: 'system',
+              text: `后台任务完成：${e.backend} run ${e.runId.slice(0, 8)} exit=${e.exitCode ?? '?'}${e.error ? ` error=${e.error}` : ''}`,
+            },
+          ]
         case 'error':
           return [...items, { id, kind: 'error', text: e.message }]
       }

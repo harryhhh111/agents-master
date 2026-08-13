@@ -16,6 +16,7 @@ const ev = (e: AgentEvent) => {
   else if (e.type === 'tool_start') console.log(`[${t}] TOOL→ ${e.name} ${JSON.stringify(e.args).slice(0, 200)}`)
   else if (e.type === 'tool_end') console.log(`[${t}] TOOL✓ ${e.name} ok=${e.ok} ${e.summary.slice(0, 200)}`)
   else if (e.type === 'ask') console.log(`\n[${t}] ASK: ${e.question}`)
+  else if (e.type === 'run_done') console.log(`[${t}] RUN_DONE: ${e.backend} ${e.runId.slice(0, 8)} exit=${e.exitCode ?? '?'}`)
   else console.log(`[${t}] ERROR: ${e.message}`)
 }
 

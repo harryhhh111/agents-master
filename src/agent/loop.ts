@@ -10,7 +10,7 @@ import { SessionReader } from '../sessions/reader.js'
 import { Ledger } from '../state/ledger.js'
 import { loadMemory } from '../state/memory.js'
 import { PinStore } from '../state/pins.js'
-import { RunRegistry } from '../state/runs.js'
+import { RunRegistry, type RunRecord } from '../state/runs.js'
 import { buildSystemPrompt } from './prompt.js'
 import { executeTool, toolDefinitions, type ToolContext } from './tools.js'
 
@@ -19,6 +19,7 @@ export type AgentEvent =
   | { type: 'tool_start'; name: string; args: unknown }
   | { type: 'tool_end'; name: string; ok: boolean; summary: string }
   | { type: 'ask'; question: string; context?: string } // ask_user 触发，UI 层负责拿答案
+  | { type: 'run_done'; runId: string; backend: string; exitCode?: number; error?: string } // 后台任务完成自动注入
   | { type: 'error'; message: string }
 
 export interface AgentCoreOptions {
@@ -34,7 +35,7 @@ export interface AgentCoreOptions {
   backends?: { kimi: AgentBackend; codex: AgentBackend }
 }
 
-// check_run 长轮询默认 30s/次，120 次迭代约可覆盖 1 小时级任务
+// check_run 默认兜底 5 分钟/次，120 次迭代足以覆盖小时级任务
 const MAX_ITERATIONS = 120
 const MAX_TOOL_RESULT_CHARS = 8000
 
@@ -83,6 +84,8 @@ export class AgentCore {
       reader: new SessionReader(stateDir),
       askUser: opts.askUser,
     }
+    // run 完成自动注入：进程退出 → 通知进对话流 → 若当前不在回合里就叫醒一个新回合
+    this.toolCtx.runs.onDone(record => this.onRunDone(record))
     this.messages = []
     // system prompt 由 memory 拼装（异步），首次 handleUserMessage 前完成
     const messages = this.messages
@@ -99,6 +102,13 @@ export class AgentCore {
   }
 
   private readonly systemReady: Promise<void>
+  /** 回合串行化：用户消息和 run 完成注入共用一条链，永不并发跑两个 loop */
+  private turnChain: Promise<void> = Promise.resolve()
+  private inLoop = false
+  /** loop 进行中到达的消息（run 完成通知 / 用户插话）：排队到安全点再入 messages。
+   * 安全点 = 一轮 tool 响应全部入列之后。直接在 tool 调用中途插入 user 消息会
+   * 破坏 "assistant(tool_calls) 后必须紧跟 tool 响应" 的 API 约束（400）。 */
+  private pendingNotices: string[] = []
 
   /** TUI 等前端读取 runs/pins/reader 等内部状态的只读入口 */
   get context(): ToolContext {
@@ -107,7 +117,60 @@ export class AgentCore {
 
   async handleUserMessage(text: string): Promise<void> {
     await this.systemReady
+    if (this.inLoop) {
+      // 用户随时插话：不中断进行中的 tool 轮次，排队到安全点吸收
+      this.pendingNotices.push(text)
+      return
+    }
     this.messages.push({ role: 'user', content: text })
+    return this.enqueueTurn()
+  }
+
+  private enqueueTurn(): Promise<void> {
+    const turn = this.turnChain.then(() => this.runLoop())
+    // 链本身永不 reject（runLoop 内部已把异常转成 error 事件），但调用方要拿到自己的回合
+    this.turnChain = turn.catch(() => undefined)
+    return turn
+  }
+
+  /** run 完成：通知注入 messages；若不在回合中则叫醒一个新回合让 agent 处理 */
+  private onRunDone(record: RunRecord): void {
+    const r = record.result
+    const notice =
+      `[后台任务完成] ${record.backend} run ${record.runId}：` +
+      `exitCode=${r?.exitCode ?? '(无)'}，耗时 ${r?.durationMs ?? '?'}ms` +
+      (r?.sessionId ? `，session=${r.sessionId}` : '') +
+      (r?.warnings?.length ? `，warnings=${r.warnings.join('；')}` : '') +
+      (record.error ? `，error=${record.error}` : '') +
+      `。artifact: ${record.handle.artifactStdoutPath}` +
+      `。当时派发的 prompt 开头：${record.prompt.slice(0, 100)}……` +
+      `。请验收结果、继续传话链或向用户汇报；如果你在本回合已经通过 check_run 处理过这次完成，忽略本通知，不要重复汇报。`
+    this.opts.onEvent({
+      type: 'run_done',
+      runId: record.runId,
+      backend: record.backend,
+      exitCode: r?.exitCode,
+      error: record.error,
+    })
+    if (this.inLoop) {
+      // loop 会在安全点 flush
+      this.pendingNotices.push(notice)
+    } else {
+      this.messages.push({ role: 'user', content: notice })
+      void this.enqueueTurn()
+    }
+  }
+
+  private flushNotices(): void {
+    for (const n of this.pendingNotices) {
+      this.messages.push({ role: 'user', content: n })
+    }
+    this.pendingNotices = []
+  }
+
+  private async runLoop(): Promise<void> {
+    await this.systemReady
+    this.inLoop = true
     try {
       for (let i = 0; i < MAX_ITERATIONS; i++) {
         const resp = await this.llm.chat.completions.create({
@@ -126,7 +189,14 @@ export class AgentCore {
           content: msg.content ?? null,
           tool_calls: msg.tool_calls,
         })
-        if (!msg.tool_calls || msg.tool_calls.length === 0) return
+        if (!msg.tool_calls || msg.tool_calls.length === 0) {
+          // 纯文本收尾前，若期间有 run 完成通知排队，flush 后再走一轮让 agent 处理
+          if (this.pendingNotices.length > 0) {
+            this.flushNotices()
+            continue
+          }
+          return
+        }
 
         for (const tc of msg.tool_calls) {
           if (tc.type !== 'function') continue
@@ -159,6 +229,8 @@ export class AgentCore {
             content: truncateToolResult(result, fullPath),
           })
         }
+        // 安全点：本轮全部 tool 响应已入列，flush 排队中的 run 完成通知
+        this.flushNotices()
       }
       this.opts.onEvent({
         type: 'error',
@@ -169,6 +241,8 @@ export class AgentCore {
         type: 'error',
         message: `loop 异常: ${e instanceof Error ? e.message : String(e)}`,
       })
+    } finally {
+      this.inLoop = false
     }
   }
 }
