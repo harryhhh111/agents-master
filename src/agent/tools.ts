@@ -66,10 +66,15 @@ export const toolDefinitions: OpenAI.Chat.ChatCompletionTool[] = [
     type: 'function',
     function: {
       name: 'check_run',
-      description: '查询 run_kimi/run_codex 启动的后台任务状态，返回退出码、耗时和 artifact 尾部。',
+      description:
+        '查询 run_kimi/run_codex 启动的后台任务状态。支持长轮询：默认等待 wait_ms（30 秒）' +
+        '直到任务结束或超时再返回，不要密集轮询。返回退出码、耗时和 artifact 尾部。',
       parameters: {
         type: 'object',
-        properties: { runId: { type: 'string', description: 'run_kimi/run_codex 返回的 runId' } },
+        properties: {
+          runId: { type: 'string', description: 'run_kimi/run_codex 返回的 runId' },
+          wait_ms: { type: 'number', description: '长轮询等待毫秒数，默认 30000，上限 120000' },
+        },
         required: ['runId'],
       },
     },
@@ -222,9 +227,17 @@ async function runBackend(ctx: ToolContext, cli: CliName, prompt: string): Promi
   }
 }
 
-async function checkRun(ctx: ToolContext, runId: string): Promise<ToolResult> {
+async function checkRun(ctx: ToolContext, runId: string, waitMs?: number): Promise<ToolResult> {
   const record = ctx.runs.get(runId)
   if (!record) return { text: `错误: 未知 runId ${runId}` }
+  // 长轮询：任务还在跑就等到结束或 wait_ms 超时，避免密集轮询烧 token
+  if (record.status === 'running') {
+    const wait = Math.min(Math.max(waitMs ?? 30_000, 0), 120_000)
+    await Promise.race([
+      record.handle.done.catch(() => undefined),
+      new Promise(resolve => setTimeout(resolve, wait)),
+    ])
+  }
   const artifactTail = await tailChars(record.handle.artifactStdoutPath, ARTIFACT_TAIL_CHARS)
   if (record.status === 'running') {
     return {
@@ -344,7 +357,11 @@ export async function executeTool(ctx: ToolContext, name: string, argsJson: stri
       case 'run_codex':
         return await runBackend(ctx, 'codex', String(args.prompt ?? ''))
       case 'check_run':
-        return await checkRun(ctx, String(args.runId ?? ''))
+        return await checkRun(
+          ctx,
+          String(args.runId ?? ''),
+          typeof args.wait_ms === 'number' ? args.wait_ms : undefined,
+        )
       case 'read_session_updates': {
         const cli = args.cli === 'kimi' || args.cli === 'codex' ? args.cli : null
         if (!cli) return { text: `错误: cli 必须是 "kimi" 或 "codex"，收到 ${String(args.cli)}` }

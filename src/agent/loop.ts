@@ -34,7 +34,8 @@ export interface AgentCoreOptions {
   backends?: { kimi: AgentBackend; codex: AgentBackend }
 }
 
-const MAX_ITERATIONS = 40
+// check_run 长轮询默认 30s/次，120 次迭代约可覆盖 1 小时级任务
+const MAX_ITERATIONS = 120
 const MAX_TOOL_RESULT_CHARS = 8000
 
 /** state 目录默认落在 agents-master 仓库内（src/agent/ → 上两级即仓库根） */
