@@ -1,0 +1,23 @@
+# agents-master 配置
+# 模型可随时换：loop 只依赖 OpenAI 兼容接口，key 只走环境变量 DEEPSEEK_API_KEY（.env）
+
+[llm]
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+
+# 放权等级：supervised = 所有软决策点也等用户拍板（v1 默认）
+# 以后可放宽，软决策点降级为"只报告不等待"；硬决策点任何等级都等用户
+[delegation]
+level = "supervised"
+
+# 项目注册表：path 是两个 CLI 共享的工作区
+[[projects]]
+name = "stock_data"
+path = "/home/vinci/projects/stock_data"
+
+# 驱动 codex 时的沙箱模式（安全相关默认值，改这里要过用户）
+[backends.codex]
+sandbox_mode = "workspace-write"
+
+[backends.kimi]
+# kimi 的 --prompt 与 --yolo 不兼容，自治执行靠它自己的配置文件

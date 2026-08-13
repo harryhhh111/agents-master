@@ -1,0 +1,34 @@
+{
+  "name": "agents-master",
+  "version": "0.1.0",
+  "description": "Personal relay agent driving codex-cli and Kimi Code",
+  "type": "module",
+  "bin": {
+    "agent": "./bin/agent.ts"
+  },
+  "scripts": {
+    "dev": "tsx ./bin/agent.ts",
+    "doctor": "tsx ./bin/agent.ts doctor",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "execa": "^10.0.1",
+    "ink": "^7.1.1",
+    "openai": "^7.4.0",
+    "react": "^19.2.8",
+    "smol-toml": "^1.8.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}
