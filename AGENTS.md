@@ -2,7 +2,8 @@
 
 个人 Agent 项目：一个带独立 LLM 大脑的 agent，驱动 codex-cli 和 Kimi Code 两个 CLI 协作，
 替代用户手工传话。背景与已敲定的技术决策见 `docs/discussion-summary-2026-08-12.md`，
-真实传话需求规格见 `docs/handoff-analysis/findings-2026-08-12.md`。
+真实传话需求规格见 `docs/handoff-analysis/findings-2026-08-12.md`，
+当前阶段与后续规划见 `docs/roadmap.md`。
 
 ## 行为规范
 
