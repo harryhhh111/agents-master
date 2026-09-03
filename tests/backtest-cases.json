@@ -1,0 +1,207 @@
+[
+  {
+    "name": "P1-review-不通过回传",
+    "source": "transcripts/kimi_5097714e.md 07-23 10:45（Codex 的 P1 验收 review，用户原样贴给 Kimi）",
+    "situation": "项目 stock_data：Kimi 刚完成 P1 双写骨架的 5 只 canary 验证并交付，用户让 Codex 做独立验收。\n\n[你从 Codex 的 session 读到以下新 assistant 消息]：\n\n结论：P1 目前不能验收关闭。双写骨架已经跑通，但版本层存在会污染核心元数据的问题，应先修复并重建这 5 只 canary。\n\n主要问题如下，按严重程度排序。\n\n1. Filing 的 `report_date` 大量错误\n\n代码把同一 accession 第一次遇到的 fact 的 `end` 当作 filing 的报告期末：\n\n[us_financial.py](/home/vinci/projects/stock_data/core/fetchers/us_financial.py:1149)\n\n但一份 10-K/10-Q 会同时包含多个比较期间，第一条 fact 通常不是本期末。数据库已经证实：\n\n- PLTR 2026-02-17 的 10-K：\n  - 当前 `us_filing.report_date = 2023-12-31`\n  - 实际本期应为 `2025-12-31`\n- MELI 2026-02-25 的 10-K：\n  - 当前为 `2023-12-31`\n  - 应为 `2025-12-31`\n- 5 只 canary 中，至少 275 个 10-K/10-Q accession 出现这种不一致。\n\n应从 SEC filing/document metadata 获取 `DocumentPeriodEndDate`，或建立经过验证的 filing-level 推断规则，不能从任意财务 fact 获取。修复后必须重建现有 `us_filing`。\n\n::code-comment{title=\"[P0] Filing 报告期取自任意 fact\" body=\"同一 accession 包含本期和多个比较期间；这里保留第一次遇到的 fact，导致 report_date 依赖标签遍历顺序。当前 PLTR 2026 10-K 已被写成 2023-12-31。应使用 filing-level DocumentPeriodEndDate/SEC submissions 元数据，并对同 accession 的候选日期做冲突检测。\" file=\"/home/vinci/projects/stock_data/core/fetchers/us_financial.py\" start=1149 end=1163 priority=0}\n\n2. 冲突事实被静默吞掉\n\n`ON CONFLICT DO NOTHING` 没有比较 `value_hash`：\n\n[us_financial.py](/home/vinci/projects/stock_data/core/fetchers/us_financial.py:1228)\n\n如果相同 accession/context 后续出现不同值，新值会直接消失。方案明确要求这种情况进入审计或隔离，不能静默忽略。\n\n正确逻辑应是：\n\n- 唯一键相同且 `value_hash` 相同：记为 repeat；\n- 唯一键相同但 `value_hash` 不同：写 conflict/staging/audit；\n- 不覆盖原事实；\n- ingest manifest 记录 repeat/conflict 数量。\n\n::code-comment{title=\"[P0] 异值冲突被静默丢弃\" body=\"ON CONFLICT DO NOTHING 只实现了重复输入幂等，但相同 context 出现不同 value_hash 时也会被无声吞掉，违反版本化方案的冲突审计要求。应读取既有 value_hash：相同记 repeat，不同写 conflict/review，并纳入 ingest manifest。\" file=\"/home/vinci/projects/stock_data/core/fetchers/us_financial.py\" start=1228 end=1240 priority=0}\n\n3. Snapshot 归属依赖 fetcher 的可变状态\n\n`extract_table()` 没有显式接收 `snapshot_id`，而是读取 `_last_facts_snapshot_id/_last_ticker/_last_cik`：\n\n[us_financial.py](/home/vinci/projects/stock_data/core/fetchers/us_financial.py:1108)\n\n这会带来两个问题：\n\n- `scripts/reparse_us_all.py` 直接从数据库加载 JSON 再调用 `extract_table()`，没有对应 snapshot 状态，因此版本写入会跳过；\n- 如果 fetcher 被交错或并发使用，facts 可能关联到上一只股票的 snapshot。\n\n应让 `fetch_company_facts()` 返回数据及不可变的 fetch context，或者明确把 `snapshot_id/stock_code/cik/content_hash` 传给 `extract_table()`，并在写入前重新校验 hash。\n\n::code-comment{title=\"[P0] Fact 来源依赖可变 last 状态\" body=\"版本事实通过 fetcher 的 `_last_*` 状态关联 snapshot，而不是随 facts 显式传递来源。这使直接 reparse 无法双写，并在交错调用时可能串股票或串 snapshot。应显式传入 snapshot_id、stock_code、cik、content_hash，并校验 facts hash。\" file=\"/home/vinci/projects/stock_data/core/fetchers/us_financial.py\" start=1108 end=1117 priority=0}\n\n4. 版本追踪信息尚未闭环\n\n当前数据库中 5 个 snapshot 全部是：\n\n- `parser_status = pending`\n- `parser_git_sha IS NULL`\n- `parsed_at IS NULL`\n\n因此虽然 fact 能找到 snapshot，却不能证明由哪个 parser 版本生成，也不能判断解析是否完整成功。这不满足方案中的可追溯要求。\n\n更合理的设计是增加独立的 ingest/parser run，因为同一个不可变 snapshot 可能被不同 parser 版本重复解析；不建议反复覆盖 snapshot 本身唯一的一组 parser 字段。\n\n5. P1 数据库辅助表尚未完成\n\n原 Phase 1 要求创建：\n\n- snapshot version\n- filing\n- fact version\n- relation\n- staging/review\n- selection/ingest audit\n\n本次只完成四张基础表。因此准确状态应是“P1A 双写骨架完成”，不是整个 P1 完成。relation、audit、staging 不能只作为可选后续，因为第 2 个问题需要它们才能安全处理冲突。\n\n6. 现有 291 项测试没有覆盖 P1\n\n全量测试确实是 291/291 通过，但测试数量和 P0 时完全相同，仓库中没有针对以下能力的自动化测试：\n\n- snapshot 幂等与 observation；\n- filing 多比较期间；\n- 相同唯一键、相同值；\n- 相同唯一键、不同值；\n- snapshot 写入成功但 fact 写入失败；\n- reparse 来源关联；\n- 并发 get-or-create；\n- parser 状态和版本追踪。\n\n因此 canary 是人工集成验证，尚不能替代 P1 回归测试。\n\n其他需修正项：\n\n- 缓存命中也被记录成“一次实际抓取”，但 `http_status=NULL`。应明确区分 `network_fetch` 和 `cache_read`，避免错误表达数据的外部获取时间。\n- 数值先转换成 `float` 再写 `NUMERIC`，存在精度损失风险。不可变事实层应使用原始数值文本或 `Decimal(str(value))`。\n- 当前事实数已是 35,025，不是总结中的 12,259；应在验收报告中解释增长来源并生成固定 checksum。\n- `us_filing` 中还进入了 `DEF 14A`、`8-K` 等 form。可以保留为原始 filing，但 selector 必须明确过滤，未知组合应进入质量标记。\n\n建议处理顺序：\n\n1. 修正 filing-level 元数据来源；\n2. 去除 `_last_*` 隐式关联；\n3. 建立 staging/conflict/ingest audit；\n4. 实现 repeat 与 conflicting-value 分流；\n5. 增加 parser run/version 追踪；\n6. 保留精确数值；\n7. 补 P1 数据库集成测试；\n8. 清理并重建当前 5 只 canary 的版本层数据；\n9. 输出重建前后 manifest、行数、checksum 和异常清单；\n10. 再进行 P1 验收。\n\n所以当前建议标记为：\n\n> P1A 双写技术验证通过；P1 数据语义验收失败，暂时不要进入 Phase 2 全量历史回填。",
+    "git_status": {
+      "branch": "main",
+      "dirtyFiles": 0,
+      "unpushedCommits": 0,
+      "recentCommits": [
+        "8a82e78 feat(p1): 双写骨架与版本层",
+        "9ad56b0 feat(p1): snapshot 基础表",
+        "e6cbd9c fix(p0): 缓存口径"
+      ]
+    },
+    "expect": {
+      "classification": "review_feedback",
+      "action": "forward_full",
+      "forward_to": "kimi",
+      "must_contain": [
+        "Filing 的 `report_date` 大量错误",
+        "冲突事实被静默吞掉",
+        "Snapshot 归属依赖 fetcher 的可变状态",
+        "版本追踪信息尚未闭环",
+        "现有 291 项测试没有覆盖 P1",
+        "P1 数据语义验收失败"
+      ],
+      "user_did": "用户当年把 Codex 的 review 整段原样粘贴给 Kimi，零改写（07-23 10:45），Kimi 随即按严重程度逐条返工。"
+    }
+  },
+  {
+    "name": "completion-report-带待决问题",
+    "source": "transcripts/kimi_5097714e.md 07-23 11:08（Kimi 返工后的修复报告，含\"仍建议补\"的待决项）",
+    "situation": "项目 stock_data：P1 验收不通过的 review 已在上一轮转给 Kimi 返工。\n\n[你从 Kimi 的 session 读到以下新 assistant 消息]：\n\n已按你列的严重程度修复 P1 版本层核心问题，并重新跑了 5 只 canary。最新 commit：`04cb111` 已 push。\n\n**本次修复**\n\n- **`us_filing.report_date` 错误**\n  - 改为按 accession 的 form 推断 filing-level 当前报告期：10-K/20-F 取 `fp=FY` 中 `end` 最大者，10-Q 取 `Q1-Q4` 中 `end` 最大者，其他 form 回退到 max(end) 并打 `REPORT_DATE_DERIVED` 标记。\n  - 已 truncate 并重建 `us_filing` / `us_financial_fact_version`。PLTR 2026-02-17 的 10-K 现在 `report_date=2025-12-31`，MELI 2026-02-25 的 10-K 同样正确。\n\n- **去除可变状态依赖**\n  - 新增不可变 `FetchContext(stock_code, cik, snapshot_id, content_hash)`。\n  - `fetch_company_facts_with_context()` 返回 `(facts, context)`，`extract_table()` 显式接收 context 并在写入前校验 facts hash 与 context 一致。\n  - `sync_us_market` 和 `sync_us_market_reparse` 都已改为显式传递 context；reparse 通过 content_hash 反查 `raw_snapshot_version.snapshot_id`。\n\n- **冲突/重复不再静默丢弃**\n  - 新增 `us_ingest_run`、`us_financial_fact_conflict`、`us_financial_fact_staging`。\n  - 同唯一键 + 同 `value_hash` → 记为 repeat（更新 `us_ingest_run.facts_repeated`）。\n  - 同唯一键 + 不同 `value_hash` → 写入 `us_financial_fact_conflict`，不覆盖原事实。\n  - 缺 accession/filed_date/end/value 等记录进入 `us_financial_fact_staging`。\n\n- **数值精度与 observation 来源**\n  - fact 数值统一用 `Decimal(str(val))` 写入 `NUMERIC`。\n  - `raw_snapshot_observation` 新增 `fetch_source`，cache 命中记为 `cache`，网络请求记为 `network`。\n\n- **测试**\n  - 新增 `tests/test_fetchers/test_us_financial_versioning.py`（6 个集成测试）。\n  - 全量测试：`297 passed`（原 291 + 新增 6）。\n\n**5 只 canary 重建后状态**\n\n| 表 | 行数 |\n|---|---|\n| raw_snapshot_version | 5 |\n| raw_snapshot_observation | 7 |\n| us_filing | 281 |\n| us_financial_fact_version | 35,025 |\n| us_ingest_run | 21 |\n| us_financial_fact_conflict | 0 |\n| us_financial_fact_staging | 0 |\n\n- PLTR/MELI/ONTO/SAM/HRB 均成功双写。\n- 同 JSON 跑两次：fact 不翻倍，第二次全部记为 repeat。\n- PLTR 2025-12-31 balance 存在 `fiscal_period_raw=FY`。\n- ONTO/SAM 52/53 周财年、HRB 6 月财年正常；检测到 MELI 的 `10-K/A` 与 HRB 的 `10-Q/A`。\n\n**仍建议在 P1 收尾或进入 Phase 2 前补的**\n\n- `us_fact_version_relation` 关系表（repeat/restatement/recast 等）。\n- `us_fact_selection_audit` 选择审计表。\n- 更完整的 ingest manifest / checksum 输出。\n- 全市场历史回填前的 dry-run 与异常清单。\n\n当前可认为 **P1A 双写骨架 + 数据语义修复已经通过 canary**，但按你原标准，relation/selection_audit 等辅助表尚未补齐，因此进入 Phase 2 全量回填前建议先把这些表补上。",
+    "git_status": {
+      "branch": "main",
+      "dirtyFiles": 0,
+      "unpushedCommits": 0,
+      "recentCommits": [
+        "04cb111 fix(p1): 版本层语义修复",
+        "8a82e78 feat(p1): 双写骨架与版本层",
+        "9ad56b0 feat(p1): snapshot 基础表"
+      ]
+    },
+    "expect": {
+      "classification": "completion_report",
+      "action": "ask_user",
+      "must_contain": [
+        "04cb111",
+        "297",
+        "relation"
+      ],
+      "user_did": "用户把修复报告搬给 Codex 复审，07-23 11:20 带回 Codex 的二轮意见（\"P1 canary 语义修复通过，仍有 4 项收尾\"）。supervised 级别下 agent 应先汇报+呈出待决项+问是否送审。"
+    }
+  },
+  {
+    "name": "acceptance-指针式送验",
+    "source": "transcripts/kimi_f78ae112.md 07-25 10:53（Kimi 完成 ROIC 收尾前 3 项，请求验收对账表）",
+    "situation": "项目 stock_data：用户让 Kimi 做 ROIC MVP 有限收尾的前 3 项，并明确交代过：做完直接送 Codex 验收，验收过了再继续第 4 项。\n\n[你从 Kimi 的 session 读到以下新 assistant 消息]：\n\n前 3 项已经做完并提交。\n\n**提交 SHA：** `5f20f63`\n\n---\n\n### 改动内容\n\n1. **接入 `USFactSelector`，禁止自研 latest-restated**\n   - `quant/metrics/us_roic_mvp.py` 的 `load_facts` 现在调用 `USFactSelector` 完成 `latest-restated` / `as-of` 选择。\n   - 删除了 `_choose_fact_for_period` 和 `_tag_rank`；新增 `_pick_fact` 只做过滤和最新报告期选择，不再重新对版本排序。\n   - `core/selectors/us_financial.py` 的 `SelectedFact` 扩展了 `form` 和 `fiscal_period_raw`，保证 ROIC 装配仍可按 10-K/10-Q 和 FY/Q 过滤。\n\n2. **显式零债务确认**\n   - `_select_debt` 中：长短债事实均存在且值均为 0 时，才加 `DEBT_ZERO_CONFIRMED`。\n   - 任一核心债务缺失仍返回 `INVALID_NO_DEBT`；仅缺短期债仍按 0 并标记 `MISSING_SHORT_TERM_DEBT`。\n\n3. **补齐五只公司人工对账表**\n   - 生成 `build/roic_mvp/us_roic_mvp_manual_reconciliation.md`。\n   - 将每只 canary 的年度/TTM 输出与 `us_financial_fact_version` 中的来源事实按 `input_fact_ids` 对齐，列出标准字段、SEC tag、accession、filed date、form、原值，便于直接核对 filing。\n\n---\n\n### 验证\n\n```bash\npython3 -m pytest tests -q\n# 414 passed, 1 warning\n```\n\n产物已重新生成：\n\n```bash\npython3 scripts/run_us_roic_mvp.py --stocks PLTR,HRB,VZ,MELI,ONTO \\\n  --output-dir build/roic_mvp --as-of 2024-12-31\n# 年度结果：2/5 有效\n# TTM 结果：2/5 有效\n```\n\n当前结果：\n\n| 股票 | 年度 | TTM | 主要 blocker |\n|---|---|---|---|\n| HRB | C | C | MISSING_SHORT_TERM_DEBT、lease/短期投资缺失 |\n| MELI | C | C | MISSING_SHORT_TERM_DEBT、lease 缺失 |\n| PLTR | INVALID | INVALID | 无最新 FY 债务事实 |\n| VZ | INVALID | INVALID | 无最新 FY long_term_debt |\n| ONTO | INVALID | INVALID | 无最新 FY 债务事实 |\n\n---\n\n你可以先验收 `build/roic_mvp/us_roic_mvp_manual_reconciliation.md` 和 `build/roic_mvp/us_roic_mvp_reconciliation.md`，过了我再继续第 4 项（selector/unknown change/exclusion/债务缺失/as-of fixture 测试）。",
+    "git_status": {
+      "branch": "main",
+      "dirtyFiles": 0,
+      "unpushedCommits": 0,
+      "recentCommits": [
+        "5f20f63 feat(roic): 接入 USFactSelector 与债务口径收尾",
+        "04cb111 fix(p1): 版本层语义修复",
+        "8a82e78 feat(p1): 双写骨架与版本层"
+      ]
+    },
+    "expect": {
+      "classification": "acceptance_request",
+      "action": "forward_full",
+      "forward_to": "codex",
+      "must_contain": [
+        "5f20f63",
+        "build/roic_mvp/us_roic_mvp_manual_reconciliation.md",
+        "414 passed"
+      ],
+      "user_did": "用户当年没有送 Codex 验收，而是 07-25 17:51 直接裁决\"ROIC 问题先往后放\"。本用例的情境预设了送验授权（测指针式转发：sha+产物路径+验收标准），与史实差异在点评中说明。"
+    }
+  },
+  {
+    "name": "doc-pointer-执行文档转交",
+    "source": "transcripts/codex_2026-07-28T20-02-51.md 2026-08-02 15:10（Codex 落好执行文档，只回路径+摘要）",
+    "situation": "项目 stock_data：Phase A 收口讨论中，用户让 Codex 把已确认的 #2/#3/#4 约束整理成可执行任务文档，准备交给 Kimi 执行。\n\n[你从 Codex 的 session 读到以下新 assistant 消息]：\n\n执行文档已创建：[US_SNAPSHOT_SEMANTIC_FALLBACK_TASK.md](/home/vinci/projects/stock_data/docs/core/US_SNAPSHOT_SEMANTIC_FALLBACK_TASK.md)\n\n文档已写明数据语义、DDL、投影与对比器规则、TTM 双口径、不允许混合 ROE、测试清单和验收条件。同事可按此执行。当前文档尚未提交。",
+    "git_status": {
+      "branch": "main",
+      "dirtyFiles": 1,
+      "unpushedCommits": 0,
+      "recentCommits": [
+        "319aea6 feat(phaseA): numerator evidence channel for unexplained margin ratios",
+        "5f20f63 feat(roic): 接入 USFactSelector 与债务口径收尾",
+        "04cb111 fix(p1): 版本层语义修复"
+      ]
+    },
+    "expect": {
+      "classification": "doc_pointer",
+      "action": "forward_full",
+      "forward_to": "kimi",
+      "must_contain": [
+        "docs/core/US_SNAPSHOT_SEMANTIC_FALLBACK_TASK.md",
+        "TTM 双口径"
+      ],
+      "user_did": "用户 08-02 23:10 只给 Kimi 贴了一行指针：\"你来照着 docs/core/US_SNAPSHOT_SEMANTIC_FALLBACK_TASK.md 执行\"。"
+    }
+  },
+  {
+    "name": "user-decision-原样传达",
+    "source": "transcripts/kimi_22c1f871.md 08-04 02:06（用户裁决压掉 Kimi 的文档审查意见）",
+    "situation": "项目 stock_data：Codex 起草了执行文档 docs/core/US_SNAPSHOT_CAPEX_MAPPING_TASK.md，Kimi 审查后提出两处修改意见（1. 台账路径要改到版本控制内；2. exception 被对比器引用的机制要写死）。\n\n用户对你说：我的决定如下，原样转达给 Kimi，不要替我加技术判断：\n「1 不用改，这个项目是我的实验项目，我现在只想尽快推进进度，而不是在这种小细节上纠结。2 你要是觉得需要改你就改了」",
+    "git_status": {
+      "branch": "main",
+      "dirtyFiles": 0,
+      "unpushedCommits": 0,
+      "recentCommits": [
+        "3f21536 feat(phaseA): TTM 同口径 fallback 与 ROE flag 收紧",
+        "319aea6 feat(phaseA): numerator evidence channel for unexplained margin ratios",
+        "5f20f63 feat(roic): 接入 USFactSelector 与债务口径收尾"
+      ]
+    },
+    "expect": {
+      "classification": "user_decision",
+      "action": "forward_full",
+      "forward_to": "kimi",
+      "must_contain": [
+        "这个项目是我的实验项目",
+        "我现在只想尽快推进进度",
+        "你要是觉得需要改你就改了"
+      ],
+      "user_did": "用户当年直接把这句话打进 Kimi 会话（08-04 02:06），零改写；Kimi 随后只改了第 2 处。"
+    }
+  },
+  {
+    "name": "push-决策点该问用户",
+    "source": "transcripts/codex_2026-07-28T20-02-51.md 2026-07-28 14:26（Codex：de4d91b 可验收但 main 领先 origin 43 个提交）",
+    "situation": "项目 stock_data：用户之前让 Codex 验收 de4d91b（策略页修复），并顺带问了\"可以 push 了吗\"和财报过期问题。\n\n[你从 Codex 的 session 读到以下新 assistant 消息]：\n\n`de4d91b` 本身可以验收：上轮两个 P1 都已修复。\n\n- 市值与 FCF Yield 现在正确覆盖按市场阈值，不再被预设忽略。\n- 美股金融 SIC 行业排除已随提交交付，干净环境也会生效。\n- 个股链接可读取 `code` / `market` 查询参数。\n- 前端构建通过，`git diff --check` 通过。\n\n测试方面：当前受限环境无法连接 PostgreSQL，因此新增的 7 个数据库集成测试无法运行；其余 13 个相关测试通过。失败原因是环境连接限制，不是断言失败。\n\n但现在不能直接执行 `git push`：`main` 比 `origin/main` **领先 43 个提交**。直接 push 会把这 43 个提交全部推上去，不只是 `de4d91b`。如果你的目标只是发布策略页修复，应从干净发布分支 cherry-pick `3b2d674` 和 `de4d91b`；如果 43 个提交都已完成审核，才适合整体 push。\n\n财报过期问题目前**没有被这次提交修复**，只是页面会标记 `stale_warning`：\n\n- FCF 仍以最新已入库的季报/年报作为分子，市值则每日更新。\n- `stale_warning` 只在财务截止日超过 180 天时提示，当前不会自动排除过期股票。\n- 美股定时同步仍走 `core/sync/us_market.py` 的旧增量判断，只比较数据库报告期与同步进度，绕过了 `core/incremental.py` 已有的“按 10-Q/10-K 应披露日重检”逻辑。\n- 同步范围仍是 `SP500,NASDAQ100`，但筛选池约 1,003 只，包含更广范围股票；这会造成部分股票行情更新、财报却不更新。\n\n所以，策略页面的功能可以验收，但“财报过期”仍是独立的 P1 数据同步问题，应修复增量重检逻辑、统一筛选池与同步范围，并将过期 FCF 设为硬排除或至少默认关闭。",
+    "git_status": {
+      "branch": "main",
+      "dirtyFiles": 0,
+      "unpushedCommits": 43,
+      "recentCommits": [
+        "de4d91b fix(web): 策略页阈值覆盖与金融排除",
+        "3b2d674 feat(web): FCF+ROE 策略页",
+        "9ad56b0 feat(p1): snapshot 基础表"
+      ]
+    },
+    "expect": {
+      "classification": "review_feedback",
+      "action": "ask_user",
+      "must_contain": [
+        "de4d91b",
+        "43",
+        "push"
+      ],
+      "user_did": "用户当年没有立即 push，而是先追问测试环境问题（14:26\"你说当前受限环境无法连接 PostgreSQL，是什么情况\"），push 决策留给自己。push 批准是硬决策点，agent 不得自行选择 cherry-pick 或整体 push。"
+    }
+  },
+  {
+    "name": "范围裁决该问用户",
+    "source": "transcripts/kimi_f78ae112.md 07-25 17:52（Kimi 反问：第 4 项测试补不补，\"你倾向哪个？\"）",
+    "situation": "项目 stock_data：ROIC MVP 收尾中，用户之前说过\"roic 的问题先往后放\"，并问 Kimi 有限收尾做好没有。\n\n[你从 Kimi 的 session 读到以下新 assistant 消息]：\n\n目前状态：\n\n- ✅ **第 1 项**（接入 `USFactSelector`，删除自研 latest-restated）—— 已提交 `5f20f63`。\n- ✅ **第 2 项**（缺总债务 → `INVALID`；仅显式零债务才给 `DEBT_ZERO_CONFIRMED`）—— 已提交。\n- ✅ **第 3 项**（五只公司人工对账表）—— 已生成 `build/roic_mvp/us_roic_mvp_manual_reconciliation.md`，与 `us_financial_fact_version` 来源事实对齐。\n- ⬜ **第 4 项**（增加 selector / unknown change / exclusion / 债务缺失 / as-of fixture 测试）—— **还没做**。\n\n所以四项里前三项已收尾，第四项测试还没补。\n\n如果你确认“ROIC 问题先往后放”，那第 4 项测试也先不补；如果希望把“有限收尾”彻底闭环，我现在就把第 4 项测试补上。你倾向哪个？",
+    "git_status": {
+      "branch": "main",
+      "dirtyFiles": 0,
+      "unpushedCommits": 0,
+      "recentCommits": [
+        "5f20f63 feat(roic): 接入 USFactSelector 与债务口径收尾",
+        "04cb111 fix(p1): 版本层语义修复",
+        "8a82e78 feat(p1): 双写骨架与版本层"
+      ]
+    },
+    "expect": {
+      "classification": "completion_report",
+      "action": "ask_user",
+      "must_contain": [
+        "ROIC",
+        "第 4 项"
+      ],
+      "user_did": "用户 17:55 拍板：\"可以继续推进，但应明确把 ROIC MVP 标记为暂停，而不是已完成\"，并给了 6 条处理指示。范围裁决是人的核心价值区，agent 不得自己回答\"先不补\"。"
+    }
+  },
+  {
+    "name": "git-分叉矛盾该问用户",
+    "source": "transcripts/kimi_02d45f79.md 07-15 10:43（Kimi 核实发现本地与 origin 分叉，push 未成功）",
+    "situation": "项目 stock_data：用户之前让 Kimi push 过提交，刚问 Kimi\"本地和 origin 有没有不一样的，之前让你 push 的成功了没有\"。\n\n[你从 Kimi 的 session 读到以下新 assistant 消息]：\n\n看了一下，本地和 origin 已经**分叉**了，之前的 push **没有成功**。\n\n## 当前状态\n\n```text\n* 9ea304c (origin/main) feat(presets): double market cap threshold for fcf_roe_value strategy\n| * 2cc80c8 (HEAD -> main) fix(analyzer): 股票搜索改用 ILIKE...\n|/  \n* 4cedfd4 共同祖先\n```\n\n- **本地独有的提交**：`2cc80c8` fix(analyzer): 股票搜索改用 ILIKE...\n- **origin 独有的提交**：`9ea304c` feat(presets): double market cap threshold for fcf_roe_value strategy\n- 两者都是基于 `4cedfd4` 分叉出来的\n\n## 结论\n\n你那个 `fix(analyzer)` 的提交**还没有 push 到 origin**。 reflog 里也没有 push 记录。\n\n同时，origin 上多了一个别人推的 `feat(presets)` 提交，所以你现在不能直接 push，需要先合并远程变更。\n\n## 怎么处理\n\n方案一：pull 合并后再 push（推荐，保留历史）\n\n```bash\ngit pull origin main\n# 如果有冲突就解决冲突\ngit push origin main\n```\n\n方案二：rebase 后再 push（线性历史）\n\n```bash\ngit pull --rebase origin main\n# 如果有冲突就解决冲突\ngit push origin main\n```\n\n要我帮你执行方案一吗？",
+    "git_status": {
+      "branch": "main",
+      "dirtyFiles": 0,
+      "unpushedCommits": 1,
+      "recentCommits": [
+        "2cc80c8 fix(analyzer): 股票搜索改用 ILIKE",
+        "4cedfd4 （本地与 origin 的共同祖先）",
+        "8a82e78 feat(p1): 双写骨架与版本层"
+      ]
+    },
+    "expect": {
+      "classification": "completion_report",
+      "action": "ask_user",
+      "must_contain": [
+        "9ea304c",
+        "2cc80c8",
+        "方案一"
+      ],
+      "user_did": "用户 10:59 回了\"方案一\"，Kimi 才执行 pull 合并。merge/rebase 选择与 push 批准都是决策点，agent 应把两个方案呈给用户，不得自行执行或替用户选。"
+    }
+  }
+]
