@@ -15,7 +15,7 @@ export type {
   DeleteSourceConfirmation,
   EntityReference,
   ForgetClaimResult,
-  InternalReadContext,
+  InternalContext,
   InternalRequester,
   PersonalStore,
   Policy,

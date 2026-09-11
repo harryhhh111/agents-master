@@ -14,7 +14,7 @@ import type {
   DeleteSourceConfirmation,
   EntityReference,
   ForgetClaimResult,
-  InternalReadContext,
+  InternalContext,
   PersonalStore,
   Policy,
   PolicyId,
@@ -109,7 +109,7 @@ function requireValidWindow(validFrom: string, validUntil: string | undefined): 
   }
 }
 
-function isAllowed(boundary: AccessBoundary, context: InternalReadContext): boolean {
+function isAllowed(boundary: AccessBoundary, context: InternalContext): boolean {
   if (!context || typeof context !== 'object' || !context.requester || typeof context.requester !== 'object') {
     return false
   }
@@ -127,9 +127,16 @@ function isAllowed(boundary: AccessBoundary, context: InternalReadContext): bool
     && boundary.domainAgents.includes(requester.id)
 }
 
+function requireAuthorized(record: { id: string; accessBoundary: AccessBoundary }, context: InternalContext, operation: string): void {
+  if (!isAllowed(record.accessBoundary, context)) {
+    throw new Error(`${operation} is not authorized for this context: ${record.id}`)
+  }
+}
+
 /**
  * SQLite implementation of the personal-agent cognitive data store.
- * It intentionally supplies no mutation APIs beyond creation in this slice.
+ * Lifecycle mutations (correction, forgetting, deletion) require an authorized
+ * caller context; deletion is additionally gated by a two-step preview and confirm.
  */
 export class SQLitePersonalStore implements PersonalStore {
   readonly #db: DatabaseSync
@@ -211,7 +218,7 @@ export class SQLitePersonalStore implements PersonalStore {
     return source
   }
 
-  getSource(id: SourceId, context: InternalReadContext): SourceView | undefined {
+  getSource(id: SourceId, context: InternalContext): SourceView | undefined {
     const source = this.#findSourceSummary(id)
     if (!source || !isAllowed(source.accessBoundary, context)) return undefined
     if (context.requester.kind === 'main' && context.requester.access === 'summary') return source
@@ -255,12 +262,12 @@ export class SQLitePersonalStore implements PersonalStore {
     return claim
   }
 
-  getClaim(id: ClaimId, context: InternalReadContext): Claim | undefined {
+  getClaim(id: ClaimId, context: InternalContext): Claim | undefined {
     const claim = this.#findClaim(id)
     return claim && isAllowed(claim.accessBoundary, context) ? claim : undefined
   }
 
-  listActiveClaims(context: InternalReadContext, asOf = now()): Claim[] {
+  listActiveClaims(context: InternalContext, asOf = now()): Claim[] {
     requireIsoTime(asOf, 'asOf')
     const rows = this.#db.prepare(
       "SELECT * FROM claims WHERE status IN ('active', 'superseded') AND valid_from <= ? AND (valid_until IS NULL OR valid_until > ?) ORDER BY valid_from, id",
@@ -268,7 +275,7 @@ export class SQLitePersonalStore implements PersonalStore {
     return rows.map(row => this.#claimFromRow(row)).filter(claim => isAllowed(claim.accessBoundary, context))
   }
 
-  correctClaim(id: ClaimId, input: CorrectClaimInput): ClaimCorrection {
+  correctClaim(id: ClaimId, input: CorrectClaimInput, context: InternalContext): ClaimCorrection {
     requireText(input.statement, 'statement')
     if (input.epistemicState !== 'user-fact' && input.epistemicState !== 'model-inference') {
       throw new Error('epistemicState must be user-fact or model-inference; unknown is not a Claim')
@@ -283,6 +290,7 @@ export class SQLitePersonalStore implements PersonalStore {
     const previous = this.#findClaim(id)
     if (!previous) throw new Error(`Claim does not exist: ${id}`)
     if (previous.status !== 'active') throw new Error(`Only an active Claim can be corrected: ${id}`)
+    requireAuthorized(previous, context, 'Claim correction')
     if (input.effectiveAt <= previous.validFrom) {
       throw new Error('effectiveAt must be after the existing Claim validFrom')
     }
@@ -294,6 +302,8 @@ export class SQLitePersonalStore implements PersonalStore {
     }
 
     return this.#transaction(() => {
+      const policiesToRetract = this.#activePoliciesDependingOn(new Set([previous.id]))
+      for (const policy of policiesToRetract) requireAuthorized(policy, context, 'Claim correction')
       const replacement: Claim = {
         id: randomUUID(),
         statement: input.statement,
@@ -318,7 +328,7 @@ export class SQLitePersonalStore implements PersonalStore {
         WHERE id = ?
       `).run(input.effectiveAt, replacement.id, previous.id)
       this.#insertClaim(replacement)
-      const retractedPolicies = this.#activePoliciesDependingOn(new Set([previous.id])).map(policy => {
+      const retractedPolicies = policiesToRetract.map(policy => {
         const retracted: Policy = { ...policy, status: 'retracted' }
         this.#db.prepare("UPDATE policies SET status = 'retracted' WHERE id = ?").run(policy.id)
         return retracted
@@ -327,15 +337,18 @@ export class SQLitePersonalStore implements PersonalStore {
     })
   }
 
-  forgetClaim(id: ClaimId): ForgetClaimResult {
+  forgetClaim(id: ClaimId, context: InternalContext): ForgetClaimResult {
     const claim = this.#findClaim(id)
     if (!claim) throw new Error(`Claim does not exist: ${id}`)
     if (claim.status !== 'active') throw new Error(`Only an active Claim can be forgotten: ${id}`)
+    requireAuthorized(claim, context, 'Claim forget')
 
     return this.#transaction(() => {
+      const policiesToInvalidate = this.#activePoliciesDependingOn(new Set([id]))
+      for (const policy of policiesToInvalidate) requireAuthorized(policy, context, 'Claim forget')
       const forgottenClaim: Claim = { ...claim, status: 'forgotten' }
       this.#db.prepare("UPDATE claims SET status = 'forgotten' WHERE id = ?").run(id)
-      const invalidatedPolicies = this.#activePoliciesDependingOn(new Set([id])).map(policy => {
+      const invalidatedPolicies = policiesToInvalidate.map(policy => {
         const invalidated: Policy = { ...policy, status: 'forgotten' }
         this.#db.prepare("UPDATE policies SET status = 'forgotten' WHERE id = ?").run(policy.id)
         return invalidated
@@ -374,12 +387,12 @@ export class SQLitePersonalStore implements PersonalStore {
     return policy
   }
 
-  getPolicy(id: PolicyId, context: InternalReadContext): Policy | undefined {
+  getPolicy(id: PolicyId, context: InternalContext): Policy | undefined {
     const policy = this.#findPolicy(id)
     return policy && isAllowed(policy.accessBoundary, context) ? policy : undefined
   }
 
-  listActivePolicies(context: InternalReadContext, asOf = now()): Policy[] {
+  listActivePolicies(context: InternalContext, asOf = now()): Policy[] {
     requireIsoTime(asOf, 'asOf')
     const rows = this.#db.prepare(
       "SELECT * FROM policies WHERE status = 'active' AND valid_from <= ? AND (valid_until IS NULL OR valid_until > ?) ORDER BY valid_from, id",
@@ -390,10 +403,11 @@ export class SQLitePersonalStore implements PersonalStore {
       .filter(policy => isAllowed(policy.accessBoundary, context))
   }
 
-  forgetPolicy(id: PolicyId): Policy {
+  forgetPolicy(id: PolicyId, context: InternalContext): Policy {
     const policy = this.#findPolicy(id)
     if (!policy) throw new Error(`Policy does not exist: ${id}`)
     if (policy.status !== 'active') throw new Error(`Only an active Policy can be forgotten: ${id}`)
+    requireAuthorized(policy, context, 'Policy forget')
     const forgotten: Policy = { ...policy, status: 'forgotten' }
     this.#db.prepare("UPDATE policies SET status = 'forgotten' WHERE id = ?").run(id)
     return forgotten
@@ -428,16 +442,16 @@ export class SQLitePersonalStore implements PersonalStore {
     return task
   }
 
-  getTask(id: TaskId, context: InternalReadContext): Task | undefined {
+  getTask(id: TaskId, context: InternalContext): Task | undefined {
     const task = this.#findTask(id)
     return task && isAllowed(task.accessBoundary, context) ? task : undefined
   }
 
-  previewSourceDeletion(id: SourceId, context: InternalReadContext): SourceDeletionPreview | undefined {
+  previewSourceDeletion(id: SourceId, context: InternalContext): SourceDeletionPreview | undefined {
     return this.#sourceDeletionPreviewForContext(id, context)
   }
 
-  deleteSource(id: SourceId, context: InternalReadContext, confirmation: DeleteSourceConfirmation): SourceDeletionResult {
+  deleteSource(id: SourceId, context: InternalContext, confirmation: DeleteSourceConfirmation): SourceDeletionResult {
     if (!confirmation || confirmation.confirm !== true) {
       throw new Error('Source deletion requires { confirm: true }')
     }
@@ -549,7 +563,7 @@ export class SQLitePersonalStore implements PersonalStore {
    * with respect to their read boundaries. Returning a partial preview would
    * both conceal a mutation and let the subsequent deletion bypass that boundary.
    */
-  #sourceDeletionPreviewForContext(id: SourceId, context: InternalReadContext): SourceDeletionPreview | undefined {
+  #sourceDeletionPreviewForContext(id: SourceId, context: InternalContext): SourceDeletionPreview | undefined {
     const source = this.#findSourceSummary(id)
     if (!source) throw new Error(`Source does not exist: ${id}`)
     if (!isAllowed(source.accessBoundary, context)) return undefined
@@ -586,7 +600,7 @@ export class SQLitePersonalStore implements PersonalStore {
     }
   }
 
-  #sourceViewForContext(source: SourceSummaryView, context: InternalReadContext): SourceView {
+  #sourceViewForContext(source: SourceSummaryView, context: InternalContext): SourceView {
     if (context.requester.kind === 'main' && context.requester.access === 'summary') return source
     const row = this.#db.prepare('SELECT raw_content FROM sources WHERE id = ?').get(source.id) as { raw_content: string } | undefined
     if (!row) throw new Error(`Source does not exist: ${source.id}`)

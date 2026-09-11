@@ -100,10 +100,11 @@ export type InternalRequester =
   | { kind: 'domain-agent'; id: string }
 
 /**
- * Every read must name an internal requester and whether it is used to build
- * task context. There is intentionally no external requester variant.
+ * Every read and lifecycle mutation must name an internal requester and
+ * whether it is used to build task context. There is intentionally no
+ * external requester variant.
  */
-export interface InternalReadContext {
+export interface InternalContext {
   requester: InternalRequester
   use: 'general' | 'task'
 }
@@ -161,20 +162,23 @@ export interface SourceDeletionResult {
 
 export interface PersonalStore {
   createSource(input: CreateSourceInput): Source
-  getSource(id: SourceId, context: InternalReadContext): SourceView | undefined
+  getSource(id: SourceId, context: InternalContext): SourceView | undefined
   createClaim(input: CreateClaimInput): Claim
-  getClaim(id: ClaimId, context: InternalReadContext): Claim | undefined
-  listActiveClaims(context: InternalReadContext, asOf?: string): Claim[]
-  correctClaim(id: ClaimId, input: CorrectClaimInput): ClaimCorrection
-  forgetClaim(id: ClaimId): ForgetClaimResult
+  getClaim(id: ClaimId, context: InternalContext): Claim | undefined
+  listActiveClaims(context: InternalContext, asOf?: string): Claim[]
+  /** Throws when the Claim, or any Policy cascaded by the correction, is outside the caller's boundary. */
+  correctClaim(id: ClaimId, input: CorrectClaimInput, context: InternalContext): ClaimCorrection
+  /** Throws when the Claim, or any Policy cascaded by the forget, is outside the caller's boundary. */
+  forgetClaim(id: ClaimId, context: InternalContext): ForgetClaimResult
   createPolicy(input: CreatePolicyInput): Policy
-  getPolicy(id: PolicyId, context: InternalReadContext): Policy | undefined
-  listActivePolicies(context: InternalReadContext, asOf?: string): Policy[]
-  forgetPolicy(id: PolicyId): Policy
+  getPolicy(id: PolicyId, context: InternalContext): Policy | undefined
+  listActivePolicies(context: InternalContext, asOf?: string): Policy[]
+  /** Throws when the Policy is outside the caller's boundary. */
+  forgetPolicy(id: PolicyId, context: InternalContext): Policy
   createTask(input: CreateTaskInput): Task
-  getTask(id: TaskId, context: InternalReadContext): Task | undefined
+  getTask(id: TaskId, context: InternalContext): Task | undefined
   /** Returns undefined when any record the deletion would expose or mutate is inaccessible. */
-  previewSourceDeletion(id: SourceId, context: InternalReadContext): SourceDeletionPreview | undefined
-  deleteSource(id: SourceId, context: InternalReadContext, confirmation: DeleteSourceConfirmation): SourceDeletionResult
+  previewSourceDeletion(id: SourceId, context: InternalContext): SourceDeletionPreview | undefined
+  deleteSource(id: SourceId, context: InternalContext, confirmation: DeleteSourceConfirmation): SourceDeletionResult
   close(): void
 }

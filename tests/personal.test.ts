@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   SQLitePersonalStore,
   type AccessBoundary,
-  type InternalReadContext,
+  type InternalContext,
 } from '../src/personal/index.js'
 
 const accessBoundary: AccessBoundary = {
@@ -16,9 +16,9 @@ const accessBoundary: AccessBoundary = {
   allowExternalDisclosure: false,
 }
 
-const fullMain: InternalReadContext = { requester: { kind: 'main', access: 'full' }, use: 'general' }
-const summaryMain: InternalReadContext = { requester: { kind: 'main', access: 'summary' }, use: 'general' }
-const relationshipAgent: InternalReadContext = {
+const fullMain: InternalContext = { requester: { kind: 'main', access: 'full' }, use: 'general' }
+const summaryMain: InternalContext = { requester: { kind: 'main', access: 'summary' }, use: 'general' }
+const relationshipAgent: InternalContext = {
   requester: { kind: 'domain-agent', id: 'relationships' },
   use: 'general',
 }
@@ -392,7 +392,7 @@ describe('SQLitePersonalStore', () => {
       effectiveAt: '2026-09-10T09:00:00.000Z',
       evidenceIds: [correctionSource.id],
       accessBoundary,
-    })).toThrow('effectiveAt must be after')
+    }, relationshipAgent)).toThrow('effectiveAt must be after')
 
     const correction = store.correctClaim(original.id, {
       statement: '用户偏好周五考虑周末安排。',
@@ -401,7 +401,7 @@ describe('SQLitePersonalStore', () => {
       effectiveAt: '2026-09-11T09:00:00.000Z',
       evidenceIds: [correctionSource.id],
       accessBoundary,
-    })
+    }, relationshipAgent)
 
     expect(correction.supersededClaim).toMatchObject({
       id: original.id,
@@ -465,7 +465,7 @@ describe('SQLitePersonalStore', () => {
       effectiveAt: '2027-09-12T09:00:00.000Z',
       evidenceIds: [correctionSource.id],
       accessBoundary,
-    })).toThrow('future effectiveAt is not supported')
+    }, relationshipAgent)).toThrow('future effectiveAt is not supported')
 
     expect(store.getClaim(claim.id, relationshipAgent)).toEqual(claim)
     expect(store.getPolicy(policy.id, relationshipAgent)).toEqual(policy)
@@ -506,7 +506,7 @@ describe('SQLitePersonalStore', () => {
       accessBoundary,
     })
 
-    const result = store.forgetClaim(claim.id)
+    const result = store.forgetClaim(claim.id, relationshipAgent)
     expect(result.forgottenClaim.status).toBe('forgotten')
     expect(result.invalidatedPolicies.map(policy => policy.id)).toEqual([dependent.id, independent.id])
     expect(store.getSource(source.id, relationshipAgent)).toEqual(source)
@@ -514,7 +514,94 @@ describe('SQLitePersonalStore', () => {
     expect(store.getPolicy(dependent.id, relationshipAgent)?.status).toBe('forgotten')
     expect(store.listActiveClaims(relationshipAgent, '2026-09-10T10:00:00.000Z')).toEqual([])
     expect(store.listActivePolicies(relationshipAgent, '2026-09-10T10:00:00.000Z')).toEqual([])
-    expect(() => store.forgetPolicy(dependent.id)).toThrow('Only an active Policy can be forgotten')
+    expect(() => store.forgetPolicy(dependent.id, relationshipAgent)).toThrow('Only an active Policy can be forgotten')
+    store.close()
+  })
+
+  it('requires an authorized context to correct or forget a record', () => {
+    const store = new SQLitePersonalStore(databasePath)
+    const source = store.createSource({
+      rawContent: '受限记录的原始证据。',
+      occurredAt: '2026-09-10T09:00:00.000Z',
+      origin: { kind: 'manual' },
+      accessBoundary,
+    })
+    const claim = store.createClaim({
+      statement: '受边界约束的认识。',
+      epistemicState: 'model-inference',
+      scope: 'personal',
+      status: 'active',
+      validFrom: '2026-09-10T09:00:00.000Z',
+      evidenceIds: [source.id],
+      accessBoundary,
+    })
+    const policy = store.createPolicy({
+      condition: '该认识成立。',
+      action: '执行受限动作。',
+      dependsOnClaimIds: [claim.id],
+      scope: 'personal',
+      validFrom: '2026-09-10T09:00:00.000Z',
+      accessBoundary,
+    })
+    const goalsAgent: InternalContext = { requester: { kind: 'domain-agent', id: 'goals' }, use: 'general' }
+
+    expect(() => store.correctClaim(claim.id, {
+      statement: '无权纠正。',
+      epistemicState: 'model-inference',
+      scope: 'personal',
+      effectiveAt: '2026-09-11T09:00:00.000Z',
+      evidenceIds: [source.id],
+      accessBoundary,
+    }, goalsAgent)).toThrow(`Claim correction is not authorized for this context: ${claim.id}`)
+    expect(() => store.forgetClaim(claim.id, goalsAgent)).toThrow(`Claim forget is not authorized for this context: ${claim.id}`)
+    expect(() => store.forgetPolicy(policy.id, goalsAgent)).toThrow(`Policy forget is not authorized for this context: ${policy.id}`)
+
+    expect(store.getClaim(claim.id, relationshipAgent)).toEqual(claim)
+    expect(store.getPolicy(policy.id, relationshipAgent)).toEqual(policy)
+    store.close()
+  })
+
+  it('refuses Claim correction and forgetting when a cascaded Policy is outside the caller boundary', () => {
+    const store = new SQLitePersonalStore(databasePath)
+    const source = store.createSource({
+      rawContent: '级联检查的原始证据。',
+      occurredAt: '2026-09-10T09:00:00.000Z',
+      origin: { kind: 'manual' },
+      accessBoundary,
+    })
+    const claim = store.createClaim({
+      statement: '可被关系 Agent 读到的认识。',
+      epistemicState: 'model-inference',
+      scope: 'personal',
+      status: 'active',
+      validFrom: '2026-09-10T09:00:00.000Z',
+      evidenceIds: [source.id],
+      accessBoundary,
+    })
+    const hiddenBoundary: AccessBoundary = { ...accessBoundary, domainAgents: ['goals'] }
+    const hiddenPolicy = store.createPolicy({
+      condition: '隐藏策略的条件。',
+      action: '不应被关系 Agent 连带改动。',
+      dependsOnClaimIds: [claim.id],
+      scope: 'personal',
+      validFrom: '2026-09-10T09:00:00.000Z',
+      accessBoundary: hiddenBoundary,
+    })
+
+    expect(() => store.correctClaim(claim.id, {
+      statement: '试图纠正。',
+      epistemicState: 'model-inference',
+      scope: 'personal',
+      effectiveAt: '2026-09-11T09:00:00.000Z',
+      evidenceIds: [source.id],
+      accessBoundary,
+    }, relationshipAgent)).toThrow(`Claim correction is not authorized for this context: ${hiddenPolicy.id}`)
+    expect(() => store.forgetClaim(claim.id, relationshipAgent)).toThrow(`Claim forget is not authorized for this context: ${hiddenPolicy.id}`)
+
+    expect(store.getClaim(claim.id, relationshipAgent)).toEqual(claim)
+    expect(store.listActiveClaims(relationshipAgent, '2026-09-11T10:00:00.000Z')).toEqual([claim])
+    expect(store.getPolicy(hiddenPolicy.id, relationshipAgent)).toBeUndefined()
+    expect(store.getPolicy(hiddenPolicy.id, { requester: { kind: 'domain-agent', id: 'goals' }, use: 'general' })?.status).toBe('active')
     store.close()
   })
 
@@ -789,7 +876,7 @@ describe('SQLitePersonalStore', () => {
       effectiveAt: '2026-09-11T09:00:00.000Z',
       evidenceIds: [correctionSource.id],
       accessBoundary,
-    })
+    }, relationshipAgent)
 
     expect(correction.retractedPolicies.map(item => item.id)).toEqual(expect.arrayContaining([onlyOld.id, multipleDependencies.id]))
     expect(correction.retractedPolicies).toHaveLength(2)
@@ -823,7 +910,7 @@ describe('SQLitePersonalStore', () => {
       effectiveAt: '2026-09-11T09:00:00.000Z',
       evidenceIds: [source.id],
       accessBoundary,
-    }).supersededClaim
+    }, relationshipAgent).supersededClaim
     const forgottenClaim = store.createClaim({
       statement: '将被遗忘的认识。',
       epistemicState: 'model-inference',
@@ -833,7 +920,7 @@ describe('SQLitePersonalStore', () => {
       evidenceIds: [source.id],
       accessBoundary,
     })
-    const forgotten = store.forgetClaim(forgottenClaim.id).forgottenClaim
+    const forgotten = store.forgetClaim(forgottenClaim.id, relationshipAgent).forgottenClaim
     const retractedSource = store.createSource({
       rawContent: '将被删除的唯一证据。',
       occurredAt: '2026-09-10T09:00:00.000Z',
