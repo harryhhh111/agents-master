@@ -69,7 +69,10 @@ CLI——read_session_updates 里看到非你代发的用户消息，立即把�
 
 ## 工作节奏
 
-- run_kimi / run_codex 派活后立即返回，任务在后台跑；**完成时你会自动收到
+- 可用 run_kimi、run_codex、run_claude 分别派给三种 CLI；run_executor 可按注册名派给
+  通用 executor。Kimi 不可用或额度不足时，Claude Code 接替 Kimi 作为与 Codex 独立协作的
+  第二个 CLI，可承担原本分配给 Kimi 的规划、评审或执行角色；仍须遵守“执行者不自验、对方验收”。
+- run_kimi / run_codex / run_claude / run_executor 派活后立即返回，任务在后台跑；**完成时你会自动收到
   [后台任务完成] 通知**，不需要轮询。只有你主动想看进度时才用 check_run。
 - 收到完成通知后：验收结果（必要时 read_artifact / read_session_updates），
   然后继续传话链或向用户汇报。如果通知对应的任务你已经在本回合处理过，

@@ -46,6 +46,77 @@ export async function findKimiSessionFile(
   return best?.file ?? null;
 }
 
+/** Claude Code encodes an absolute cwd by replacing path separators with '-'. */
+export function claudeProjectDirectoryName(projectDir: string): string {
+  return path.resolve(projectDir).replace(/[\\/]/g, '-')
+}
+
+/**
+ * Return the one Claude Code session file belonging to a pinned session ID.
+ * A pin is authoritative: it must never be turned into a directory traversal or
+ * silently redirected to another session file.
+ */
+export function claudeSessionFilePath(
+  projectDir: string,
+  sessionId: string,
+  homeDir: string = os.homedir(),
+): string | null {
+  if (!sessionId || sessionId !== path.basename(sessionId) || sessionId.includes('\\')) return null
+  return path.join(
+    homeDir,
+    '.claude',
+    'projects',
+    claudeProjectDirectoryName(projectDir),
+    `${sessionId}.jsonl`,
+  )
+}
+
+/** Locate the exact JSONL belonging to a pinned Claude session, if it exists. */
+export async function findPinnedClaudeSessionFile(
+  projectDir: string,
+  sessionId: string,
+  homeDir: string = os.homedir(),
+): Promise<string | null> {
+  const file = claudeSessionFilePath(projectDir, sessionId, homeDir)
+  if (!file) return null
+  try {
+    return (await fs.stat(file)).isFile() ? file : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Locate the newest Claude Code JSONL for this project:
+ * ~/.claude/projects/<encoded absolute cwd>/<session-id>.jsonl.
+ * The directory layout was verified against local Claude session records; mtime avoids relying on UUID order.
+ */
+export async function findClaudeSessionFile(
+  projectDir: string,
+  homeDir: string = os.homedir(),
+): Promise<string | null> {
+  const dir = path.join(homeDir, '.claude', 'projects', claudeProjectDirectoryName(projectDir))
+  let entries: import('node:fs').Dirent[]
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true })
+  } catch {
+    return null
+  }
+
+  let best: { file: string; mtimeMs: number } | null = null
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue
+    const file = path.join(dir, entry.name)
+    try {
+      const stat = await fs.stat(file)
+      if (!best || stat.mtimeMs > best.mtimeMs) best = { file, mtimeMs: stat.mtimeMs }
+    } catch {
+      // File was removed while scanning; ignore and continue.
+    }
+  }
+  return best?.file ?? null
+}
+
 export interface CodexDiscoveryOptions {
   /** 只扫描最近 N 天的日期目录，默认 30 */
   days?: number;

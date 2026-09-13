@@ -2,13 +2,20 @@ import { promises as fs } from 'node:fs'
 import { execa } from 'execa'
 import type OpenAI from 'openai'
 import type { AgentBackend } from '../backends/AgentBackend.js'
-import { findCodexSessionFile, findKimiSessionFile } from '../sessions/discovery.js'
+import {
+  claudeSessionFilePath,
+  findClaudeSessionFile,
+  findCodexSessionFile,
+  findKimiSessionFile,
+  findPinnedClaudeSessionFile,
+} from '../sessions/discovery.js'
+import { parseClaudeChunk } from '../sessions/claudeParser.js'
 import { parseCodexChunk } from '../sessions/codexParser.js'
 import { parseKimiChunk } from '../sessions/kimiParser.js'
 import type { SessionReader } from '../sessions/reader.js'
 import type { SessionMessage } from '../sessions/types.js'
 import type { Ledger } from '../state/ledger.js'
-import type { CliName, PinStore } from '../state/pins.js'
+import type { PinStore } from '../state/pins.js'
 import type { RunRegistry } from '../state/runs.js'
 
 /** 工具执行需要的全部上下文，由 loop 组装注入（测试可整体替换）。 */
@@ -18,7 +25,10 @@ export interface ToolContext {
   stateDir: string
   /** 全局 memory/ 目录（经验沉淀，跨项目共享） */
   memoryDir: string
-  backends: Record<CliName, AgentBackend>
+  /** Claude 会话根目录；生产环境使用用户 home，测试可注入临时目录。 */
+  sessionHomeDir?: string
+  /** 已注册执行器。key 是稳定的路由名，例如 kimi、codex、claude。 */
+  backends: Record<string, AgentBackend>
   runs: RunRegistry
   pins: PinStore
   ledger: Ledger
@@ -51,6 +61,36 @@ export const toolDefinitions: OpenAI.Chat.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'run_claude',
+      description:
+        '给 Claude Code 派活/传话：detach 模式启动，立即返回 runId 和 artifact 路径，' +
+        '长任务用 check_run 轮询。如有钉住的 session 会自动续接。',
+      parameters: {
+        type: 'object',
+        properties: { prompt: { type: 'string', description: '发给 Claude 的完整 prompt' } },
+        required: ['prompt'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'run_executor',
+      description:
+        '给已注册的通用 executor 派活。executor 为注册名；Kimi、Codex、Claude 也可分别使用兼容的 run_kimi/run_codex/run_claude。',
+      parameters: {
+        type: 'object',
+        properties: {
+          executor: { type: 'string', description: '已注册 executor 名称，例如 kimi、codex、claude' },
+          prompt: { type: 'string', description: '发给 executor 的完整 prompt' },
+        },
+        required: ['executor', 'prompt'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'run_codex',
       description:
         '给 codex-cli 派活/传话：detach 模式启动，立即返回 runId 和 artifact 路径，' +
@@ -67,13 +107,13 @@ export const toolDefinitions: OpenAI.Chat.ChatCompletionTool[] = [
     function: {
       name: 'check_run',
       description:
-        '查询 run_kimi/run_codex 启动的后台任务状态。进程一结束会立即返回（事件唤醒），' +
+        '查询任意 run_* 或 run_executor 启动的后台任务状态。进程一结束会立即返回（事件唤醒），' +
         'wait_ms 只是任务未结束时的兜底等待：默认 300000（5 分钟），上限 600000（10 分钟）。' +
         '任务未结束时不要密集调用，安心等。',
       parameters: {
         type: 'object',
         properties: {
-          runId: { type: 'string', description: 'run_kimi/run_codex 返回的 runId' },
+          runId: { type: 'string', description: 'run_* / run_executor 返回的 runId' },
           wait_ms: { type: 'number', description: '兜底等待毫秒数，默认 300000，上限 600000' },
         },
         required: ['runId'],
@@ -90,7 +130,7 @@ export const toolDefinitions: OpenAI.Chat.ChatCompletionTool[] = [
         'kind=notification 是后台任务通知，不是用户输入。',
       parameters: {
         type: 'object',
-        properties: { cli: { type: 'string', enum: ['kimi', 'codex'] } },
+          properties: { cli: { type: 'string', enum: ['kimi', 'codex', 'claude'] } },
         required: ['cli'],
       },
     },
@@ -189,42 +229,46 @@ async function tailChars(filePath: string, chars: number): Promise<string> {
   }
 }
 
-async function runBackend(ctx: ToolContext, cli: CliName, prompt: string): Promise<ToolResult> {
-  const backend = ctx.backends[cli]
-  const pin = await ctx.pins.getPin(ctx.projectName, cli)
+async function runBackend(ctx: ToolContext, executor: string, prompt: string): Promise<ToolResult> {
+  const backend = ctx.backends[executor]
+  if (!backend) return { text: `错误: 未注册 executor ${executor}` }
+  const pin = await ctx.pins.getPin(ctx.projectName, executor)
   const handle = backend.runDetached(prompt, {
     cwd: ctx.projectPath,
     sessionId: pin?.sessionId,
   })
-  const record = ctx.runs.register(cli, prompt, handle)
-  // done 回收：钉住 sessionId、记录代发 prompt（供 human/agent 标注）、收集 warnings
-  handle.done
-    .then(async result => {
-      record.status = 'done'
-      record.result = result
+  // Pin/session persistence must finish before RunRegistry broadcasts completion. Otherwise a
+  // completion notice can wake a new loop that tries to resume Claude before its session is pinned.
+  const finalizedHandle: import('../backends/AgentBackend.js').DetachedRunHandle = {
+    ...handle,
+    done: handle.done.then(async result => {
       if (result.sessionId) {
-        const prev = await ctx.pins.getPin(ctx.projectName, cli)
-        await ctx.pins.setPin(ctx.projectName, cli, {
+        const prev = await ctx.pins.getPin(ctx.projectName, executor)
+        await ctx.pins.setPin(ctx.projectName, executor, {
           sessionId: result.sessionId,
-          sessionFile: prev?.sessionFile ?? null,
+          // Claude 的 pin 文件路径由 cwd + sessionId 唯一决定，不能沿用上一次
+          // （可能属于另一 session）的 discovery 结果。
+          sessionFile:
+            executor === 'claude'
+              ? claudeSessionFilePath(ctx.projectPath, result.sessionId, ctx.sessionHomeDir)
+              : prev?.sessionFile ?? null,
         })
         await ctx.pins.recordSentPrompt(result.sessionId, prompt)
       }
+      return result
     })
-    .catch((e: unknown) => {
-      record.status = 'done'
-      record.error = e instanceof Error ? e.message : String(e)
-    })
+  }
+  const record = ctx.runs.register(executor, prompt, finalizedHandle)
   return {
     text: json({
       runId: record.runId,
-      pid: handle.pid,
-      artifactStdoutPath: handle.artifactStdoutPath,
-      artifactStderrPath: handle.artifactStderrPath,
+      pid: finalizedHandle.pid,
+      artifactStdoutPath: finalizedHandle.artifactStdoutPath,
+      artifactStderrPath: finalizedHandle.artifactStderrPath,
       resumedSession: pin?.sessionId ?? null,
       note: '任务已在后台运行；完成时会自动收到 [后台任务完成] 通知，无需轮询。只有你主动想看进度时才用 check_run。',
     }),
-    fullPath: handle.artifactStdoutPath,
+    fullPath: finalizedHandle.artifactStdoutPath,
   }
 }
 
@@ -275,14 +319,34 @@ interface AnnotatedMessage {
   origin?: 'agent' | 'human'
 }
 
-async function readSessionUpdates(ctx: ToolContext, cli: CliName): Promise<ToolResult> {
+type SessionReaderExecutor = 'kimi' | 'codex' | 'claude'
+
+async function readSessionUpdates(ctx: ToolContext, cli: SessionReaderExecutor): Promise<ToolResult> {
   const pin = await ctx.pins.getPin(ctx.projectName, cli)
-  let sessionFile = pin?.sessionFile ?? null
+  let sessionFile: string | null
+
+  if (cli === 'claude' && pin) {
+    // A Claude pin names one exact file. Do not fall back to newest-file discovery:
+    // another Claude session in this project may be newer but is unrelated.
+    sessionFile = await findPinnedClaudeSessionFile(ctx.projectPath, pin.sessionId, ctx.sessionHomeDir)
+    if (!sessionFile) {
+      return { text: `未找到 Claude 钉住的 session 文件（session ${pin.sessionId}）：${ctx.projectPath}` }
+    }
+    // Repair legacy/stale path data after confirming the canonical pinned file.
+    if (pin.sessionFile !== sessionFile) {
+      await ctx.pins.setPin(ctx.projectName, cli, { ...pin, sessionFile })
+    }
+  } else {
+    sessionFile = pin?.sessionFile ?? null
+  }
+
   if (!sessionFile || !(await fs.stat(sessionFile).then(() => true, () => false))) {
     sessionFile =
       cli === 'kimi'
         ? await findKimiSessionFile(ctx.projectPath)
-        : await findCodexSessionFile(ctx.projectPath)
+        : cli === 'claude'
+          ? await findClaudeSessionFile(ctx.projectPath, ctx.sessionHomeDir)
+          : await findCodexSessionFile(ctx.projectPath)
     if (!sessionFile) {
       return { text: `未找到 ${cli} 的 session 文件（项目 ${ctx.projectPath} 还没有会话记录？）` }
     }
@@ -291,7 +355,7 @@ async function readSessionUpdates(ctx: ToolContext, cli: CliName): Promise<ToolR
     }
   }
 
-  const parse = cli === 'kimi' ? parseKimiChunk : parseCodexChunk
+  const parse = cli === 'kimi' ? parseKimiChunk : cli === 'claude' ? parseClaudeChunk : parseCodexChunk
   const { messages, warnings } = await ctx.reader.readMessages(sessionFile, parse)
 
   const sentPrompts = new Set<string>([
@@ -358,6 +422,10 @@ export async function executeTool(ctx: ToolContext, name: string, argsJson: stri
         return await runBackend(ctx, 'kimi', String(args.prompt ?? ''))
       case 'run_codex':
         return await runBackend(ctx, 'codex', String(args.prompt ?? ''))
+      case 'run_claude':
+        return await runBackend(ctx, 'claude', String(args.prompt ?? ''))
+      case 'run_executor':
+        return await runBackend(ctx, String(args.executor ?? ''), String(args.prompt ?? ''))
       case 'check_run':
         return await checkRun(
           ctx,
@@ -365,8 +433,8 @@ export async function executeTool(ctx: ToolContext, name: string, argsJson: stri
           typeof args.wait_ms === 'number' ? args.wait_ms : undefined,
         )
       case 'read_session_updates': {
-        const cli = args.cli === 'kimi' || args.cli === 'codex' ? args.cli : null
-        if (!cli) return { text: `错误: cli 必须是 "kimi" 或 "codex"，收到 ${String(args.cli)}` }
+        const cli = args.cli === 'kimi' || args.cli === 'codex' || args.cli === 'claude' ? args.cli : null
+        if (!cli) return { text: `错误: cli 必须是 "kimi"、"codex" 或 "claude"，收到 ${String(args.cli)}` }
         return await readSessionUpdates(ctx, cli)
       }
       case 'read_artifact':

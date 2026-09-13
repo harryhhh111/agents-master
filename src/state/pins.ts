@@ -1,7 +1,9 @@
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 
-export type CliName = 'kimi' | 'codex'
+/** 已注册 executor 的名称。保留 CliName 别名，避免现有调用方破坏。 */
+export type ExecutorName = string
+export type CliName = ExecutorName
 
 export interface CliPin {
   sessionId: string
@@ -11,7 +13,7 @@ export interface CliPin {
 
 interface PinsData {
   /** 项目 → cli → 钉住的 session */
-  projects: Record<string, Partial<Record<CliName, CliPin>>>
+  projects: Record<string, Partial<Record<ExecutorName, CliPin>>>
   /** sessionId → agent 代发过的 prompt 原文，供 read_session_updates 标注 agent/human */
   sentPrompts: Record<string, string[]>
 }

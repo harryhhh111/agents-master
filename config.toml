@@ -21,3 +21,8 @@ sandbox_mode = "workspace-write"
 
 [backends.kimi]
 # kimi 的 --prompt 与 --yolo 不兼容，自治执行靠它自己的配置文件
+
+# Claude 的非交互编码任务默认只自动接受工作区内的文件编辑。它不等同于
+# bypassPermissions：命令和更广泛权限仍不会被一并批准。只有用户明确授权时才可放宽。
+[backends.claude]
+permission_mode = "acceptEdits"

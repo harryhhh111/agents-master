@@ -4,9 +4,11 @@ import path from 'node:path'
 import type OpenAI from 'openai'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AgentCore, type AgentEvent } from '../src/agent/loop.js'
+import { buildSystemPrompt } from '../src/agent/prompt.js'
 import { executeTool, type ToolContext } from '../src/agent/tools.js'
 import type { AgentBackend, DetachedRunHandle } from '../src/backends/AgentBackend.js'
 import type { Config } from '../src/config.js'
+import { ClaudeBackend } from '../src/backends/ClaudeBackend.js'
 import { SessionReader } from '../src/sessions/reader.js'
 import { Ledger } from '../src/state/ledger.js'
 import { PinStore } from '../src/state/pins.js'
@@ -29,7 +31,11 @@ function testConfig(): Config {
     llm: { base_url: 'https://fake.example', model: 'fake-model' },
     delegation: { level: 'supervised' },
     projects: [{ name: 'proj', path: tmp }],
-    backends: { codex: { sandbox_mode: 'workspace-write' }, kimi: {} },
+    backends: {
+      codex: { sandbox_mode: 'workspace-write' },
+      kimi: {},
+      claude: { binary: 'claude', permission_mode: 'acceptEdits' },
+    },
   }
 }
 
@@ -102,6 +108,7 @@ function makeToolCtx(overrides: Partial<ToolContext> = {}): ToolContext {
     projectPath: tmp,
     stateDir: tmp,
     memoryDir: tmp,
+    sessionHomeDir: tmp,
     backends: {
       kimi: fakeBackend('kimi', null, tmp),
       codex: fakeBackend('codex', null, tmp),
@@ -319,6 +326,69 @@ describe('run_kimi / check_run', () => {
   })
 })
 
+describe('executor registry 与兼容路由', () => {
+  it('系统 prompt 提供 Claude/通用 executor，并说明 Kimi 无额度时 Claude 接替', () => {
+    const prompt = buildSystemPrompt('proj', '/tmp/proj')
+    expect(prompt).toContain('run_claude')
+    expect(prompt).toContain('run_executor')
+    expect(prompt).toContain('Kimi 不可用或额度不足时，Claude Code 接替 Kimi')
+  })
+
+  it('run_claude 和 run_executor 都按 registry key 路由，未知 executor 保持为工具错误', async () => {
+    const claude = fakeBackend('claude', 'sess-claude-1', tmp)
+    const custom = fakeBackend('custom', null, tmp)
+    const ctx = makeToolCtx({
+      backends: {
+        kimi: fakeBackend('kimi', null, tmp),
+        codex: fakeBackend('codex', null, tmp),
+        claude,
+        custom,
+      },
+    })
+    await fs.writeFile(path.join(tmp, 'claude-stdout.log'), 'claude output')
+    await fs.writeFile(path.join(tmp, 'custom-stdout.log'), 'custom output')
+
+    const claudeStarted = await executeTool(ctx, 'run_claude', JSON.stringify({ prompt: '审查改动' }))
+    expect(JSON.parse(claudeStarted.text)).toMatchObject({ resumedSession: null })
+    const customStarted = await executeTool(
+      ctx,
+      'run_executor',
+      JSON.stringify({ executor: 'custom', prompt: '执行自定义任务' }),
+    )
+    expect(JSON.parse(customStarted.text)).toMatchObject({ resumedSession: null })
+    expect((await executeTool(ctx, 'run_executor', JSON.stringify({ executor: 'missing', prompt: 'x' }))).text)
+      .toContain('未注册 executor missing')
+
+    await flush()
+    expect(await ctx.pins.getPin('proj', 'claude')).toEqual({
+      sessionId: 'sess-claude-1',
+      sessionFile: path.join(
+        tmp,
+        '.claude',
+        'projects',
+        tmp.replace(/[\\/]/g, '-'),
+        'sess-claude-1.jsonl',
+      ),
+    })
+  })
+
+  it('默认 registry 注册配置化 Claude backend', () => {
+    const { client } = fakeLlm([{ content: 'ok' }])
+    const core = new AgentCore({
+      config: testConfig(),
+      projectName: 'proj',
+      llm: client,
+      stateDir: tmp,
+      askUser: async () => '',
+      onEvent: () => {},
+    })
+
+    expect(core.context.backends.kimi).toBeDefined()
+    expect(core.context.backends.codex).toBeDefined()
+    expect(core.context.backends.claude).toBeInstanceOf(ClaudeBackend)
+  })
+})
+
 describe('read_session_updates 的 human/agent 标注', () => {
   it('agent 代发精确匹配标 origin=agent，其余标 human，后台通知标 notification', async () => {
     const wireFile = path.join(tmp, 'wire.jsonl')
@@ -372,6 +442,93 @@ describe('read_session_updates 的 human/agent 标注', () => {
     // 幂等：再读一次没有新消息
     const again = await executeTool(ctx, 'read_session_updates', JSON.stringify({ cli: 'kimi' }))
     expect(JSON.parse(again.text).messages).toEqual([])
+  })
+
+  it('Claude 保留同一套 agent/human 精确匹配语义，并且不返回 thinking/tool 内容', async () => {
+    const sessionFile = path.join(
+      tmp,
+      '.claude',
+      'projects',
+      tmp.replace(/[\\/]/g, '-'),
+      'synthetic-claude-session.jsonl',
+    )
+    await fs.mkdir(path.dirname(sessionFile), { recursive: true })
+    await fs.writeFile(
+      sessionFile,
+      [
+        JSON.stringify({
+          type: 'user', timestamp: '2026-09-14T01:00:00.000Z',
+          message: { role: 'user', content: '请审查这个变更' },
+        }),
+        JSON.stringify({
+          type: 'user', timestamp: '2026-09-14T01:01:00.000Z',
+          message: { role: 'user', content: '先不要改文件' },
+        }),
+        JSON.stringify({
+          type: 'assistant', timestamp: '2026-09-14T01:02:00.000Z',
+          message: { role: 'assistant', content: [
+            { type: 'thinking', thinking: 'private thinking' },
+            { type: 'text', text: '收到，会先审查' },
+            { type: 'tool_use', name: 'Bash', input: { command: 'private command' } },
+          ] },
+        }),
+      ].join('\n') + '\n',
+    )
+    const pins = new PinStore(tmp)
+    await pins.setPin('proj', 'claude', { sessionId: 'synthetic-claude-session', sessionFile })
+    await pins.recordSentPrompt('synthetic-claude-session', '请审查这个变更')
+
+    const res = await executeTool(makeToolCtx({ pins }), 'read_session_updates', JSON.stringify({ cli: 'claude' }))
+    const data = JSON.parse(res.text)
+    expect(data.messages).toEqual([
+      { ts: Date.parse('2026-09-14T01:00:00.000Z'), who: 'user', text: '请审查这个变更', origin: 'agent' },
+      { ts: Date.parse('2026-09-14T01:01:00.000Z'), who: 'user', text: '先不要改文件', origin: 'human' },
+      { ts: Date.parse('2026-09-14T01:02:00.000Z'), who: 'assistant', text: '收到，会先审查' },
+    ])
+    expect(res.text).not.toContain('private')
+  })
+
+  it('Claude 有 pin 时只读取该 sessionId 的规范路径，不会选同项目更新的其他文件', async () => {
+    const sessionDir = path.join(tmp, '.claude', 'projects', tmp.replace(/[\\/]/g, '-'))
+    const pinnedFile = path.join(sessionDir, 'pinned-session.jsonl')
+    const unrelatedFile = path.join(sessionDir, 'newer-unrelated.jsonl')
+    await fs.mkdir(sessionDir, { recursive: true })
+    await fs.writeFile(
+      pinnedFile,
+      JSON.stringify({ type: 'user', timestamp: '2026-09-14T01:00:00.000Z', message: { role: 'user', content: 'pinned' } }) + '\n',
+    )
+    await fs.writeFile(
+      unrelatedFile,
+      JSON.stringify({ type: 'user', timestamp: '2026-09-14T02:00:00.000Z', message: { role: 'user', content: 'unrelated' } }) + '\n',
+    )
+    await fs.utimes(unrelatedFile, new Date('2026-09-15'), new Date('2026-09-15'))
+
+    const pins = new PinStore(tmp)
+    // Simulate a legacy/stale stored path: sessionId remains the source of truth.
+    await pins.setPin('proj', 'claude', { sessionId: 'pinned-session', sessionFile: unrelatedFile })
+    const res = await executeTool(makeToolCtx({ pins }), 'read_session_updates', JSON.stringify({ cli: 'claude' }))
+
+    expect(JSON.parse(res.text)).toMatchObject({ sessionFile: pinnedFile, messages: [{ text: 'pinned' }] })
+    expect(await pins.getPin('proj', 'claude')).toEqual({ sessionId: 'pinned-session', sessionFile: pinnedFile })
+  })
+
+  it('Claude 无 pin 才按 discovery 选择最新文件；缺失 pin 文件不回退到它', async () => {
+    const sessionDir = path.join(tmp, '.claude', 'projects', tmp.replace(/[\\/]/g, '-'))
+    const discoveredFile = path.join(sessionDir, 'newest-session.jsonl')
+    await fs.mkdir(sessionDir, { recursive: true })
+    await fs.writeFile(
+      discoveredFile,
+      JSON.stringify({ type: 'user', timestamp: '2026-09-14T02:00:00.000Z', message: { role: 'user', content: 'discovered' } }) + '\n',
+    )
+
+    const unpinned = await executeTool(makeToolCtx(), 'read_session_updates', JSON.stringify({ cli: 'claude' }))
+    expect(JSON.parse(unpinned.text)).toMatchObject({ sessionFile: discoveredFile, messages: [{ text: 'discovered' }] })
+
+    const pins = new PinStore(tmp)
+    await pins.setPin('proj', 'claude', { sessionId: 'missing-session', sessionFile: null })
+    const pinnedMissing = await executeTool(makeToolCtx({ pins }), 'read_session_updates', JSON.stringify({ cli: 'claude' }))
+    expect(pinnedMissing.text).toContain('missing-session')
+    expect(pinnedMissing.text).not.toContain('discovered')
   })
 
   it('找不到 session 文件时返回说明文本而不是抛异常', async () => {

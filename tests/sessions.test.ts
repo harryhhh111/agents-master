@@ -4,7 +4,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseCodexChunk } from "../src/sessions/codexParser.js";
-import { findCodexSessionFile, findKimiSessionFile } from "../src/sessions/discovery.js";
+import { parseClaudeChunk } from "../src/sessions/claudeParser.js";
+import {
+  claudeProjectDirectoryName,
+  claudeSessionFilePath,
+  findClaudeSessionFile,
+  findCodexSessionFile,
+  findKimiSessionFile,
+  findPinnedClaudeSessionFile,
+} from "../src/sessions/discovery.js";
 import { parseKimiChunk } from "../src/sessions/kimiParser.js";
 import { SessionReader } from "../src/sessions/reader.js";
 
@@ -88,6 +96,48 @@ describe("parseCodexChunk", () => {
     expect(warnings).toBe(3); // 1 解析失败 + 1 缺 timestamp + 1 缺 content
     expect(messages.map((m) => m.text)).toEqual(["缺 timestamp"]);
     expect(messages[0]!.ts).toBe(0);
+  });
+});
+
+describe("parseClaudeChunk", () => {
+  it("按本机 ~/.claude/projects JSONL 的 user/assistant 结构提取公开文本", () => {
+    // Fixture intentionally uses synthetic text/UUIDs, while matching observed top-level fields:
+    // user.message.content is a string; assistant.message.content is typed blocks.
+    const chunk = [
+      JSON.stringify({
+        type: "user", timestamp: "2026-09-14T01:02:03.000Z", sessionId: "synthetic-session",
+        message: { role: "user", content: "由 agent 代发的任务" },
+      }),
+      JSON.stringify({
+        type: "assistant", timestamp: "2026-09-14T01:02:04.000Z", sessionId: "synthetic-session",
+        message: { role: "assistant", content: [
+          { type: "thinking", thinking: "private reasoning" },
+          { type: "text", text: "公开回复" },
+          { type: "tool_use", name: "Bash", input: { command: "private command" } },
+        ] },
+      }),
+      JSON.stringify({ type: "permission-mode", permissionMode: "acceptEdits" }),
+    ].join("\n");
+
+    const { messages, warnings } = parseClaudeChunk(chunk);
+    expect(warnings).toBe(0);
+    expect(messages).toEqual([
+      { ts: Date.parse("2026-09-14T01:02:03.000Z"), who: "user", text: "由 agent 代发的任务" },
+      { ts: Date.parse("2026-09-14T01:02:04.000Z"), who: "assistant", text: "公开回复" },
+    ]);
+    expect(JSON.stringify(messages)).not.toContain("private");
+  });
+
+  it("字段缺失、角色不符和非法 JSON 计入 warnings，tool result 不伪装为用户输入", () => {
+    const chunk = [
+      "{broken",
+      JSON.stringify({ type: "user", timestamp: "2026-09-14T01:02:03Z", message: { role: "assistant", content: "错角色" } }),
+      JSON.stringify({ type: "user", timestamp: "invalid", message: { role: "user", content: [{ type: "tool_result", content: "私有" }] } }),
+      JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "缺时间" }] } }),
+    ].join("\n");
+    const { messages, warnings } = parseClaudeChunk(chunk);
+    expect(warnings).toBe(3);
+    expect(messages).toEqual([{ ts: 0, who: "assistant", text: "缺时间" }]);
   });
 });
 
@@ -186,6 +236,36 @@ describe("discovery", () => {
 
   it("kimi：无匹配目录返回 null", async () => {
     expect(await findKimiSessionFile(projectDir, home)).toBeNull();
+  });
+
+  async function writeClaudeSession(project: string, name: string, mtime: Date): Promise<string> {
+    const file = path.join(home, ".claude", "projects", claudeProjectDirectoryName(project), name);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, "{}\n");
+    await fs.utimes(file, mtime, mtime);
+    return file;
+  }
+
+  it("claude：按实际 projects/<encoded cwd>/<uuid>.jsonl 布局匹配，并取最新 mtime", async () => {
+    const older = await writeClaudeSession(projectDir, "synthetic-old.jsonl", new Date("2026-09-01"));
+    const newest = await writeClaudeSession(projectDir, "synthetic-new.jsonl", new Date("2026-09-02"));
+    await writeClaudeSession("/some/other/project", "synthetic-other.jsonl", new Date("2026-09-03"));
+
+    expect(older).not.toBe(newest);
+    expect(await findClaudeSessionFile(projectDir, home)).toBe(newest);
+  });
+
+  it("claude：没有该 cwd 目录时返回 null", async () => {
+    expect(await findClaudeSessionFile(projectDir, home)).toBeNull();
+  });
+
+  it("claude：钉住 sessionId 时只定位规范文件，不受同目录更新文件影响", async () => {
+    const pinned = await writeClaudeSession(projectDir, "pinned-session.jsonl", new Date("2026-09-01"));
+    await writeClaudeSession(projectDir, "newer-unrelated.jsonl", new Date("2026-09-02"));
+
+    expect(claudeSessionFilePath(projectDir, "pinned-session", home)).toBe(pinned);
+    expect(await findPinnedClaudeSessionFile(projectDir, "pinned-session", home)).toBe(pinned);
+    expect(await findPinnedClaudeSessionFile(projectDir, "missing-session", home)).toBeNull();
   });
 
   function dateDir(daysAgo: number): string {

@@ -2,6 +2,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type OpenAI from 'openai'
 import type { AgentBackend } from '../backends/AgentBackend.js'
+import { ClaudeBackend } from '../backends/ClaudeBackend.js'
 import { CodexBackend } from '../backends/CodexBackend.js'
 import { KimiBackend } from '../backends/KimiBackend.js'
 import type { Config } from '../config.js'
@@ -31,8 +32,8 @@ export interface AgentCoreOptions {
   llm?: OpenAI
   /** 默认 <agents-master>/state/<项目名>/ */
   stateDir?: string
-  /** 测试注入假 backend；默认真实 KimiBackend/CodexBackend */
-  backends?: { kimi: AgentBackend; codex: AgentBackend }
+  /** 测试注入 executor registry；默认注册 Kimi、Codex 和 Claude。 */
+  backends?: Record<string, AgentBackend>
 }
 
 // check_run 默认兜底 5 分钟/次，120 次迭代足以覆盖小时级任务
@@ -77,6 +78,10 @@ export class AgentCore {
       backends: opts.backends ?? {
         kimi: new KimiBackend(),
         codex: new CodexBackend({ sandboxMode: opts.config.backends.codex.sandbox_mode }),
+        claude: new ClaudeBackend({
+          binary: opts.config.backends.claude.binary,
+          permissionMode: opts.config.backends.claude.permission_mode,
+        }),
       },
       runs: new RunRegistry(),
       pins: new PinStore(stateDir),
