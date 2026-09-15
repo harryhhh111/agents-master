@@ -3,6 +3,7 @@ export type SourceId = string
 export type ClaimId = string
 export type PolicyId = string
 export type TaskId = string
+export type TaskEventId = string
 
 /**
  * Limits how an internal agent may use a record. This is deliberately about
@@ -15,10 +16,12 @@ export interface AccessBoundary {
   allowExternalDisclosure: boolean
 }
 
-export interface SourceOrigin {
-  kind: 'conversation' | 'task-event' | 'file' | 'web' | 'external' | 'manual'
-  reference?: string
-}
+export type SourceOrigin =
+  | { kind: 'task-event'; reference: TaskEventId }
+  | {
+    kind: 'conversation' | 'file' | 'web' | 'external' | 'manual'
+    reference?: string
+  }
 
 /** Raw, time-bound evidence. Being stored does not make it a fact. */
 export interface Source {
@@ -75,24 +78,119 @@ export type EntityReference =
   | { kind: 'policy'; id: PolicyId }
   | { kind: 'task'; id: TaskId }
 
+export type TaskStatus = 'active' | 'paused' | 'completed' | 'cancelled'
+
+/** The three product domains, plus the migration-only bucket for pre-domain Tasks. */
+export type TaskDomain = 'relationship' | 'work-project' | 'goal' | 'legacy'
+
+/** This is deliberately a fixed product role set, not a general agent registry. */
+export type TaskOwner = 'main-agent' | 'work-project-agent'
+
 /** A running commitment; references provide context but do not define ownership. */
 export interface Task {
   id: TaskId
   title: string
-  status: 'active' | 'paused' | 'completed' | 'cancelled'
+  /** The durable outcome being pursued. Legacy Tasks use their title as the objective. */
+  objective: string
+  status: TaskStatus
+  domain: TaskDomain
+  owner: TaskOwner
+  /** A stable work-project key when this Task belongs to a work project. */
+  projectKey?: string
+  /** The concise task-list progress line, intentionally separate from the journal. */
+  visibleProgress?: string
+  /** A decision or missing input which requires the user's attention. */
+  waitingForUser?: string
+  /** A provisional result that remains distinct from a completed task. */
+  candidateResult?: string
   createdAt: string
   updatedAt: string
   entityReferences: readonly EntityReference[]
   accessBoundary: AccessBoundary
 }
 
+/** Append-only history for a Task. Events inherit the Task's access boundary. */
+export type TaskEventType = 'note' | 'progress' | 'waiting-for-user' | 'candidate-result' | 'status-change'
+
+/** Status transitions are recorded only by updateTask after a persisted change. */
+export type AppendableTaskEventType = Exclude<TaskEventType, 'status-change'>
+
+/**
+ * Task ownership stays a fixed product role set. Event actors instead record
+ * the authorized requester that actually made an append, including domains
+ * which are allowed by a Task boundary but are not Task owners.
+ */
+export type TaskEventActor = TaskOwner | `domain-agent:${string}`
+
+export interface TaskEvent {
+  id: TaskEventId
+  taskId: TaskId
+  /** The citable Source created atomically with this event. */
+  sourceId: SourceId
+  type: TaskEventType
+  content: string
+  actor: TaskEventActor
+  occurredAt: string
+  recordedAt: string
+}
+
 export type CreateSourceInput = Omit<Source, 'id' | 'recordedAt'> & { recordedAt?: string }
 export type CreateClaimInput = Omit<Claim, 'id' | 'supersedesClaimId' | 'supersededByClaimId'>
 /** New Policies are active unless the caller is importing a historical record. */
 export type CreatePolicyInput = Omit<Policy, 'id' | 'status'> & { status?: PolicyStatus }
-export type CreateTaskInput = Omit<Task, 'id' | 'createdAt' | 'updatedAt'> & {
+/**
+ * The new task fields are optional at creation for source compatibility with
+ * pre-domain callers. They receive conservative MainAgent/legacy defaults.
+ */
+export type CreateTaskInput = Omit<
+  Task,
+  'id' | 'createdAt' | 'updatedAt' | 'objective' | 'domain' | 'owner' | 'projectKey' | 'visibleProgress' | 'waitingForUser' | 'candidateResult'
+> & {
   createdAt?: string
   updatedAt?: string
+  objective?: string
+  domain?: TaskDomain
+  owner?: TaskOwner
+  projectKey?: string
+  visibleProgress?: string
+  waitingForUser?: string
+  candidateResult?: string
+}
+
+/**
+ * All Task fields that can change during its lifetime. Access boundaries are
+ * intentionally immutable through this API so a visible caller cannot widen
+ * a record's audience as a side effect of an update.
+ */
+export interface UpdateTaskInput {
+  title?: string
+  objective?: string
+  status?: TaskStatus
+  domain?: TaskDomain
+  owner?: TaskOwner
+  projectKey?: string | null
+  visibleProgress?: string | null
+  waitingForUser?: string | null
+  candidateResult?: string | null
+  entityReferences?: readonly EntityReference[]
+  updatedAt?: string
+}
+
+export interface ListTasksInput {
+  statuses?: readonly TaskStatus[]
+  domain?: TaskDomain
+  owner?: TaskOwner
+  projectKey?: string
+}
+
+export interface AppendTaskEventInput {
+  /** status-change is intentionally unavailable to direct appends. */
+  type: AppendableTaskEventType
+  content: string
+  /** Must exactly match the actor derived from the authorized requester. */
+  actor?: TaskEventActor
+  occurredAt?: string
+  recordedAt?: string
 }
 
 export type InternalRequester =
@@ -113,6 +211,19 @@ export interface InternalContext {
 export type SourceSummaryView = Omit<Source, 'rawContent'> & { rawContent?: never }
 export type SourceFullView = Source
 export type SourceView = SourceSummaryView | SourceFullView
+
+/** A summary view is structurally unable to contain a TaskEvent's content. */
+export type TaskEventSummaryView = Omit<TaskEvent, 'content'> & { content?: never }
+export type TaskEventFullView = TaskEvent
+export type TaskEventView = TaskEventSummaryView | TaskEventFullView
+
+/** Maps a requester's declared read level to its safe TaskEvent response shape. */
+export type TaskEventViewForContext<Context extends InternalContext> =
+  [Extract<Context['requester'], { kind: 'main'; access: 'summary' }>] extends [never]
+    ? TaskEventFullView
+    : Context['requester'] extends { kind: 'main'; access: 'summary' }
+      ? TaskEventSummaryView
+      : TaskEventView
 
 /** Corrections are immediate or historical; scheduled future corrections are unsupported. */
 export interface CorrectClaimInput {
@@ -177,6 +288,20 @@ export interface PersonalStore {
   forgetPolicy(id: PolicyId, context: InternalContext): Policy
   createTask(input: CreateTaskInput): Task
   getTask(id: TaskId, context: InternalContext): Task | undefined
+  listTasks(context: InternalContext, input?: ListTasksInput): Task[]
+  /** Throws when the Task is not visible to the caller. */
+  updateTask(id: TaskId, input: UpdateTaskInput, context: InternalContext): Task
+  /** Events are append-only and can be added only by a caller authorized for the parent Task. */
+  appendTaskEvent(id: TaskId, input: AppendTaskEventInput, context: InternalContext): TaskEvent
+  /**
+   * Returns no events when the parent Task is absent or outside the caller
+   * boundary. Summary MainAgent contexts receive structural redactions.
+   */
+  listTaskEvents<Context extends InternalContext>(
+    id: TaskId,
+    context: Context,
+    limit?: number,
+  ): TaskEventViewForContext<Context>[]
   /** Returns undefined when any record the deletion would expose or mutate is inaccessible. */
   previewSourceDeletion(id: SourceId, context: InternalContext): SourceDeletionPreview | undefined
   deleteSource(id: SourceId, context: InternalContext, confirmation: DeleteSourceConfirmation): SourceDeletionResult

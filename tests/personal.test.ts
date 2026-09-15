@@ -7,6 +7,8 @@ import {
   SQLitePersonalStore,
   type AccessBoundary,
   type InternalContext,
+  type TaskEvent,
+  type TaskEventSummaryView,
 } from '../src/personal/index.js'
 
 const accessBoundary: AccessBoundary = {
@@ -358,6 +360,405 @@ describe('SQLitePersonalStore', () => {
       entityReferences: [],
       accessBoundary,
     }).updatedAt).toBe(createdAt)
+    store.close()
+  })
+
+  it('preserves independent Task changes across store instances and validates against the persisted timestamp', () => {
+    const first = new SQLitePersonalStore(databasePath)
+    const task = first.createTask({
+      title: '并发更新任务',
+      status: 'active',
+      createdAt: '2026-09-10T09:00:00.000Z',
+      updatedAt: '2026-09-10T09:00:00.000Z',
+      entityReferences: [],
+      accessBoundary,
+    })
+    const second = new SQLitePersonalStore(databasePath)
+
+    first.updateTask(task.id, {
+      title: '第一个实例更新的标题',
+      updatedAt: '2026-09-10T09:01:00.000Z',
+    }, relationshipAgent)
+    const independentlyUpdated = second.updateTask(task.id, {
+      visibleProgress: '第二个实例更新的进展。',
+      updatedAt: '2026-09-10T09:02:00.000Z',
+    }, relationshipAgent)
+
+    expect(independentlyUpdated).toMatchObject({
+      title: '第一个实例更新的标题',
+      visibleProgress: '第二个实例更新的进展。',
+      updatedAt: '2026-09-10T09:02:00.000Z',
+    })
+    expect(first.getTask(task.id, relationshipAgent)).toEqual(independentlyUpdated)
+    expect(() => second.updateTask(task.id, {
+      candidateResult: '不应写入。',
+      updatedAt: '2026-09-10T09:01:59.999Z',
+    }, relationshipAgent)).toThrow('updatedAt must not be earlier than the current Task timestamp')
+    first.close()
+    second.close()
+  })
+
+  it('advances Task recency atomically for journal activity without moving timestamps backwards', () => {
+    const store = new SQLitePersonalStore(databasePath)
+    const task = store.createTask({
+      title: '事件应更新任务新鲜度',
+      status: 'active',
+      createdAt: '2026-09-10T09:00:00.000Z',
+      updatedAt: '2026-09-10T09:00:00.000Z',
+      entityReferences: [],
+      accessBoundary,
+    })
+    const lessRecent = store.createTask({
+      title: '用于验证排序的任务',
+      status: 'active',
+      createdAt: '2026-09-10T09:01:00.000Z',
+      updatedAt: '2026-09-10T09:01:00.000Z',
+      entityReferences: [],
+      accessBoundary,
+    })
+
+    store.appendTaskEvent(task.id, {
+      type: 'progress',
+      content: '这条日志比另一个任务更新。',
+      occurredAt: '2026-09-10T09:02:00.000Z',
+      recordedAt: '2026-09-10T09:02:00.000Z',
+    }, relationshipAgent)
+    expect(store.getTask(task.id, relationshipAgent)?.updatedAt).toBe('2026-09-10T09:02:00.000Z')
+    expect(store.listTasks(relationshipAgent).map(entry => entry.id)).toEqual([task.id, lessRecent.id])
+
+    store.appendTaskEvent(task.id, {
+      type: 'note',
+      content: '历史补录不得使任务时间倒退。',
+      occurredAt: '2026-09-10T08:00:00.000Z',
+      recordedAt: '2026-09-10T08:00:00.000Z',
+    }, relationshipAgent)
+    expect(store.getTask(task.id, relationshipAgent)?.updatedAt).toBe('2026-09-10T09:02:00.000Z')
+
+    const statusChanged = store.updateTask(task.id, {
+      status: 'paused',
+      updatedAt: '2026-09-10T09:03:00.000Z',
+    }, relationshipAgent)
+    expect(statusChanged.updatedAt).toBe('2026-09-10T09:03:00.000Z')
+    expect(store.getTask(task.id, relationshipAgent)).toEqual(statusChanged)
+    store.close()
+  })
+
+  it('uses per-Task append order for equal-time event reads and bounded summary reads', () => {
+    const store = new SQLitePersonalStore(databasePath)
+    const task = store.createTask({
+      title: '同一时间的事件顺序',
+      status: 'active',
+      createdAt: '2026-09-10T09:00:00.000Z',
+      updatedAt: '2026-09-10T09:00:00.000Z',
+      entityReferences: [],
+      accessBoundary,
+    })
+    const eventInput = {
+      occurredAt: '2026-09-10T09:01:00.000Z',
+      recordedAt: '2026-09-10T09:01:00.000Z',
+    }
+    const first = store.appendTaskEvent(task.id, { type: 'note', content: 'first', ...eventInput }, relationshipAgent)
+    const second = store.appendTaskEvent(task.id, { type: 'progress', content: 'second', ...eventInput }, relationshipAgent)
+    const third = store.appendTaskEvent(task.id, { type: 'waiting-for-user', content: 'third', ...eventInput }, relationshipAgent)
+
+    expect(store.listTaskEvents(task.id, relationshipAgent)).toEqual([first, second, third])
+    expect(store.listTaskEvents(task.id, relationshipAgent, 2)).toEqual([second, third])
+    expect(store.listTaskEvents(task.id, summaryMain, 2).map(event => event.id)).toEqual([second.id, third.id])
+    store.close()
+
+    const reopened = new SQLitePersonalStore(databasePath)
+    expect(reopened.listTaskEvents(task.id, relationshipAgent, 2)).toEqual([second, third])
+    expect(reopened.listTaskEvents(task.id, summaryMain, 2).map(event => event.id)).toEqual([second.id, third.id])
+    reopened.close()
+  })
+
+  it('migrates the provenance-aware Stage 1.1 event schema with its insertion order intact', () => {
+    const legacy = new DatabaseSync(databasePath)
+    legacy.exec(`
+      CREATE TABLE sources (
+        id TEXT PRIMARY KEY, raw_content TEXT NOT NULL, summary TEXT,
+        occurred_at TEXT NOT NULL, recorded_at TEXT NOT NULL,
+        origin_json TEXT NOT NULL, access_boundary_json TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY, title TEXT NOT NULL, objective TEXT NOT NULL,
+        status TEXT NOT NULL, domain TEXT NOT NULL, owner TEXT NOT NULL,
+        project_key TEXT, visible_progress TEXT, waiting_for_user TEXT, candidate_result TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        entity_references_json TEXT NOT NULL, access_boundary_json TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE task_events (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+        source_id TEXT NOT NULL REFERENCES sources(id), type TEXT NOT NULL,
+        content TEXT NOT NULL, actor TEXT NOT NULL, occurred_at TEXT NOT NULL,
+        recorded_at TEXT NOT NULL
+      ) STRICT;
+    `)
+    const timestamp = '2026-09-10T09:01:00.000Z'
+    legacy.prepare('INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
+      'stage-task', '旧 Stage 任务', '旧 Stage 任务', 'active', 'relationship', 'main-agent',
+      null, null, null, null, '2026-09-10T09:00:00.000Z', '2026-09-10T09:00:00.000Z', '[]', JSON.stringify(accessBoundary),
+    )
+    for (const [id, content] of [['source-first', 'first'], ['source-second', 'second']] as const) {
+      legacy.prepare('INSERT INTO sources VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+        id, content, null, timestamp, timestamp,
+        JSON.stringify({ kind: 'task-event', reference: `event-${content}` }), JSON.stringify(accessBoundary),
+      )
+    }
+    legacy.prepare('INSERT INTO task_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+      'event-z-first', 'stage-task', 'source-first', 'note', 'first', 'main-agent', timestamp, timestamp,
+    )
+    legacy.prepare('INSERT INTO task_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
+      'event-a-second', 'stage-task', 'source-second', 'progress', 'second', 'main-agent', timestamp, timestamp,
+    )
+    legacy.close()
+
+    const store = new SQLitePersonalStore(databasePath)
+    expect(store.listTaskEvents('stage-task', relationshipAgent).map(event => event.id))
+      .toEqual(['event-z-first', 'event-a-second'])
+    expect(store.listTaskEvents('stage-task', summaryMain, 1).map(event => event.id))
+      .toEqual(['event-a-second'])
+    store.close()
+  })
+
+  it('maintains a MainAgent task card, filters visible Tasks, and preserves its immutable event journal', () => {
+    const store = new SQLitePersonalStore(databasePath)
+    const task = store.createTask({
+      title: '推进个人 Agent 主线',
+      objective: '完成 Stage 1.1 控制面基础',
+      status: 'active',
+      domain: 'work-project',
+      owner: 'main-agent',
+      projectKey: 'agents-master',
+      visibleProgress: '正在建立持久化基础。',
+      createdAt: '2026-09-10T09:00:00.000Z',
+      updatedAt: '2026-09-10T09:00:00.000Z',
+      entityReferences: [],
+      accessBoundary: { ...accessBoundary, mainAgent: 'full' },
+    })
+    const unrelated = store.createTask({
+      title: '关系任务',
+      status: 'paused',
+      domain: 'relationship',
+      owner: 'main-agent',
+      createdAt: '2026-09-10T09:01:00.000Z',
+      updatedAt: '2026-09-10T09:01:00.000Z',
+      entityReferences: [],
+      accessBoundary,
+    })
+
+    const updated = store.updateTask(task.id, {
+      visibleProgress: 'SQLite task journal 已可用。',
+      waitingForUser: '请确认下一阶段优先级。',
+      candidateResult: 'Stage 1.1 实现候选。',
+      updatedAt: '2026-09-10T10:00:00.000Z',
+    }, relationshipAgent)
+    const firstEvent = store.appendTaskEvent(task.id, {
+      type: 'progress',
+      content: '持久化任务模型已扩展。',
+      occurredAt: '2026-09-10T09:30:00.000Z',
+      recordedAt: '2026-09-10T09:31:00.000Z',
+    }, fullMain)
+    const secondEvent = store.appendTaskEvent(task.id, {
+      type: 'waiting-for-user',
+      content: '等待用户确认范围。',
+      actor: 'main-agent',
+      occurredAt: '2026-09-10T09:45:00.000Z',
+      recordedAt: '2026-09-10T09:46:00.000Z',
+    }, fullMain)
+
+    expect(updated).toMatchObject({
+      ...task,
+      visibleProgress: 'SQLite task journal 已可用。',
+      waitingForUser: '请确认下一阶段优先级。',
+      candidateResult: 'Stage 1.1 实现候选。',
+      updatedAt: '2026-09-10T10:00:00.000Z',
+    })
+    expect(store.listTasks(relationshipAgent, { domain: 'work-project', projectKey: 'agents-master' }))
+      .toEqual([updated])
+    expect(store.listTasks(relationshipAgent, { statuses: ['paused'] })).toEqual([unrelated])
+    expect(store.listTaskEvents(task.id, relationshipAgent)).toEqual([firstEvent, secondEvent])
+    expect(store.listTaskEvents(task.id, relationshipAgent, 1)).toEqual([secondEvent])
+    expect(() => store.updateTask(task.id, { visibleProgress: '不应写入。' }, {
+      requester: { kind: 'domain-agent', id: 'goals' }, use: 'general',
+    })).toThrow(`Task update is not authorized for this context: ${task.id}`)
+    expect(() => store.appendTaskEvent(task.id, { type: 'note', content: '不应写入。' }, {
+      requester: { kind: 'domain-agent', id: 'goals' }, use: 'general',
+    })).toThrow(`Task event append is not authorized for this context: ${task.id}`)
+    expect(() => store.appendTaskEvent(task.id, {
+      type: 'note',
+      content: '主 Agent 不能伪装成工作项目 Agent。',
+      actor: 'work-project-agent',
+    }, fullMain)).toThrow('Task event actor must match the authorized requester: main-agent')
+    expect(store.listTaskEvents(task.id, { requester: { kind: 'domain-agent', id: 'goals' }, use: 'general' })).toEqual([])
+    expect(() => store.updateTask(task.id, { updatedAt: '2026-09-10T08:59:59.999Z' }, relationshipAgent))
+      .toThrow('updatedAt must not be earlier than the current Task timestamp')
+    store.close()
+
+    const reopened = new SQLitePersonalStore(databasePath)
+    expect(reopened.getTask(task.id, relationshipAgent)).toEqual(updated)
+    expect(reopened.listTaskEvents(task.id, relationshipAgent)).toEqual([firstEvent, secondEvent])
+    reopened.close()
+  })
+
+  it('makes every TaskEvent citable evidence and removes it only with its Source', () => {
+    const store = new SQLitePersonalStore(databasePath)
+    const task = store.createTask({
+      title: '保留事件证据',
+      status: 'active',
+      createdAt: '2026-09-10T09:00:00.000Z',
+      updatedAt: '2026-09-10T09:00:00.000Z',
+      entityReferences: [],
+      accessBoundary,
+    })
+    const event = store.appendTaskEvent(task.id, {
+      type: 'note',
+      content: '用户确认这条进展可以作为后续认识的证据。',
+      actor: 'domain-agent:relationships',
+      occurredAt: '2026-09-10T09:01:00.000Z',
+      recordedAt: '2026-09-10T09:02:00.000Z',
+    }, relationshipAgent)
+    const source = store.getSource(event.sourceId, relationshipAgent)
+    expect(source).toEqual({
+      id: event.sourceId,
+      rawContent: event.content,
+      occurredAt: event.occurredAt,
+      recordedAt: event.recordedAt,
+      origin: { kind: 'task-event', reference: event.id },
+      accessBoundary,
+    })
+    const claim = store.createClaim({
+      statement: '该任务有用户确认的可引用进展。',
+      epistemicState: 'user-fact',
+      scope: 'project',
+      status: 'active',
+      validFrom: '2026-09-10T09:02:00.000Z',
+      evidenceIds: [event.sourceId],
+      accessBoundary,
+    })
+    store.close()
+
+    const reopened = new SQLitePersonalStore(databasePath)
+    expect(reopened.listTaskEvents(task.id, relationshipAgent)).toEqual([event])
+    expect(reopened.getSource(event.sourceId, relationshipAgent)).toEqual(source)
+    const preview = reopened.previewSourceDeletion(event.sourceId, relationshipAgent)
+    expect(preview?.affectedActiveTaskIds).toEqual([task.id])
+    expect(preview?.solelySupportedClaims).toEqual([claim])
+    const deletion = reopened.deleteSource(event.sourceId, relationshipAgent, { confirm: true })
+    expect(deletion.affectedActiveTaskIds).toEqual([task.id])
+    expect(deletion.retractedClaims).toEqual([{ ...claim, status: 'retracted' }])
+    expect(reopened.getSource(event.sourceId, relationshipAgent)).toBeUndefined()
+    expect(reopened.listTaskEvents(task.id, relationshipAgent)).toEqual([])
+    reopened.close()
+  })
+
+  it('redacts TaskEvent content structurally for a summary MainAgent reader', () => {
+    const store = new SQLitePersonalStore(databasePath)
+    const task = store.createTask({
+      title: '摘要可见的任务事件',
+      status: 'active',
+      createdAt: '2026-09-10T09:00:00.000Z',
+      updatedAt: '2026-09-10T09:00:00.000Z',
+      entityReferences: [],
+      accessBoundary: { ...accessBoundary, mainAgent: 'full' },
+    })
+    const event = store.appendTaskEvent(task.id, {
+      type: 'note',
+      content: '这段原始事件内容绝不能交给摘要读取者。',
+      occurredAt: '2026-09-10T09:01:00.000Z',
+      recordedAt: '2026-09-10T09:02:00.000Z',
+    }, relationshipAgent)
+    const typedSummaryMain = {
+      requester: { kind: 'main', access: 'summary' },
+      use: 'general',
+    } as const satisfies InternalContext
+    const summaryEvents: TaskEventSummaryView[] = store.listTaskEvents(task.id, typedSummaryMain)
+    const typedDomainAgent = {
+      requester: { kind: 'domain-agent', id: 'relationships' },
+      use: 'general',
+    } as const satisfies InternalContext
+    const typedFullMain = {
+      requester: { kind: 'main', access: 'full' },
+      use: 'general',
+    } as const satisfies InternalContext
+    const fullEvents: TaskEvent[] = store.listTaskEvents(task.id, typedDomainAgent)
+    const mainFullEvents: TaskEvent[] = store.listTaskEvents(task.id, typedFullMain)
+
+    expect(summaryEvents).toEqual([{
+      id: event.id,
+      taskId: event.taskId,
+      sourceId: event.sourceId,
+      type: event.type,
+      actor: event.actor,
+      occurredAt: event.occurredAt,
+      recordedAt: event.recordedAt,
+    }])
+    expect(summaryEvents[0]).not.toHaveProperty('content')
+    expect(fullEvents).toEqual([event])
+    expect(mainFullEvents).toEqual([event])
+    store.close()
+  })
+
+  it('records only actual status transitions with the authorized requester as actor', () => {
+    const store = new SQLitePersonalStore(databasePath)
+    const task = store.createTask({
+      title: '验证状态事件',
+      status: 'active',
+      createdAt: '2026-09-10T09:00:00.000Z',
+      updatedAt: '2026-09-10T09:00:00.000Z',
+      entityReferences: [],
+      accessBoundary,
+    })
+    expect(() => store.appendTaskEvent(task.id, {
+      type: 'status-change' as never,
+      content: '直接追加状态变更不能绕过任务状态写入。',
+    }, relationshipAgent)).toThrow('status-change events may only be created by updateTask')
+    const paused = store.updateTask(task.id, {
+      status: 'paused',
+      updatedAt: '2026-09-10T09:03:00.000Z',
+    }, relationshipAgent)
+    const [transition] = store.listTaskEvents(task.id, relationshipAgent)
+    expect(transition).toMatchObject({
+      taskId: task.id,
+      type: 'status-change',
+      content: 'Task status changed from active to paused.',
+      actor: 'domain-agent:relationships',
+      occurredAt: paused.updatedAt,
+      recordedAt: paused.updatedAt,
+    })
+    expect(store.getSource(transition.sourceId, relationshipAgent)).toMatchObject({
+      rawContent: transition.content,
+      occurredAt: paused.updatedAt,
+      recordedAt: paused.updatedAt,
+      origin: { kind: 'task-event', reference: transition.id },
+      accessBoundary,
+    })
+    store.updateTask(task.id, {
+      status: 'paused',
+      visibleProgress: '状态未变，只更新可见进展。',
+      updatedAt: '2026-09-10T09:04:00.000Z',
+    }, relationshipAgent)
+    store.updateTask(task.id, {
+      visibleProgress: '未提供状态也不写状态事件。',
+      updatedAt: '2026-09-10T09:05:00.000Z',
+    }, relationshipAgent)
+    expect(store.listTaskEvents(task.id, relationshipAgent)).toEqual([transition])
+    const completed = store.updateTask(task.id, {
+      status: 'completed',
+      updatedAt: '2026-09-10T09:06:00.000Z',
+    }, summaryMain)
+    expect(store.listTaskEvents(task.id, relationshipAgent)).toEqual([
+      transition,
+      expect.objectContaining({
+        type: 'status-change',
+        actor: 'main-agent',
+        content: 'Task status changed from paused to completed.',
+        occurredAt: completed.updatedAt,
+      }),
+    ])
+    expect(() => store.appendTaskEvent(task.id, {
+      type: 'note', content: '领域请求者不能伪装成主 Agent。', actor: 'main-agent',
+    }, relationshipAgent)).toThrow('Task event actor must match the authorized requester: domain-agent:relationships')
     store.close()
   })
 
@@ -982,6 +1383,7 @@ describe('SQLitePersonalStore', () => {
       CREATE TABLE claims (id TEXT PRIMARY KEY, statement TEXT NOT NULL, epistemic_state TEXT NOT NULL, scope TEXT NOT NULL, status TEXT NOT NULL, valid_from TEXT NOT NULL, valid_until TEXT, evidence_ids_json TEXT NOT NULL, access_boundary_json TEXT NOT NULL) STRICT;
       CREATE TABLE policies (id TEXT PRIMARY KEY, condition TEXT NOT NULL, action TEXT NOT NULL, depends_on_claim_ids_json TEXT NOT NULL, scope TEXT NOT NULL, valid_from TEXT NOT NULL, valid_until TEXT, access_boundary_json TEXT NOT NULL) STRICT;
       CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, entity_references_json TEXT NOT NULL, access_boundary_json TEXT NOT NULL) STRICT;
+      CREATE TABLE task_events (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), type TEXT NOT NULL, content TEXT NOT NULL, actor TEXT NOT NULL, occurred_at TEXT NOT NULL, recorded_at TEXT NOT NULL) STRICT;
     `)
     const sourceId = 'legacy-source'
     const claimId = 'legacy-claim'
@@ -995,12 +1397,52 @@ describe('SQLitePersonalStore', () => {
     legacy.prepare('INSERT INTO policies VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(
       policyId, '旧条件', '旧动作', JSON.stringify([claimId]), 'personal', '2026-09-10T09:00:00.000Z', null, JSON.stringify(accessBoundary),
     )
+    legacy.prepare('INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+      'legacy-task', '旧任务', 'active', '2026-09-10T09:00:00.000Z', '2026-09-10T09:00:00.000Z', '[]', JSON.stringify(accessBoundary),
+    )
+    legacy.prepare('INSERT INTO task_events VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+      'legacy-event', 'legacy-task', 'note', '旧事件仍应保留为可引用证据。', 'main-agent',
+      '2026-09-10T09:01:00.000Z', '2026-09-10T09:02:00.000Z',
+    )
+    legacy.prepare('INSERT INTO task_events VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+      'legacy-event-second', 'legacy-task', 'progress', '同一时间的第二条旧事件。', 'main-agent',
+      '2026-09-10T09:01:00.000Z', '2026-09-10T09:02:00.000Z',
+    )
     legacy.close()
 
     const store = new SQLitePersonalStore(databasePath)
     expect(store.getClaim(claimId, relationshipAgent)).toMatchObject({ id: claimId, status: 'active' })
     expect(store.getPolicy(policyId, relationshipAgent)).toMatchObject({ id: policyId, status: 'active' })
     expect(store.listActivePolicies(relationshipAgent, '2026-09-10T10:00:00.000Z')).toHaveLength(1)
+    expect(store.getTask('legacy-task', relationshipAgent)).toMatchObject({
+      id: 'legacy-task',
+      title: '旧任务',
+      objective: '旧任务',
+      domain: 'legacy',
+      owner: 'main-agent',
+      status: 'active',
+    })
+    const [legacyEvent] = store.listTaskEvents('legacy-task', relationshipAgent)
+    expect(legacyEvent).toMatchObject({
+      id: 'legacy-event',
+      taskId: 'legacy-task',
+      content: '旧事件仍应保留为可引用证据。',
+      actor: 'main-agent',
+      occurredAt: '2026-09-10T09:01:00.000Z',
+      recordedAt: '2026-09-10T09:02:00.000Z',
+    })
+    expect(store.getSource(legacyEvent.sourceId, relationshipAgent)).toEqual({
+      id: legacyEvent.sourceId,
+      rawContent: legacyEvent.content,
+      occurredAt: legacyEvent.occurredAt,
+      recordedAt: legacyEvent.recordedAt,
+      origin: { kind: 'task-event', reference: legacyEvent.id },
+      accessBoundary,
+    })
+    expect(store.listTaskEvents('legacy-task', relationshipAgent).map(event => event.id))
+      .toEqual(['legacy-event', 'legacy-event-second'])
+    expect(store.listTaskEvents('legacy-task', summaryMain, 1).map(event => event.id))
+      .toEqual(['legacy-event-second'])
     store.close()
   })
 })

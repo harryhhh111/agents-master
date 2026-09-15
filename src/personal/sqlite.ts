@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import type {
   AccessBoundary,
+  AppendableTaskEventType,
+  AppendTaskEventInput,
   Claim,
   ClaimEpistemicState,
   ClaimCorrection,
@@ -15,6 +17,7 @@ import type {
   EntityReference,
   ForgetClaimResult,
   InternalContext,
+  ListTasksInput,
   PersonalStore,
   Policy,
   PolicyId,
@@ -27,7 +30,17 @@ import type {
   SourceSummaryView,
   SourceView,
   Task,
+  TaskDomain,
+  TaskEvent,
+  TaskEventActor,
+  TaskEventSummaryView,
+  TaskEventId,
+  TaskEventType,
+  TaskEventViewForContext,
   TaskId,
+  TaskOwner,
+  TaskStatus,
+  UpdateTaskInput,
 } from './types.js'
 
 type SourceRow = {
@@ -71,11 +84,36 @@ type PolicyRow = {
 type TaskRow = {
   id: string
   title: string
-  status: Task['status']
+  objective: string | null
+  status: TaskStatus
+  domain: TaskDomain | null
+  owner: TaskOwner | null
+  project_key: string | null
+  visible_progress: string | null
+  waiting_for_user: string | null
+  candidate_result: string | null
   created_at: string
   updated_at: string
   entity_references_json: string
   access_boundary_json: string
+}
+
+type TaskEventRow = {
+  id: string
+  task_id: string
+  source_id: string | null
+  type: TaskEventType
+  content: string
+  actor: TaskEventActor
+  occurred_at: string
+  recorded_at: string
+  append_order: number
+}
+
+type TaskEventSummaryRow = Omit<TaskEventRow, 'content'>
+
+type RecordedTaskEventInput = Omit<AppendTaskEventInput, 'type'> & {
+  type: TaskEventType
 }
 
 const now = (): string => new Date().toISOString()
@@ -85,6 +123,12 @@ const legacyDenyBoundary: AccessBoundary = {
   allowInTaskContext: false,
   allowExternalDisclosure: false,
 }
+
+const taskStatuses: readonly TaskStatus[] = ['active', 'paused', 'completed', 'cancelled']
+const taskDomains: readonly TaskDomain[] = ['relationship', 'work-project', 'goal', 'legacy']
+const taskOwners: readonly TaskOwner[] = ['main-agent', 'work-project-agent']
+const taskEventTypes: readonly TaskEventType[] = ['note', 'progress', 'waiting-for-user', 'candidate-result', 'status-change']
+const appendableTaskEventTypes: readonly AppendableTaskEventType[] = ['note', 'progress', 'waiting-for-user', 'candidate-result']
 
 function requireText(value: string, field: string): void {
   if (!value.trim()) throw new Error(`${field} must not be empty`)
@@ -107,6 +151,53 @@ function requireValidWindow(validFrom: string, validUntil: string | undefined): 
     requireIsoTime(validUntil, 'validUntil')
     if (validUntil <= validFrom) throw new Error('validUntil must be after validFrom')
   }
+}
+
+function requireOptionalText(value: string | undefined, field: string): void {
+  if (value !== undefined) requireText(value, field)
+}
+
+function requireTaskStatus(status: TaskStatus): void {
+  if (!taskStatuses.includes(status)) throw new Error(`Unsupported Task status: ${status}`)
+}
+
+function requireTaskDomain(domain: TaskDomain): void {
+  if (!taskDomains.includes(domain)) throw new Error(`Unsupported Task domain: ${domain}`)
+}
+
+function requireTaskOwner(owner: TaskOwner): void {
+  if (!taskOwners.includes(owner)) throw new Error(`Unsupported Task owner: ${owner}`)
+}
+
+function requireValidTaskAssignment(domain: TaskDomain, owner: TaskOwner): void {
+  requireTaskDomain(domain)
+  requireTaskOwner(owner)
+  if ((domain === 'legacy' || domain === 'relationship' || domain === 'goal') && owner !== 'main-agent') {
+    throw new Error(`Task domain ${domain} must be owned by main-agent`)
+  }
+}
+
+function requireTaskEventType(type: TaskEventType): void {
+  if (!taskEventTypes.includes(type)) throw new Error(`Unsupported Task event type: ${type}`)
+}
+
+function requireAppendableTaskEventType(type: AppendableTaskEventType): void {
+  if (!appendableTaskEventTypes.includes(type)) {
+    throw new Error('status-change events may only be created by updateTask')
+  }
+}
+
+/**
+ * Owners remain fixed product roles. Events record the actual authorized
+ * requester, so any domain already permitted by a Task boundary can append
+ * truthfully without impersonating an owner.
+ */
+function taskEventActorForContext(context: InternalContext): TaskEventActor {
+  if (context.requester.kind === 'main') return 'main-agent'
+  // Preserve the established work-project identity; other authorized domains
+  // use an explicit requester encoding rather than pretending to be an owner.
+  if (context.requester.id === 'work-project-agent') return 'work-project-agent'
+  return `domain-agent:${context.requester.id}`
 }
 
 function isAllowed(boundary: AccessBoundary, context: InternalContext): boolean {
@@ -182,14 +273,39 @@ export class SQLitePersonalStore implements PersonalStore {
       CREATE TABLE IF NOT EXISTS tasks (
         id TEXT PRIMARY KEY,
         title TEXT NOT NULL,
+        objective TEXT NOT NULL,
         status TEXT NOT NULL,
+        domain TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        project_key TEXT,
+        visible_progress TEXT,
+        waiting_for_user TEXT,
+        candidate_result TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         entity_references_json TEXT NOT NULL,
         access_boundary_json TEXT NOT NULL
       ) STRICT;
+      CREATE INDEX IF NOT EXISTS tasks_by_updated_at ON tasks(updated_at DESC, id);
+      CREATE TABLE IF NOT EXISTS task_events (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        source_id TEXT NOT NULL REFERENCES sources(id),
+        type TEXT NOT NULL,
+        content TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        occurred_at TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        append_order INTEGER NOT NULL
+      ) STRICT;
     `)
-    this.#migrateSchema()
+    this.#transaction(() => this.#migrateSchema())
+    this.#db.exec(`
+      DROP INDEX IF EXISTS task_events_by_task;
+      CREATE INDEX task_events_by_task ON task_events(task_id, occurred_at, recorded_at, append_order);
+      CREATE UNIQUE INDEX IF NOT EXISTS task_events_by_source ON task_events(source_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS task_events_by_task_append_order ON task_events(task_id, append_order);
+    `)
   }
 
   createSource(input: CreateSourceInput): Source {
@@ -416,6 +532,16 @@ export class SQLitePersonalStore implements PersonalStore {
   createTask(input: CreateTaskInput): Task {
     requireText(input.title, 'title')
     for (const reference of input.entityReferences) this.#validateEntityReference(reference)
+    const objective = input.objective ?? input.title
+    requireText(objective, 'objective')
+    const domain = input.domain ?? 'legacy'
+    const owner = input.owner ?? 'main-agent'
+    requireTaskStatus(input.status)
+    requireValidTaskAssignment(domain, owner)
+    requireOptionalText(input.projectKey, 'projectKey')
+    requireOptionalText(input.visibleProgress, 'visibleProgress')
+    requireOptionalText(input.waitingForUser, 'waitingForUser')
+    requireOptionalText(input.candidateResult, 'candidateResult')
     const createdAt = input.createdAt ?? now()
     requireIsoTime(createdAt, 'createdAt')
     if (input.updatedAt !== undefined) requireIsoTime(input.updatedAt, 'updatedAt')
@@ -424,16 +550,36 @@ export class SQLitePersonalStore implements PersonalStore {
     const task: Task = {
       id: randomUUID(),
       title: input.title,
+      objective,
       status: input.status,
+      domain,
+      owner,
+      ...(input.projectKey === undefined ? {} : { projectKey: input.projectKey }),
+      ...(input.visibleProgress === undefined ? {} : { visibleProgress: input.visibleProgress }),
+      ...(input.waitingForUser === undefined ? {} : { waitingForUser: input.waitingForUser }),
+      ...(input.candidateResult === undefined ? {} : { candidateResult: input.candidateResult }),
       createdAt,
       updatedAt,
       entityReferences: input.entityReferences,
       accessBoundary: input.accessBoundary,
     }
-    this.#db.prepare(`INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+    this.#db.prepare(`
+      INSERT INTO tasks (
+        id, title, objective, status, domain, owner, project_key, visible_progress,
+        waiting_for_user, candidate_result, created_at, updated_at,
+        entity_references_json, access_boundary_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
       task.id,
       task.title,
+      task.objective,
       task.status,
+      task.domain,
+      task.owner,
+      task.projectKey ?? null,
+      task.visibleProgress ?? null,
+      task.waitingForUser ?? null,
+      task.candidateResult ?? null,
       task.createdAt,
       task.updatedAt,
       JSON.stringify(task.entityReferences),
@@ -445,6 +591,224 @@ export class SQLitePersonalStore implements PersonalStore {
   getTask(id: TaskId, context: InternalContext): Task | undefined {
     const task = this.#findTask(id)
     return task && isAllowed(task.accessBoundary, context) ? task : undefined
+  }
+
+  listTasks(context: InternalContext, input: ListTasksInput = {}): Task[] {
+    if (input.statuses !== undefined) input.statuses.forEach(requireTaskStatus)
+    if (input.domain !== undefined) requireTaskDomain(input.domain)
+    if (input.owner !== undefined) requireTaskOwner(input.owner)
+    if (input.projectKey !== undefined) requireText(input.projectKey, 'projectKey')
+    const rows = this.#db.prepare('SELECT * FROM tasks ORDER BY updated_at DESC, id').all() as TaskRow[]
+    return rows
+      .map(row => this.#taskFromRow(row))
+      .filter(task => isAllowed(task.accessBoundary, context))
+      .filter(task => input.statuses === undefined || input.statuses.includes(task.status))
+      .filter(task => input.domain === undefined || task.domain === input.domain)
+      .filter(task => input.owner === undefined || task.owner === input.owner)
+      .filter(task => input.projectKey === undefined || task.projectKey === input.projectKey)
+  }
+
+  updateTask(id: TaskId, input: UpdateTaskInput, context: InternalContext): Task {
+    if (input.title !== undefined) requireText(input.title, 'title')
+    if (input.objective !== undefined) requireText(input.objective, 'objective')
+    if (input.status !== undefined) requireTaskStatus(input.status)
+    if (input.projectKey !== undefined && input.projectKey !== null) requireText(input.projectKey, 'projectKey')
+    if (input.visibleProgress !== undefined && input.visibleProgress !== null) requireText(input.visibleProgress, 'visibleProgress')
+    if (input.waitingForUser !== undefined && input.waitingForUser !== null) requireText(input.waitingForUser, 'waitingForUser')
+    if (input.candidateResult !== undefined && input.candidateResult !== null) requireText(input.candidateResult, 'candidateResult')
+    if (input.updatedAt !== undefined) requireIsoTime(input.updatedAt, 'updatedAt')
+
+    // Lock before reading so both authorization and timestamp validation use
+    // the persisted row that this write will modify. The SQL below only names
+    // supplied fields, so an independent store instance cannot overwrite a
+    // field it did not intend to change.
+    return this.#transaction(() => {
+      const current = this.#findTask(id)
+      if (!current) throw new Error(`Task does not exist: ${id}`)
+      requireAuthorized(current, context, 'Task update')
+      if (input.entityReferences !== undefined) {
+        for (const reference of input.entityReferences) this.#validateEntityReference(reference)
+      }
+      const domain = input.domain ?? current.domain
+      const owner = input.owner ?? current.owner
+      requireValidTaskAssignment(domain, owner)
+      const updatedAt = input.updatedAt ?? now()
+      if (updatedAt < current.createdAt || updatedAt < current.updatedAt) {
+        throw new Error('updatedAt must not be earlier than the current Task timestamp')
+      }
+      const projectKey = input.projectKey === undefined ? current.projectKey : input.projectKey ?? undefined
+      const visibleProgress = input.visibleProgress === undefined ? current.visibleProgress : input.visibleProgress ?? undefined
+      const waitingForUser = input.waitingForUser === undefined ? current.waitingForUser : input.waitingForUser ?? undefined
+      const candidateResult = input.candidateResult === undefined ? current.candidateResult : input.candidateResult ?? undefined
+      const updated: Task = {
+        id: current.id,
+        title: input.title ?? current.title,
+        objective: input.objective ?? current.objective,
+        status: input.status ?? current.status,
+        domain,
+        owner,
+        ...(projectKey === undefined ? {} : { projectKey }),
+        ...(visibleProgress === undefined ? {} : { visibleProgress }),
+        ...(waitingForUser === undefined ? {} : { waitingForUser }),
+        ...(candidateResult === undefined ? {} : { candidateResult }),
+        createdAt: current.createdAt,
+        updatedAt,
+        entityReferences: input.entityReferences ?? current.entityReferences,
+        accessBoundary: current.accessBoundary,
+      }
+      const assignments: string[] = []
+      const values: Array<string | null> = []
+      if (input.title !== undefined) { assignments.push('title = ?'); values.push(updated.title) }
+      if (input.objective !== undefined) { assignments.push('objective = ?'); values.push(updated.objective) }
+      if (input.status !== undefined) { assignments.push('status = ?'); values.push(updated.status) }
+      if (input.domain !== undefined) { assignments.push('domain = ?'); values.push(updated.domain) }
+      if (input.owner !== undefined) { assignments.push('owner = ?'); values.push(updated.owner) }
+      if (input.projectKey !== undefined) { assignments.push('project_key = ?'); values.push(updated.projectKey ?? null) }
+      if (input.visibleProgress !== undefined) { assignments.push('visible_progress = ?'); values.push(updated.visibleProgress ?? null) }
+      if (input.waitingForUser !== undefined) { assignments.push('waiting_for_user = ?'); values.push(updated.waitingForUser ?? null) }
+      if (input.candidateResult !== undefined) { assignments.push('candidate_result = ?'); values.push(updated.candidateResult ?? null) }
+      if (input.entityReferences !== undefined) {
+        assignments.push('entity_references_json = ?')
+        values.push(JSON.stringify(updated.entityReferences))
+      }
+      assignments.push('updated_at = ?')
+      values.push(updated.updatedAt)
+      this.#db.prepare(`UPDATE tasks SET ${assignments.join(', ')} WHERE id = ?`).run(...values, updated.id)
+      if (input.status !== undefined && input.status !== current.status) {
+        this.#appendTaskEventForTask(current, {
+          type: 'status-change',
+          content: `Task status changed from ${current.status} to ${updated.status}.`,
+          // The supplied update timestamp is the effective time of the status
+          // change, so using it for both event times preserves their ordering.
+          occurredAt: updated.updatedAt,
+          recordedAt: updated.updatedAt,
+        }, taskEventActorForContext(context))
+      }
+      return updated
+    })
+  }
+
+  appendTaskEvent(id: TaskId, input: AppendTaskEventInput, context: InternalContext): TaskEvent {
+    requireTaskEventType(input.type)
+    requireAppendableTaskEventType(input.type)
+    requireText(input.content, 'content')
+    if (input.occurredAt !== undefined) requireIsoTime(input.occurredAt, 'occurredAt')
+    if (input.recordedAt !== undefined) requireIsoTime(input.recordedAt, 'recordedAt')
+    return this.#transaction(() => {
+      const task = this.#findTask(id)
+      if (!task) throw new Error(`Task does not exist: ${id}`)
+      requireAuthorized(task, context, 'Task event append')
+      const actor = taskEventActorForContext(context)
+      if (input.actor !== undefined && input.actor !== actor) {
+        throw new Error(`Task event actor must match the authorized requester: ${actor}`)
+      }
+      return this.#appendTaskEventForTask(task, input, actor)
+    })
+  }
+
+  /** Caller holds the transaction that makes the event and its evidence inseparable. */
+  #appendTaskEventForTask(
+    task: Task,
+    input: RecordedTaskEventInput,
+    actor: TaskEventActor,
+  ): TaskEvent {
+    requireTaskEventType(input.type)
+    const occurredAt = input.occurredAt ?? now()
+    const recordedAt = input.recordedAt ?? now()
+    requireIsoTime(occurredAt, 'occurredAt')
+    requireIsoTime(recordedAt, 'recordedAt')
+    if (recordedAt < occurredAt) throw new Error('recordedAt must not be earlier than occurredAt')
+
+    const eventId = randomUUID() as TaskEventId
+    const source: Source = {
+      id: randomUUID(),
+      rawContent: input.content,
+      occurredAt,
+      recordedAt,
+      origin: { kind: 'task-event', reference: eventId },
+      accessBoundary: task.accessBoundary,
+    }
+    const event: TaskEvent = {
+      id: eventId,
+      taskId: task.id,
+      sourceId: source.id,
+      type: input.type,
+      content: input.content,
+      actor,
+      occurredAt,
+      recordedAt,
+    }
+    this.#db.prepare(`
+      INSERT INTO sources (
+        id, raw_content, summary, occurred_at, recorded_at, origin_json, access_boundary_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      source.id,
+      source.rawContent,
+      null,
+      source.occurredAt,
+      source.recordedAt,
+      JSON.stringify(source.origin),
+      JSON.stringify(source.accessBoundary),
+    )
+    this.#db.prepare(`
+      INSERT INTO task_events (id, task_id, source_id, type, content, actor, occurred_at, recorded_at, append_order)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, (
+        SELECT COALESCE(MAX(append_order), 0) + 1 FROM task_events WHERE task_id = ?
+      ))
+    `).run(
+      event.id,
+      event.taskId,
+      event.sourceId,
+      event.type,
+      event.content,
+      event.actor,
+      event.occurredAt,
+      event.recordedAt,
+      event.taskId,
+    )
+    // Event evidence and the parent Task's recency are one journal mutation.
+    // A backdated event cannot move a Task clock backwards.
+    this.#db.prepare(`
+      UPDATE tasks
+      SET updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END
+      WHERE id = ?
+    `).run(event.recordedAt, event.recordedAt, event.taskId)
+    return event
+  }
+
+  listTaskEvents<Context extends InternalContext>(
+    id: TaskId,
+    context: Context,
+    limit?: number,
+  ): TaskEventViewForContext<Context>[] {
+    const task = this.#findTask(id)
+    if (!task || !isAllowed(task.accessBoundary, context)) return []
+    if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1)) {
+      throw new Error('limit must be a positive integer')
+    }
+    if (context.requester.kind === 'main' && context.requester.access === 'summary') {
+      const rows = limit === undefined
+        ? this.#db.prepare(`
+            SELECT id, task_id, source_id, type, actor, occurred_at, recorded_at
+            FROM task_events WHERE task_id = ? ORDER BY occurred_at, recorded_at, append_order
+          `).all(id) as TaskEventSummaryRow[]
+        : this.#db.prepare(`
+            SELECT id, task_id, source_id, type, actor, occurred_at, recorded_at FROM (
+              SELECT id, task_id, source_id, type, actor, occurred_at, recorded_at, append_order
+              FROM task_events WHERE task_id = ? ORDER BY occurred_at DESC, recorded_at DESC, append_order DESC LIMIT ?
+            ) ORDER BY occurred_at, recorded_at, append_order
+          `).all(id, limit) as TaskEventSummaryRow[]
+      return rows.map(row => this.#taskEventSummaryFromRow(row)) as TaskEventViewForContext<Context>[]
+    }
+    const rows = limit === undefined
+      ? this.#db.prepare('SELECT * FROM task_events WHERE task_id = ? ORDER BY occurred_at, recorded_at, append_order').all(id) as TaskEventRow[]
+      : this.#db.prepare(`
+          SELECT * FROM (
+            SELECT * FROM task_events WHERE task_id = ? ORDER BY occurred_at DESC, recorded_at DESC, append_order DESC LIMIT ?
+          ) ORDER BY occurred_at, recorded_at, append_order
+        `).all(id, limit) as TaskEventRow[]
+    return rows.map(row => this.#taskEventFromRow(row)) as TaskEventViewForContext<Context>[]
   }
 
   previewSourceDeletion(id: SourceId, context: InternalContext): SourceDeletionPreview | undefined {
@@ -478,6 +842,9 @@ export class SQLitePersonalStore implements PersonalStore {
         this.#db.prepare("UPDATE policies SET status = 'retracted' WHERE id = ?").run(policy.id)
         return retracted
       })
+      // This is the sole exception to TaskEvent append-only history: deleting
+      // its evidence must also remove the duplicate raw event content.
+      this.#db.prepare('DELETE FROM task_events WHERE source_id = ?').run(id)
       this.#db.prepare('DELETE FROM sources WHERE id = ?').run(id)
       return {
         deletedSource: preview.source,
@@ -581,14 +948,25 @@ export class SQLitePersonalStore implements PersonalStore {
       || !policiesToRetract.every(policy => isAllowed(policy.accessBoundary, context))) {
       return undefined
     }
+    const eventLinkedTasks = (this.#db.prepare(`
+      SELECT DISTINCT tasks.*
+      FROM tasks JOIN task_events ON task_events.task_id = tasks.id
+      WHERE task_events.source_id = ?
+      ORDER BY tasks.id
+    `).all(id) as TaskRow[]).map(row => this.#taskFromRow(row))
+    // Removing an event is a mutation of its parent Task's journal even when
+    // the task is no longer active, so no hidden journal may be changed.
+    if (!eventLinkedTasks.every(task => isAllowed(task.accessBoundary, context))) return undefined
+
     const affectedIds = new Set<string>([
       id,
       ...claims.map(claim => claim.id),
       ...policiesToRetract.map(policy => policy.id),
     ])
+    const eventLinkedTaskIds = new Set(eventLinkedTasks.map(task => task.id))
     const affectedActiveTasks = (this.#db.prepare("SELECT * FROM tasks WHERE status = 'active' ORDER BY id").all() as TaskRow[])
       .map(row => this.#taskFromRow(row))
-      .filter(task => task.entityReferences.some(reference => affectedIds.has(reference.id)))
+      .filter(task => eventLinkedTaskIds.has(task.id) || task.entityReferences.some(reference => affectedIds.has(reference.id)))
     if (!affectedActiveTasks.every(task => isAllowed(task.accessBoundary, context))) return undefined
 
     return {
@@ -663,9 +1041,107 @@ export class SQLitePersonalStore implements PersonalStore {
         JSON.stringify(legacyDenyBoundary),
       )
     }
+    if (!this.#hasColumn('tasks', 'objective')) {
+      this.#db.exec('ALTER TABLE tasks ADD COLUMN objective TEXT')
+      this.#db.exec('UPDATE tasks SET objective = title WHERE objective IS NULL')
+    }
+    if (!this.#hasColumn('tasks', 'domain')) {
+      this.#db.exec('ALTER TABLE tasks ADD COLUMN domain TEXT')
+      this.#db.exec("UPDATE tasks SET domain = 'legacy' WHERE domain IS NULL")
+    }
+    if (!this.#hasColumn('tasks', 'owner')) {
+      this.#db.exec('ALTER TABLE tasks ADD COLUMN owner TEXT')
+      this.#db.exec("UPDATE tasks SET owner = 'main-agent' WHERE owner IS NULL")
+    }
+    if (!this.#hasColumn('tasks', 'project_key')) this.#db.exec('ALTER TABLE tasks ADD COLUMN project_key TEXT')
+    if (!this.#hasColumn('tasks', 'visible_progress')) this.#db.exec('ALTER TABLE tasks ADD COLUMN visible_progress TEXT')
+    if (!this.#hasColumn('tasks', 'waiting_for_user')) this.#db.exec('ALTER TABLE tasks ADD COLUMN waiting_for_user TEXT')
+    if (!this.#hasColumn('tasks', 'candidate_result')) this.#db.exec('ALTER TABLE tasks ADD COLUMN candidate_result TEXT')
+    if (!this.#hasColumn('task_events', 'source_id')) {
+      // The prior Stage 1.1 table held raw event text without citable evidence.
+      // Rebuild it twice: first permit a temporary NULL while sources are made,
+      // then restore the non-null relation used by all current writes.
+      this.#rebuildTaskEventsWithoutSourceRelation()
+      this.#backfillTaskEventSources()
+      this.#rebuildTaskEventsWithSourceRelation(true)
+    } else if (!this.#hasColumn('task_events', 'append_order')) {
+      // The provenance-aware Stage 1.1 table already has its Sources. Rebuild
+      // it with a durable per-Task sequence seeded from insertion rowids.
+      this.#rebuildTaskEventsWithSourceRelation(false)
+    }
   }
 
-  #hasColumn(table: 'sources' | 'claims' | 'policies' | 'tasks', column: string): boolean {
+  #rebuildTaskEventsWithoutSourceRelation(): void {
+    this.#db.exec('ALTER TABLE task_events RENAME TO task_events_legacy')
+    this.#db.exec(`
+      CREATE TABLE task_events (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        source_id TEXT REFERENCES sources(id),
+        type TEXT NOT NULL,
+        content TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        occurred_at TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        append_order INTEGER NOT NULL
+      ) STRICT;
+      INSERT INTO task_events (
+        id, task_id, source_id, type, content, actor, occurred_at, recorded_at, append_order
+      )
+      SELECT id, task_id, NULL, type, content, actor, occurred_at, recorded_at, rowid
+      FROM task_events_legacy;
+      DROP TABLE task_events_legacy;
+    `)
+  }
+
+  #rebuildTaskEventsWithSourceRelation(preserveAppendOrder: boolean): void {
+    this.#db.exec('ALTER TABLE task_events RENAME TO task_events_legacy')
+    this.#db.exec(`
+      CREATE TABLE task_events (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        source_id TEXT NOT NULL REFERENCES sources(id),
+        type TEXT NOT NULL,
+        content TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        occurred_at TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        append_order INTEGER NOT NULL
+      ) STRICT;
+      INSERT INTO task_events (
+        id, task_id, source_id, type, content, actor, occurred_at, recorded_at, append_order
+      )
+      SELECT id, task_id, source_id, type, content, actor, occurred_at, recorded_at,
+        ${preserveAppendOrder ? 'append_order' : 'rowid'}
+      FROM task_events_legacy;
+      DROP TABLE task_events_legacy;
+    `)
+  }
+
+  #backfillTaskEventSources(): void {
+    const rows = this.#db.prepare('SELECT * FROM task_events WHERE source_id IS NULL').all() as TaskEventRow[]
+    for (const row of rows) {
+      const task = this.#findTask(row.task_id)
+      if (!task) throw new Error(`Task event has no parent Task: ${row.id}`)
+      const sourceId = randomUUID()
+      this.#db.prepare(`
+        INSERT INTO sources (
+          id, raw_content, summary, occurred_at, recorded_at, origin_json, access_boundary_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        sourceId,
+        row.content,
+        null,
+        row.occurred_at,
+        row.recorded_at,
+        JSON.stringify({ kind: 'task-event', reference: row.id } satisfies SourceOrigin),
+        JSON.stringify(task.accessBoundary),
+      )
+      this.#db.prepare('UPDATE task_events SET source_id = ? WHERE id = ?').run(sourceId, row.id)
+    }
+  }
+
+  #hasColumn(table: 'sources' | 'claims' | 'policies' | 'tasks' | 'task_events', column: string): boolean {
     const columns = this.#db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
     return columns.some(entry => entry.name === column)
   }
@@ -727,11 +1203,47 @@ export class SQLitePersonalStore implements PersonalStore {
     return {
       id: row.id,
       title: row.title,
+      // The coalesce guards against a partially migrated database being opened
+      // concurrently during deployment; normal migrations backfill these.
+      objective: row.objective ?? row.title,
       status: row.status,
+      domain: row.domain ?? 'legacy',
+      owner: row.owner ?? 'main-agent',
+      ...(row.project_key === null ? {} : { projectKey: row.project_key }),
+      ...(row.visible_progress === null ? {} : { visibleProgress: row.visible_progress }),
+      ...(row.waiting_for_user === null ? {} : { waitingForUser: row.waiting_for_user }),
+      ...(row.candidate_result === null ? {} : { candidateResult: row.candidate_result }),
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       entityReferences: JSON.parse(row.entity_references_json) as EntityReference[],
       accessBoundary: JSON.parse(row.access_boundary_json) as AccessBoundary,
+    }
+  }
+
+  #taskEventFromRow(row: TaskEventRow): TaskEvent {
+    if (row.source_id === null) throw new Error(`Task event is missing its provenance Source: ${row.id}`)
+    return {
+      id: row.id as TaskEventId,
+      taskId: row.task_id,
+      sourceId: row.source_id,
+      type: row.type,
+      content: row.content,
+      actor: row.actor,
+      occurredAt: row.occurred_at,
+      recordedAt: row.recorded_at,
+    }
+  }
+
+  #taskEventSummaryFromRow(row: TaskEventSummaryRow): TaskEventSummaryView {
+    if (row.source_id === null) throw new Error(`Task event is missing its provenance Source: ${row.id}`)
+    return {
+      id: row.id as TaskEventId,
+      taskId: row.task_id,
+      sourceId: row.source_id,
+      type: row.type,
+      actor: row.actor,
+      occurredAt: row.occurred_at,
+      recordedAt: row.recorded_at,
     }
   }
 }
