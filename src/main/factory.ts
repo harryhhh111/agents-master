@@ -1,5 +1,6 @@
 import { chmodSync, mkdirSync, statSync } from 'node:fs'
 import path from 'node:path'
+import type { FrontBrain } from '../frontbrain/types.js'
 import { SQLiteMainInboxStore, type SQLiteMainInboxStoreOptions } from './inbox.js'
 import { MainAgentRuntime } from './runtime.js'
 
@@ -7,6 +8,8 @@ export interface MainAgentRuntimeFactoryOptions extends SQLiteMainInboxStoreOpti
   /** Required composition-owned directory; stores never create it themselves. */
   dataDirectory: string
   databaseFileName?: string
+  /** Optional Stage 1.2b foreground model; required before processing user-message events. */
+  frontBrain?: FrontBrain
 }
 
 export interface MainAgentRuntimeResources {
@@ -48,7 +51,7 @@ export function createMainAgentRuntime(options: MainAgentRuntimeFactoryOptions):
   return {
     databasePath,
     store,
-    runtime: new MainAgentRuntime(store),
+    runtime: new MainAgentRuntime(store, options.frontBrain),
     close: () => store.close(),
   }
 }

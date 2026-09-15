@@ -10,11 +10,14 @@ import type {
   InboxEventType,
   InboxPayload,
   MainConversationMessage,
+  MainConversationMessageId,
   MainAgentRuntimeStore,
   ReceiveUserMessageInput,
   ReceiveUserMessageResult,
+  RecordProcessedUserMessageEventInput,
+  RecordProcessedUserMessageEventResult,
 } from './types.js'
-import { InboxIdempotencyConflictError } from './types.js'
+import { InboxIdempotencyConflictError, maxMainConversationContextMessages } from './types.js'
 
 type InboxRow = {
   id: string
@@ -44,8 +47,6 @@ type ConversationRow = {
 export interface SQLiteMainInboxStoreOptions {
   clock?: () => string
 }
-
-const maxRecentContextMessages = 100
 
 function requireText(value: string, field: string): void {
   if (!value.trim()) throw new Error(`${field} must not be empty`)
@@ -144,14 +145,41 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
   }
 
   readRecentContext(limit = 20): MainConversationMessage[] {
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > maxRecentContextMessages) {
-      throw new Error(`limit must be a positive integer no greater than ${maxRecentContextMessages}`)
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > maxMainConversationContextMessages) {
+      throw new Error(`limit must be a positive integer no greater than ${maxMainConversationContextMessages}`)
     }
     const rows = this.#db.prepare(`
       SELECT * FROM (
         SELECT * FROM main_conversation_messages ORDER BY created_at DESC, append_order DESC LIMIT ?
       ) ORDER BY created_at, append_order
     `).all(limit) as ConversationRow[]
+    return rows.map(toMessage)
+  }
+
+  /**
+   * Anchored foreground read: the persisted conversation up to and including
+   * the anchor message (by append order), windowed to the most recent `limit`
+   * messages. The window is selected by append order — the deterministic
+   * admission sequence — so the anchor is always inside it no matter how
+   * small the limit is, and nothing appended after the anchor ever leaks in.
+   * The result is then returned in the usual chronological order.
+   */
+  readContextThroughMessage(messageId: MainConversationMessageId, limit = 20): MainConversationMessage[] {
+    requireText(messageId, 'messageId')
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > maxMainConversationContextMessages) {
+      throw new Error(`limit must be a positive integer no greater than ${maxMainConversationContextMessages}`)
+    }
+    const rows = this.#db.prepare(`
+      SELECT * FROM (
+        SELECT m.* FROM main_conversation_messages m
+        JOIN main_conversation_messages anchor ON anchor.id = ?
+        WHERE m.append_order <= anchor.append_order
+        ORDER BY m.append_order DESC LIMIT ?
+      ) ORDER BY created_at, append_order
+    `).all(messageId, limit) as ConversationRow[]
+    if (!rows.some(row => row.id === messageId)) {
+      throw new Error(`Main conversation message not found: ${messageId}`)
+    }
     return rows.map(toMessage)
   }
 
@@ -245,25 +273,54 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
   }
 
   claimNextPendingEvent(claimedAt = this.#now()): InboxEvent | undefined {
-    requireIsoTime(claimedAt, 'claimedAt')
+    return this.#claimNextPendingEventOfType(undefined, claimedAt)
+  }
+
+  /**
+   * Foreground-only claim: picks the next eligible pending user-message event
+   * and never claims or alters timer/domain-update events, which keep waiting
+   * for their own consumers.
+   */
+  claimNextPendingUserMessageEvent(claimedAt = this.#now()): InboxEvent | undefined {
+    return this.#claimNextPendingEventOfType('user-message', claimedAt)
+  }
+
+  /**
+   * Persists the assistant reply and flips the exact claimed user-message
+   * event to processed inside one transaction. The transition is conditional
+   * on `status = 'claimed'`, so a repeat or race rolls the whole transaction
+   * back — the assistant insert can never be committed twice.
+   */
+  recordProcessedUserMessageEvent(input: RecordProcessedUserMessageEventInput): RecordProcessedUserMessageEventResult {
+    requireText(input.eventId, 'eventId')
+    requireText(input.content, 'content')
+    const processedAt = input.processedAt ?? this.#now()
+    requireIsoTime(processedAt, 'processedAt')
+
     this.#db.exec('BEGIN IMMEDIATE')
     try {
-      const candidate = this.#db.prepare(`
-        SELECT * FROM inbox_events WHERE status = 'pending'
-        ORDER BY CASE priority WHEN 'interrupt' THEN 0 ELSE 1 END, append_order LIMIT 1
-      `).get() as InboxRow | undefined
-      if (!candidate) {
-        this.#db.exec('COMMIT')
-        return undefined
+      const event = this.#findEvent(input.eventId)
+      if (event.type !== 'user-message') {
+        throw new Error(`Cannot record a processed reply for non-user inbox event ${input.eventId} (type ${event.type})`)
       }
+      const message: MainConversationMessage = {
+        id: randomUUID(), role: 'assistant', content: input.content, createdAt: processedAt,
+      }
+      this.#db.prepare(`
+        INSERT INTO main_conversation_messages (id, role, content, created_at, append_order)
+        VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(append_order), 0) + 1 FROM main_conversation_messages))
+      `).run(message.id, message.role, message.content, message.createdAt)
       const update = this.#db.prepare(`
-        UPDATE inbox_events SET status = 'claimed', claimed_at = ?, updated_at = ?
-        WHERE id = ? AND status = 'pending'
-      `).run(claimedAt, claimedAt, candidate.id)
-      if (update.changes !== 1) throw new Error(`Unable to claim pending inbox event: ${candidate.id}`)
-      const claimed = this.#findEvent(candidate.id)
+        UPDATE inbox_events SET status = 'processed', processed_at = ?, updated_at = ?
+        WHERE id = ? AND status = 'claimed'
+      `).run(processedAt, processedAt, input.eventId)
+      if (update.changes !== 1) {
+        const current = this.#db.prepare('SELECT status FROM inbox_events WHERE id = ?')
+          .get(input.eventId) as { status: InboxEventStatus } | undefined
+        throw new Error(`Cannot transition inbox event ${input.eventId} from ${current?.status ?? 'missing'} to processed`)
+      }
       this.#db.exec('COMMIT')
-      return toEvent(claimed)
+      return { message, event: toEvent(this.#findEvent(input.eventId)) }
     } catch (error) {
       this.#db.exec('ROLLBACK')
       throw error
@@ -285,6 +342,19 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
     `).run(recoveredAt).changes)
   }
 
+  /**
+   * Foreground-only recovery: returns only abandoned claimed user-message
+   * events to pending. Claimed timer/domain-update events are never reset —
+   * they may belong to other consumers and keep their claims.
+   */
+  recoverClaimedUserMessageEvents(recoveredAt = this.#now()): number {
+    requireIsoTime(recoveredAt, 'recoveredAt')
+    return Number(this.#db.prepare(`
+      UPDATE inbox_events SET status = 'pending', claimed_at = NULL, updated_at = ?
+      WHERE status = 'claimed' AND type = 'user-message'
+    `).run(recoveredAt).changes)
+  }
+
   close(): void {
     this.#db.close()
   }
@@ -293,6 +363,37 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
     const value = this.#clock()
     requireIsoTime(value, 'clock result')
     return value
+  }
+
+  #claimNextPendingEventOfType(type: InboxEventType | undefined, claimedAt: string): InboxEvent | undefined {
+    requireIsoTime(claimedAt, 'claimedAt')
+    this.#db.exec('BEGIN IMMEDIATE')
+    try {
+      const candidate = (type === undefined
+        ? this.#db.prepare(`
+            SELECT * FROM inbox_events WHERE status = 'pending'
+            ORDER BY CASE priority WHEN 'interrupt' THEN 0 ELSE 1 END, append_order LIMIT 1
+          `).get()
+        : this.#db.prepare(`
+            SELECT * FROM inbox_events WHERE status = 'pending' AND type = ?
+            ORDER BY CASE priority WHEN 'interrupt' THEN 0 ELSE 1 END, append_order LIMIT 1
+          `).get(type)) as InboxRow | undefined
+      if (!candidate) {
+        this.#db.exec('COMMIT')
+        return undefined
+      }
+      const update = this.#db.prepare(`
+        UPDATE inbox_events SET status = 'claimed', claimed_at = ?, updated_at = ?
+        WHERE id = ? AND status = 'pending'
+      `).run(claimedAt, claimedAt, candidate.id)
+      if (update.changes !== 1) throw new Error(`Unable to claim pending inbox event: ${candidate.id}`)
+      const claimed = this.#findEvent(candidate.id)
+      this.#db.exec('COMMIT')
+      return toEvent(claimed)
+    } catch (error) {
+      this.#db.exec('ROLLBACK')
+      throw error
+    }
   }
 
   #insertEvent(event: InboxEvent): void {

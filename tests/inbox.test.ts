@@ -163,6 +163,56 @@ describe('durable main inbox and runtime', () => {
     reopened.close()
   })
 
+  it('scoped recovery returns only claimed user-message events; legacy recovery keeps resetting every claim', () => {
+    const store = new SQLiteMainInboxStore(databasePath)
+    const timer = store.enqueueEvent({
+      conversationId: 'main', idempotencyKey: 'timer-1', type: 'timer', payload: { at: 'daily' },
+      createdAt: '2026-09-15T01:00:00.000Z',
+    }).event
+    const domain = store.enqueueEvent({
+      conversationId: 'main', idempotencyKey: 'domain-1', type: 'domain-update', payload: { state: 'paused' },
+      createdAt: '2026-09-15T01:01:00.000Z',
+    }).event
+    const claimedUser = store.receiveUserMessage({
+      conversationId: 'main', idempotencyKey: 'user-claimed', content: '被领取的前台工作',
+      receivedAt: '2026-09-15T01:02:00.000Z',
+    }).event
+    const pendingUser = store.receiveUserMessage({
+      conversationId: 'main', idempotencyKey: 'user-pending', content: '还没被领取',
+      receivedAt: '2026-09-15T01:03:00.000Z',
+    }).event
+    const claimAt = '2026-09-15T01:04:00.000Z'
+    expect(store.claimNextPendingEvent(claimAt)!.id).toBe(timer.id)
+    expect(store.claimNextPendingEvent(claimAt)!.id).toBe(domain.id)
+    expect(store.claimNextPendingUserMessageEvent(claimAt)!.id).toBe(claimedUser.id)
+
+    // Scoped recovery returns exactly the one claimed user-message event; the
+    // claimed timer/domain-update events keep their claims and the pending
+    // user message stays pending.
+    expect(store.recoverClaimedUserMessageEvents('2026-09-15T01:05:00.000Z')).toBe(1)
+    const direct = new DatabaseSync(databasePath)
+    try {
+      expect(direct.prepare('SELECT id, status, claimed_at, updated_at FROM inbox_events ORDER BY append_order').all())
+        .toEqual([
+          { id: timer.id, status: 'claimed', claimed_at: claimAt, updated_at: claimAt },
+          { id: domain.id, status: 'claimed', claimed_at: claimAt, updated_at: claimAt },
+          { id: claimedUser.id, status: 'pending', claimed_at: null, updated_at: '2026-09-15T01:05:00.000Z' },
+          { id: pendingUser.id, status: 'pending', claimed_at: null, updated_at: '2026-09-15T01:03:00.000Z' },
+        ])
+    } finally {
+      direct.close()
+    }
+    // The recovered event is immediately re-claimable by the foreground surface.
+    expect(store.claimNextPendingUserMessageEvent('2026-09-15T01:06:00.000Z'))
+      .toMatchObject({ id: claimedUser.id, status: 'claimed' })
+
+    // Legacy recovery retains its broad semantics: every claimed event resets,
+    // timer/domain-update events included.
+    expect(store.recoverClaimedEvents('2026-09-15T01:07:00.000Z')).toBe(3)
+    expect(store.claimNextPendingEvent('2026-09-15T01:08:00.000Z')!.id).toBe(timer.id)
+    store.close()
+  })
+
   it('rejects non-canonical timestamps at the persistent boundary', () => {
     const store = new SQLiteMainInboxStore(databasePath)
     expect(() => store.receiveUserMessage({

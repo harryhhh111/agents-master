@@ -9,6 +9,8 @@
   "scripts": {
     "dev": "tsx ./bin/agent.ts",
     "doctor": "tsx ./bin/agent.ts doctor",
+    "probe:frontbrain": "tsx ./scripts/probe-frontbrain.ts",
+    "smoke:user-message": "tsx ./scripts/smoke-user-message.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

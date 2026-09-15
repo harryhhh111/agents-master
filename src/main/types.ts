@@ -1,3 +1,4 @@
+import type { FrontBrainResponse } from '../frontbrain/types.js'
 import type {
   CreateTaskInput,
   InternalContext,
@@ -8,6 +9,9 @@ import type {
   TaskEventViewForContext,
   UpdateTaskInput,
 } from '../personal/types.js'
+
+/** Maximum persisted messages that one foreground context may compose. */
+export const maxMainConversationContextMessages = 100
 
 export type MainConversationRole = 'user' | 'assistant' | 'system'
 export type MainConversationMessageId = string
@@ -108,15 +112,85 @@ export class InboxIdempotencyConflictError extends Error {
   }
 }
 
+/**
+ * Foreground-turn input for the FrontBrain-wired runtime. Instructions and
+ * checkpoint are immutable stable-prefix bytes; nothing here is persisted
+ * into the conversation or the cognitive store.
+ */
+export interface ProcessNextUserMessageEventInput {
+  /** Stable system instructions; must be non-empty and is passed verbatim. */
+  instructions: string
+  /** Optional string checkpoint, appended verbatim right after instructions. */
+  checkpoint?: string
+  /** Output cap for the FrontBrain completion: a safe integer from 1 through 8192. */
+  maxOutputTokens: number
+  /**
+   * Optional upper bound of persisted conversation messages composed into
+   * context: a safe integer from 1 through 100 (default 20).
+   * The window is anchored at the claimed event's conversation message, so
+   * that message is always included; messages appended after it never leak.
+   */
+  contextMessageLimit?: number
+}
+
+export interface ProcessNextUserMessageEventResult {
+  /** The exact user-message event that was claimed and is now processed. */
+  event: InboxEvent
+  /** The persisted assistant reply; committed with the processed transition. */
+  message: MainConversationMessage
+  /** FrontBrain telemetry for this turn. Never persisted into the conversation. */
+  response: FrontBrainResponse
+}
+
+/** One-transaction persistence of an assistant reply plus processed state. */
+export interface RecordProcessedUserMessageEventInput {
+  eventId: InboxEventId
+  content: string
+  /** Must be canonical UTC ISO text when supplied. */
+  processedAt?: string
+}
+
+export interface RecordProcessedUserMessageEventResult {
+  message: MainConversationMessage
+  event: InboxEvent
+}
+
 /** Storage boundary used by the executor-free foreground runtime. */
 export interface MainAgentRuntimeStore extends MainConversationStore {
   receiveUserMessage(input: ReceiveUserMessageInput): ReceiveUserMessageResult
   enqueueEvent(input: EnqueueInboxEventInput): EnqueueInboxEventResult
   claimNextPendingEvent(claimedAt?: string): InboxEvent | undefined
+  /** Claims only pending user-message events; timer and domain-update events stay untouched. */
+  claimNextPendingUserMessageEvent(claimedAt?: string): InboxEvent | undefined
+  /**
+   * Anchored foreground read: the persisted conversation up to and including
+   * the anchor message in append order, windowed to the most recent `limit`
+   * messages. The anchor is always included no matter how small the limit is;
+   * messages appended after the anchor never appear. Window selection is by
+   * append order (the deterministic admission sequence), then the window is
+   * returned in the usual chronological order.
+   */
+  readContextThroughMessage(messageId: MainConversationMessageId, limit?: number): MainConversationMessage[]
+  /**
+   * Persists the assistant reply and flips the exact claimed user-message
+   * event to processed in one SQLite transaction. Exact-once: a failed
+   * transition rolls the insert back, so no duplicate reply can be committed.
+   */
+  recordProcessedUserMessageEvent(input: RecordProcessedUserMessageEventInput): RecordProcessedUserMessageEventResult
   completeInboxEvent(id: InboxEventId, completedAt?: string): InboxEvent
   cancelInboxEvent(id: InboxEventId, cancelledAt?: string): InboxEvent
-  /** Explicitly return abandoned claimed work to pending after a worker restart. */
+  /**
+   * Explicitly return ALL abandoned claimed work to pending after a worker
+   * restart. Legacy surface: also resets claimed timer/domain-update events,
+   * which may belong to other consumers — foreground user-message recovery
+   * must use recoverClaimedUserMessageEvents instead.
+   */
   recoverClaimedEvents(recoveredAt?: string): number
+  /**
+   * Foreground-only recovery: returns only abandoned claimed user-message
+   * events to pending. Claimed timer/domain-update events are never reset.
+   */
+  recoverClaimedUserMessageEvents(recoveredAt?: string): number
 }
 
 export interface MainAgentRuntimePort {
@@ -125,6 +199,17 @@ export interface MainAgentRuntimePort {
   completeInboxEvent(id: InboxEventId, completedAt?: string): InboxEvent
   cancelInboxEvent(id: InboxEventId, cancelledAt?: string): InboxEvent
   recoverClaimedEvents(recoveredAt?: string): number
+  /**
+   * Foreground-only recovery: returns only abandoned claimed user-message
+   * events to pending; claimed timer/domain-update events stay untouched.
+   */
+  recoverClaimedUserMessageEvents(recoveredAt?: string): number
+  /**
+   * One foreground turn over the next pending user-message event. Returns
+   * undefined when no user-message event is pending. On FrontBrain failure
+   * the event stays claimed for explicit recovery; nothing is persisted.
+   */
+  processNextUserMessageEvent(input: ProcessNextUserMessageEventInput): Promise<ProcessNextUserMessageEventResult | undefined>
 }
 
 export interface MainAgentOptions<Context extends InternalContext = InternalContext> {

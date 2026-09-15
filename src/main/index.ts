@@ -22,8 +22,12 @@ export type {
   InboxPayload,
   MainAgentRuntimePort,
   MainAgentRuntimeStore,
+  ProcessNextUserMessageEventInput,
+  ProcessNextUserMessageEventResult,
   ReceiveUserMessageInput,
   ReceiveUserMessageResult,
+  RecordProcessedUserMessageEventInput,
+  RecordProcessedUserMessageEventResult,
 } from './types.js'
 export { InboxIdempotencyConflictError } from './types.js'
 export type { SQLiteMainInboxStoreOptions } from './inbox.js'

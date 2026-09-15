@@ -3,7 +3,7 @@
 
 [llm]
 base_url = "https://api.deepseek.com"
-model = "deepseek-v4-flash"
+model = "deepseek-flash"
 
 # 放权等级：supervised = 所有软决策点也等用户拍板（v1 默认）
 # 以后可放宽，软决策点降级为"只报告不等待"；硬决策点任何等级都等用户
