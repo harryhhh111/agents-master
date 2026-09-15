@@ -113,6 +113,7 @@ describe("parseClaudeChunk", () => {
         message: { role: "assistant", content: [
           { type: "thinking", thinking: "private reasoning" },
           { type: "text", text: "公开回复" },
+          { type: "text", text: "第二个公开段落" },
           { type: "tool_use", name: "Bash", input: { command: "private command" } },
         ] },
       }),
@@ -123,7 +124,7 @@ describe("parseClaudeChunk", () => {
     expect(warnings).toBe(0);
     expect(messages).toEqual([
       { ts: Date.parse("2026-09-14T01:02:03.000Z"), who: "user", text: "由 agent 代发的任务" },
-      { ts: Date.parse("2026-09-14T01:02:04.000Z"), who: "assistant", text: "公开回复" },
+      { ts: Date.parse("2026-09-14T01:02:04.000Z"), who: "assistant", text: "公开回复\n第二个公开段落" },
     ]);
     expect(JSON.stringify(messages)).not.toContain("private");
   });

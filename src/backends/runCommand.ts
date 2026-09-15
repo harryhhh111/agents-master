@@ -125,6 +125,16 @@ export interface DetachedCommandHandle {
   pid: number
   artifactStdoutPath: string
   artifactStderrPath: string
+  /**
+   * Final command result after stdout and stderr artifacts have flushed.
+   *
+   * `stdout` is deliberately mode-dependent without changing the existing API:
+   * - normal streaming: the raw stdout persisted in `artifactStdoutPath`;
+   * - `artifactStdoutTransform`: raw stdout before the final transform (the artifact is transformed);
+   * - `artifactStdoutLineFilter`: the incrementally filtered public stdout persisted in the artifact.
+   *
+   * `stderr` is retained for internal diagnostics and its artifact path must not be surfaced to an LLM by default.
+   */
   done: Promise<CommandResult>
   cancel(signal?: NodeJS.Signals | number): void
 }
@@ -135,6 +145,10 @@ export function defaultArtifactPaths(
   name: string,
 ): { stdoutPath: string; stderrPath: string } {
   const dir = path.join(cwd, '.agent-artifacts')
+  // Detached executor output can include project details and stderr can include credentials or
+  // launcher diagnostics. POSIX honors these modes; Windows does not map them consistently.
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+  if (process.platform !== 'win32') fs.chmodSync(dir, 0o700)
   const stamp = `${name}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   return {
     stdoutPath: path.join(dir, `${stamp}.stdout.log`),
@@ -164,7 +178,7 @@ export async function runCommand(options: CommandOptions): Promise<CommandResult
   if (artifactStdoutPath) fs.mkdirSync(path.dirname(artifactStdoutPath), { recursive: true })
   if (artifactStderrPath) fs.mkdirSync(path.dirname(artifactStderrPath), { recursive: true })
   // 若调用方复用路径，先清除旧内容，避免运行期间暴露上一次的未过滤输出。
-  if (artifactStdoutPath && artifactStdoutTransform) fs.writeFileSync(artifactStdoutPath, '')
+  if (artifactStdoutPath && artifactStdoutTransform) fs.writeFileSync(artifactStdoutPath, '', { mode: 0o600 })
 
   const result = await execa(cmd, args, {
     cwd,
@@ -182,8 +196,8 @@ export async function runCommand(options: CommandOptions): Promise<CommandResult
   const stderr = result.stderr ?? ''
   const durationMs = Date.now() - start
 
-  if (artifactStdoutPath) fs.writeFileSync(artifactStdoutPath, artifactStdoutTransform?.(stdout) ?? stdout)
-  if (artifactStderrPath) fs.writeFileSync(artifactStderrPath, stderr)
+  if (artifactStdoutPath) fs.writeFileSync(artifactStdoutPath, artifactStdoutTransform?.(stdout) ?? stdout, { mode: 0o600 })
+  if (artifactStderrPath) fs.writeFileSync(artifactStderrPath, stderr, { mode: 0o600 })
 
   return {
     stdout: stdout.toString(),
@@ -196,6 +210,8 @@ export async function runCommand(options: CommandOptions): Promise<CommandResult
 /**
  * detach 模式：spawn 后立即返回，stdout/stderr 流式追加写入 artifact 文件。
  * 不设默认超时，适合小时级长任务；调用方通过 artifact 文件轮询进度。
+ * `done.stdout` semantics are explicit: normal mode returns raw artifact stdout, transform mode
+ * returns raw pre-transform stdout, and line-filter mode returns the filtered public artifact text.
  */
 export function spawnDetachedCommand(options: CommandOptions): DetachedCommandHandle {
   const start = Date.now()
@@ -221,7 +237,7 @@ export function spawnDetachedCommand(options: CommandOptions): DetachedCommandHa
   fs.mkdirSync(path.dirname(artifactStdoutPath), { recursive: true })
   fs.mkdirSync(path.dirname(artifactStderrPath), { recursive: true })
   // 先清空再 spawn：即使路径被复用，调用方拿到 handle 时也只能读到安全的空内容。
-  if (artifactStdoutTransform || artifactStdoutLineFilter) fs.writeFileSync(artifactStdoutPath, '')
+  if (artifactStdoutTransform || artifactStdoutLineFilter) fs.writeFileSync(artifactStdoutPath, '', { mode: 0o600 })
 
   const subprocess = execa(cmd, args, {
     cwd,
@@ -232,7 +248,7 @@ export function spawnDetachedCommand(options: CommandOptions): DetachedCommandHa
     buffer: false,
   })
 
-  const stderrStream = fs.createWriteStream(artifactStderrPath, { flags: 'a' })
+  const stderrStream = fs.createWriteStream(artifactStderrPath, { flags: 'a', mode: 0o600 })
   subprocess.stderr?.pipe(stderrStream)
 
   const streamFinished = (stream: fs.WriteStream) =>
@@ -247,7 +263,7 @@ export function spawnDetachedCommand(options: CommandOptions): DetachedCommandHa
   const stdoutChunks: Buffer[] = []
   const stdoutFinished = artifactStdoutLineFilter
     ? (() => {
-        const stdoutStream = fs.createWriteStream(artifactStdoutPath, { flags: 'a' })
+        const stdoutStream = fs.createWriteStream(artifactStdoutPath, { flags: 'a', mode: 0o600 })
         const lineFilter = new LineFilteringTransform(artifactStdoutLineFilter)
         subprocess.stdout?.pipe(lineFilter).pipe(stdoutStream)
         return streamFinished(stdoutStream)
@@ -265,7 +281,7 @@ export function spawnDetachedCommand(options: CommandOptions): DetachedCommandHa
           subprocess.stdout.once('error', reject)
         })
       : (() => {
-          const stdoutStream = fs.createWriteStream(artifactStdoutPath, { flags: 'a' })
+          const stdoutStream = fs.createWriteStream(artifactStdoutPath, { flags: 'a', mode: 0o600 })
           subprocess.stdout?.pipe(stdoutStream)
           return streamFinished(stdoutStream)
         })()

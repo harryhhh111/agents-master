@@ -56,5 +56,5 @@ function extractText(content: unknown, role: 'user' | 'assistant'): string {
     // Whitelist only explicit text. This excludes thinking, tool_use and tool_result records.
     if (block.type === 'text' && typeof block.text === 'string') text.push(block.text)
   }
-  return text.join('')
+  return text.join('\n')
 }

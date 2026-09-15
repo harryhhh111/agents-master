@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { loadConfig } from '../src/config.js'
-import { LineFilteringTransform } from '../src/backends/runCommand.js'
+import { defaultArtifactPaths, LineFilteringTransform, spawnDetachedCommand } from '../src/backends/runCommand.js'
 import { extractKimiAssistantText, extractKimiSessionId } from '../src/backends/KimiBackend.js'
 import { extractLastMessageFromJsonl, extractSessionIdFromJsonl } from '../src/backends/CodexBackend.js'
 import {
@@ -258,6 +258,7 @@ describe('Claude command protocol', () => {
       '--output-format=stream-json',
       '--permission-mode',
       'acceptEdits',
+      '--',
       '实现这个切片',
     ])
   })
@@ -270,10 +271,96 @@ describe('Claude command protocol', () => {
 
   it('续接任务加入 --resume，且不把 prompt 送到 stdin', () => {
     const command = buildClaudeCommand('继续检查', { cwd: '/workspace', sessionId: 'claude-session-1' })
-    expect(command.args).toContain('--resume')
-    expect(command.args).toContain('claude-session-1')
+    expect(command.args).toEqual([
+      '-p',
+      '--verbose',
+      '--output-format=stream-json',
+      '--permission-mode',
+      'acceptEdits',
+      '--resume',
+      'claude-session-1',
+      '--',
+      '继续检查',
+    ])
     expect(command.args?.at(-1)).toBe('继续检查')
     expect(command.input).toBeUndefined()
+  })
+
+  it('在位置 prompt 前放置 --，使 dash 开头的 prompt 不会被解析为 flag', () => {
+    const command = buildClaudeCommand('--not-a-claude-flag', { cwd: '/workspace' })
+    expect(command.args?.slice(-2)).toEqual(['--', '--not-a-claude-flag'])
+  })
+})
+
+describe('spawnDetachedCommand artifact and stdout semantics', () => {
+  const command = (script: string) => ({
+    cmd: '/bin/sh',
+    args: ['-c', `${script}; sleep 0.05`],
+  })
+
+  it('uses owner-only default artifacts where supported and retains stderr internally', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'detached-artifacts-'))
+    try {
+      const paths = defaultArtifactPaths(dir, 'test')
+      const handle = spawnDetachedCommand({
+        ...command("printf %s 'raw stdout'; printf %s 'private diagnostic' >&2"),
+        cwd: dir,
+        artifactStdoutPath: paths.stdoutPath,
+        artifactStderrPath: paths.stderrPath,
+        artifactStdoutTransform: stdout => stdout,
+      })
+      const result = await handle.done
+
+      expect(result).toMatchObject({ stdout: 'raw stdout', stderr: 'private diagnostic', exitCode: 0 })
+      expect(await fs.readFile(paths.stdoutPath, 'utf8')).toBe('raw stdout')
+      expect(await fs.readFile(paths.stderrPath, 'utf8')).toBe('private diagnostic')
+      if (process.platform !== 'win32') {
+        expect((await fs.stat(path.dirname(paths.stdoutPath))).mode & 0o777).toBe(0o700)
+        expect((await fs.stat(paths.stdoutPath)).mode & 0o777).toBe(0o600)
+        expect((await fs.stat(paths.stderrPath)).mode & 0o777).toBe(0o600)
+      }
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('documents and preserves normal, transform, and line-filter done.stdout modes', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'detached-stdout-'))
+    try {
+      const normalPath = path.join(dir, 'normal.log')
+      const normal = spawnDetachedCommand({
+        ...command("printf %s 'normal raw'"),
+        cwd: dir,
+        artifactStdoutPath: normalPath,
+        artifactStderrPath: path.join(dir, 'normal.stderr.log'),
+      })
+      expect((await normal.done).stdout).toBe('normal raw')
+      expect(await fs.readFile(normalPath, 'utf8')).toBe('normal raw')
+
+      const transformedPath = path.join(dir, 'transformed.log')
+      const transformed = spawnDetachedCommand({
+        ...command("printf %s 'transform raw'"),
+        cwd: dir,
+        artifactStdoutPath: transformedPath,
+        artifactStderrPath: path.join(dir, 'transformed.stderr.log'),
+        artifactStdoutTransform: stdout => `public: ${stdout}`,
+      })
+      expect((await transformed.done).stdout).toBe('transform raw')
+      expect(await fs.readFile(transformedPath, 'utf8')).toBe('public: transform raw')
+
+      const filteredPath = path.join(dir, 'filtered.log')
+      const filtered = spawnDetachedCommand({
+        ...command("printf '%s\\n' private public"),
+        cwd: dir,
+        artifactStdoutPath: filteredPath,
+        artifactStderrPath: path.join(dir, 'filtered.stderr.log'),
+        artifactStdoutLineFilter: { onLine: line => (line === 'public' ? 'public' : null) },
+      })
+      expect((await filtered.done).stdout).toBe('public')
+      expect(await fs.readFile(filteredPath, 'utf8')).toBe('public')
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true })
+    }
   })
 })
 

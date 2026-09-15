@@ -287,7 +287,7 @@ describe('AgentCore loop', () => {
 })
 
 describe('run_kimi / check_run', () => {
-  it('runDetached 返回 runId/pid/artifact，done 后钉住 sessionId 并记录代发 prompt', async () => {
+  it('runDetached 返回 runId/pid/公开 stdout artifact，不向 LLM 暴露敏感 stderr path；done 后钉住 sessionId 并记录代发 prompt', async () => {
     const ctx = makeToolCtx({
       backends: {
         kimi: fakeBackend('kimi', 'sess-kimi-1', tmp),
@@ -303,6 +303,8 @@ describe('run_kimi / check_run', () => {
       artifactStdoutPath: path.join(tmp, 'kimi-stdout.log'),
       resumedSession: null,
     })
+    expect(startInfo).not.toHaveProperty('artifactStderrPath')
+    expect(started.text).not.toContain('kimi-stderr.log')
     expect(typeof startInfo.runId).toBe('string')
 
     await flush()

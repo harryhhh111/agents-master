@@ -139,6 +139,8 @@ export function buildClaudeCommand(
   const permissionMode = backendOptions.permissionMode ?? 'acceptEdits'
   const args = ['-p', '--verbose', '--output-format=stream-json', '--permission-mode', permissionMode]
   if (options.sessionId) args.push('--resume', options.sessionId)
+  // Keep the prompt positional while preventing a dash-prefixed prompt from being parsed as a flag.
+  args.push('--')
   args.push(prompt)
 
   return {

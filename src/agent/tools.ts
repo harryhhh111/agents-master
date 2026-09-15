@@ -49,7 +49,7 @@ export const toolDefinitions: OpenAI.Chat.ChatCompletionTool[] = [
     function: {
       name: 'run_kimi',
       description:
-        '给 Kimi Code 派活/传话：detach 模式启动，立即返回 runId 和 artifact 路径，' +
+        '给 Kimi Code 派活/传话：detach 模式启动，立即返回 runId 和公开 stdout artifact 路径，' +
         '长任务用 check_run 轮询。如有钉住的 session 会自动续接。',
       parameters: {
         type: 'object',
@@ -63,7 +63,7 @@ export const toolDefinitions: OpenAI.Chat.ChatCompletionTool[] = [
     function: {
       name: 'run_claude',
       description:
-        '给 Claude Code 派活/传话：detach 模式启动，立即返回 runId 和 artifact 路径，' +
+        '给 Claude Code 派活/传话：detach 模式启动，立即返回 runId 和公开 stdout artifact 路径，' +
         '长任务用 check_run 轮询。如有钉住的 session 会自动续接。',
       parameters: {
         type: 'object',
@@ -93,7 +93,7 @@ export const toolDefinitions: OpenAI.Chat.ChatCompletionTool[] = [
     function: {
       name: 'run_codex',
       description:
-        '给 codex-cli 派活/传话：detach 模式启动，立即返回 runId 和 artifact 路径，' +
+        '给 codex-cli 派活/传话：detach 模式启动，立即返回 runId 和公开 stdout artifact 路径，' +
         '长任务用 check_run 轮询。如有钉住的 session 会自动续接。',
       parameters: {
         type: 'object',
@@ -264,7 +264,6 @@ async function runBackend(ctx: ToolContext, executor: string, prompt: string): P
       runId: record.runId,
       pid: finalizedHandle.pid,
       artifactStdoutPath: finalizedHandle.artifactStdoutPath,
-      artifactStderrPath: finalizedHandle.artifactStderrPath,
       resumedSession: pin?.sessionId ?? null,
       note: '任务已在后台运行；完成时会自动收到 [后台任务完成] 通知，无需轮询。只有你主动想看进度时才用 check_run。',
     }),
