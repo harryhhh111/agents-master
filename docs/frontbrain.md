@@ -1,4 +1,4 @@
-# 前台模型 FrontBrain（Stage 1.2b 切片）
+# 前台模型 FrontBrain（Stage 1.2b / 1.2c 切片）
 
 快速主 Agent Runtime 的低延迟前台模型边界。本切片落地：接口与实现、确定性上下文
 组装、能力探测脚本、不假定缓存的遥测，以及**仅用户消息事件**的 runtime 领取/完成
@@ -101,3 +101,35 @@ npm run smoke:user-message
 `uncachedInputTokens` 保持 `undefined`；探测的三个阶段只如实转述上报值，不据此
 断言命中/未命中，也不推断 continuation / prefix cache 的存在、TTL 或取消语义。
 任何缓存结论都必须是后续实测的结果。
+
+## Stage 1.2c：持久化主 Agent 终端入口
+
+Stage 1.2c 已把上述 Runtime 接成最小可用的持续终端对话入口：
+
+```bash
+npm run main:chat -- --data-dir /private/path/to/main-chat
+# 或：agent main --data-dir /private/path/to/main-chat
+```
+
+- `--data-dir` 省略时默认使用 `~/.local/share/agents-master/main-chat`。目录和 SQLite
+  文件仍只由 `createMainAgentRuntime` 创建并在 Linux 上校验为当前用户拥有的 `0700` /
+  `0600`；store 本身不承担建目录职责。
+- `MainAgentForegroundHost` 将每条输入先同步持久化，再启动一个单飞、串行的 drain；模型
+  调用在飞行期间，readline 仍可继续接受并持久化后续行。实际领取仍由 Runtime 的
+  user-message inbox 优先级与 durable admission order 决定，普通 `timer` /
+  `domain-update` 事件不被前台领取。
+- 启动和 `/recover` 只调用 scoped 的 `recoverClaimedUserMessageEvents()`。前台失败后事件
+  保持 claimed、host 停止自动 drain 并清楚提示；新输入仍可入库，只有用户明确执行
+  `/recover` 才会重试。`/help`、`/recover`、`/exit` 是当前唯一的终端命令。
+- 稳定 system instructions 固定在 `src/main/foreground.ts`，要求主 Agent 自然理解、简短
+  回答、信息不足时澄清，并明确当前没有任务/记忆写入或外部动作能力，不能假装已经执行。
+
+本切片仍**不具备**任务或记忆工具调用/写入、自动委派、领域事件处理、Web UI、子 Agent，或
+并行前台推理；也不改变 Runtime 的原子持久化和失败恢复语义。
+
+### 2026-09-16 本机探测记录（非 provider 保证）
+
+本机三阶段 API probe 当日仅观测到 `cache hit=0`：baseline 输入 49 token、约 571ms；
+continuation 输入 65 token、约 603ms；common-prefix 输入 50 token、约 487ms。它只是这一次
+调用的 telemetry，**不能**推广为 provider 对 continuation / prefix cache、TTL、取消语义或未来
+请求的任何保证。

@@ -106,6 +106,14 @@ async function doctor(): Promise<void> {
 const cmd = process.argv[2]
 if (cmd === 'doctor') {
   await doctor()
+} else if (cmd === 'main') {
+  const { runMainChat } = await import('../scripts/main-chat.js')
+  try {
+    await runMainChat(process.argv.slice(3))
+  } catch (e) {
+    console.error(e instanceof Error ? e.message : String(e))
+    process.exit(1)
+  }
 } else if (cmd === 'chat') {
   const projectName = process.argv[3]
   if (!projectName) {
@@ -124,5 +132,5 @@ if (cmd === 'doctor') {
     process.exit(1)
   }
 } else {
-  console.log('用法: agent <项目名> | agent doctor | agent chat <项目名>')
+  console.log('用法: agent <项目名> | agent doctor | agent main [--data-dir <目录>] | agent chat <项目名>')
 }
