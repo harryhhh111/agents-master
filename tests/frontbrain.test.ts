@@ -1,9 +1,11 @@
+import { formatUsageLine, parseProbeArgs } from '../scripts/probe-frontbrain.js'
 import { describe, expect, it } from 'vitest'
 import type { MainConversationMessage } from '../src/main/index.js'
 import { composeFrontBrainContext } from '../src/frontbrain/index.js'
 import {
   DeepSeekFrontBrain,
   probeMaxOutputTokens,
+  probeStablePrefixFixture,
   runFrontBrainProbe,
 } from '../src/frontbrain/index.js'
 import type {
@@ -199,44 +201,113 @@ function makeFakeBrain(): { brain: FrontBrain; requests: FrontBrainRequest[] } {
 }
 
 describe('runFrontBrainProbe', () => {
-  it('runs baseline, true continuation, then common-prefix branch, with accurate phase labels', async () => {
+  it('uses a substantial deterministic synthetic prefix and preserves measured request shapes', async () => {
     const { brain, requests } = makeFakeBrain()
-    const result = await runFrontBrainProbe(brain, { instructions, checkpoint })
-
-    expect(requests).toHaveLength(3)
+    const events: string[] = []
+    const responses: FrontBrainResponse[] = []
+    const result = await runFrontBrainProbe({ async complete(request) {
+      events.push(`call-${requests.length + 1}`)
+      const response = await brain.complete(request)
+      responses.push(response)
+      return response
+    } }, { instructions, checkpoint, sleep: async ms => {
+      events.push(`sleep-${ms}`)
+      expect(requests).toHaveLength(3)
+      await Promise.resolve()
+      events.push('settled')
+    } })
+    expect(events).toEqual(['call-1', 'call-2', 'call-3', 'sleep-2000', 'settled', 'call-4', 'call-5'])
+    expect(probeStablePrefixFixture).toContain('Not a product prompt')
+    expect(probeStablePrefixFixture.split('Checkpoint section ')).toHaveLength(13)
+    // Structural source-size check, deliberately not a tokenizer estimate.
+    expect(probeStablePrefixFixture.split(/\s+/).length).toBeGreaterThan(700)
     for (const request of requests) {
       expect(request.maxOutputTokens).toBe(probeMaxOutputTokens)
-      expect(request.messages.slice(0, 2)).toEqual([
+      expect(request.messages.slice(0, 3)).toEqual([
         { role: 'system', content: instructions },
         { role: 'system', content: checkpoint },
+        { role: 'system', content: probeStablePrefixFixture },
       ])
     }
-
-    // baseline: shared prefix + one short divergent user tail.
-    expect(requests[0].messages).toHaveLength(3)
-    expect(requests[0].messages[2].role).toBe('user')
-
-    // continuation: the exact prior request transcript retained verbatim,
-    // including the baseline assistant response, then one appended user turn.
-    expect(requests[1].messages.slice(0, requests[0].messages.length)).toEqual(requests[0].messages)
-    expect(requests[1].messages[requests[0].messages.length]).toEqual({
-      role: 'assistant',
-      content: 'fake-1',
+    expect(requests[0]).toEqual(requests[1])
+    expect(requests[0].messages).toHaveLength(4)
+    expect(requests[3].messages).toEqual([
+      ...requests[1].messages,
+      { role: 'assistant', content: 'fake-2' },
+      { role: 'user', content: '能力探测续：再回复一个词"完成"。' },
+    ])
+    expect(requests[4].messages).toHaveLength(4)
+    expect(requests[2].messages.slice(0, 3)).toEqual(requests[4].messages.slice(0, 3))
+    expect(new Set([requests[0], requests[2], requests[4]].map(r => r.messages.at(-1)!.content)).size).toBe(3)
+    expect(result.turns.map(t => t.phase)).toEqual([
+      'warmup-initial', 'warmup-repeat', 'warmup-prefix-detection', 'measurement-continuation', 'measurement-common-prefix',
+    ])
+    result.turns.forEach((turn, i) => {
+      expect(turn.response).toBe(responses[i])
+      const line = formatUsageLine(turn.phase, turn.response)
+      expect(line).toContain(`${turn.phase}: latency=${10 * (i + 1)}.0ms`)
+      expect(line).toContain('in=30 out=2 total=32')
+      expect(line).toContain('below target')
+      expect(line).toContain(`finish=stop | text="fake-${i + 1}"`)
+      expect(line).toContain(i === 1 ? 'cache hit=28 miss=未上报' : 'cache: 未上报')
     })
-    expect(requests[1].messages.at(-1)!.role).toBe('user')
-    expect(requests[1].messages.at(-1)).not.toEqual(requests[0].messages.at(-1))
+    expect(result.targetInputTokens).toBe(512)
+    expect(result.settleMs).toBe(2000)
+    expect(result.maxOutputTokens).toBe(16)
+  })
 
-    // common-prefix branch: same shared prefix, divergent tail, after the two
-    // divergent requests.
-    expect(requests[2].messages).toHaveLength(3)
-    expect(requests[2].messages[2].role).toBe('user')
-    expect(requests[2].messages[2]).not.toEqual(requests[0].messages[2])
+  it('awaits an injected delay before measurement and permits zero without sleeping', async () => {
+    const { brain, requests } = makeFakeBrain()
+    let release!: () => void
+    let reached!: () => void
+    const sleeping = new Promise<void>(resolve => { reached = resolve })
+    const pending = runFrontBrainProbe(brain, { instructions, settleMs: 17, sleep: ms => {
+      expect(ms).toBe(17)
+      reached()
+      return new Promise<void>(resolve => { release = resolve })
+    } })
+    await sleeping
+    expect(requests).toHaveLength(3)
+    release()
+    await pending
+    expect(requests).toHaveLength(5)
+    await runFrontBrainProbe(brain, { instructions, settleMs: 0, sleep: async () => {
+      throw new Error('zero must not sleep')
+    } })
+    expect(requests[5].messages[1].content).toBe(probeStablePrefixFixture)
+  })
 
-    // Phases are labeled accurately, in call order, with telemetry reported as-is.
-    expect(result.maxOutputTokens).toBe(probeMaxOutputTokens)
-    expect(result.turns.map(turn => turn.phase)).toEqual(['baseline', 'continuation', 'common-prefix'])
-    expect(result.turns.map(turn => turn.response.text)).toEqual(['fake-1', 'fake-2', 'fake-3'])
-    expect(result.turns[0].response.latencyMs).toBe(10)
-    expect(result.turns[1].response.usage.cachedInputTokens).toBe(28)
+  it('rejects invalid library delays before calls', async () => {
+    const { brain, requests } = makeFakeBrain()
+    for (const settleMs of [-1, 0.5, NaN, Infinity, 30001, Number.MAX_SAFE_INTEGER + 1]) {
+      await expect(runFrontBrainProbe(brain, { instructions, settleMs })).rejects.toThrow('settle-ms')
+    }
+    expect(requests).toHaveLength(0)
+  })
+})
+
+describe('probe CLI helpers (import has no network side effects)', () => {
+  it('strictly parses bounded nonnegative integer milliseconds', () => {
+    expect(parseProbeArgs([])).toEqual({ settleMs: 2000 })
+    for (const value of ['0', '17', '30000']) {
+      expect(parseProbeArgs(['--settle-ms', value])).toEqual({ settleMs: Number(value) })
+    }
+    for (const value of ['', '-1', '+1', '1.5', '2e3', '0x10', ' 2', '2 ', 'NaN', 'Infinity', '30001', '9007199254740993']) {
+      expect(() => parseProbeArgs(['--settle-ms', value])).toThrow()
+    }
+    for (const args of [['--settle-ms'], ['--unknown', '2'], ['--settle-ms=2'], ['--settle-ms', '2', 'extra'], ['--settle-ms', '2', '--settle-ms', '3']]) {
+      expect(() => parseProbeArgs(args)).toThrow()
+    }
+  })
+
+  it('reports actual counts, target boundary, zero cache hits and missing telemetry', () => {
+    for (const inputTokens of [511, 512, 700, undefined]) {
+      const line = formatUsageLine('phase', {
+        text: '', latencyMs: 1, usage: { inputTokens, cachedInputTokens: 0, uncachedInputTokens: inputTokens },
+      })
+      expect(line).toContain(`in=${inputTokens ?? '?'}`)
+      expect(line).toContain(inputTokens === undefined ? 'unknown' : inputTokens < 512 ? 'below target' : 'at target (or above)')
+      expect(line).toContain('cache hit=0')
+    }
   })
 })

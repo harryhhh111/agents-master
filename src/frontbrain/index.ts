@@ -2,7 +2,8 @@ export { composeFrontBrainContext } from './context.js'
 export type { FrontBrainContextInput } from './context.js'
 export { createFrontBrain, DeepSeekFrontBrain } from './deepseek.js'
 export type { DeepSeekFrontBrainOptions } from './deepseek.js'
-export { probeMaxOutputTokens, runFrontBrainProbe } from './probe.js'
+export { probeMaxOutputTokens, probeTargetInputTokens, probeDefaultSettleMs, probeMaxSettleMs,
+  probeStablePrefixFixture, validateProbeSettleMs, runFrontBrainProbe } from './probe.js'
 export type {
   FrontBrainProbeInput,
   FrontBrainProbePhase,

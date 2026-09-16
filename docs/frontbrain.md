@@ -74,14 +74,30 @@ const result = await runtime.processNextUserMessageEvent({
 npm run probe:frontbrain
 ```
 
-对 provider 发三次受控调用，各限 16 输出 token，按阶段打印延迟与 usage/cache 值：
+使用固定的合成测量 fixture（12 段重复的虚构项目检查点，非产品 prompt、无真实用户数据），
+拼在 instructions + 可选 checkpoint 后形成稳定前缀。目标是 provider 实际上报的输入达到
+512 token；字符数/词数不是 token 数，不能代替实测。每次输出上限仍为 16 token。
 
-1. `baseline`：共用前缀（instructions + checkpoint）+ 尾部 A，冷启动参考。
-2. `continuation`：原样保留上一次完整请求记录（含 assistant 回复）再追加新用户轮，
-   观察 provider 是否对完整上文报告缓存。
-3. `common-prefix`：两轮分叉请求之后，复用同一前缀 + 新尾部 C，观察前缀字节是否仍被缓存。
+按顺序串行调用五次：
 
-单元测试只使用 fake 客户端，绝不发起付费调用。
+1. `warmup-initial`：稳定前缀 + 尾部 A，不假定冷缓存。
+2. `warmup-repeat`：完全相同的请求再次预热。
+3. `warmup-prefix-detection`：相同稳定前缀 + 不同尾部 B，给 provider 识别公共前缀的机会。
+4. 等待默认 2000ms 后，`measurement-continuation` 原样保留第二次请求及其 assistant 回复，
+   追加一个用户轮，测量真实 continuation。
+5. `measurement-common-prefix`：仅复用稳定前缀 + 新尾部 C，测量公共前缀分支。
+
+等待仅发生在全部预热和测量之间，可显式覆盖（0 表示不等待）：
+
+```bash
+npm run probe:frontbrain -- --settle-ms 2000
+```
+
+`--settle-ms` 只接受十进制非负整数，范围 0–30000ms；拒绝小数、负数、指数、缺值、
+重复或未知参数。两秒不是持久化完成保证，脚本不自动重试或扩大付费调用。
+每阶段打印 latency、实际 in/out/total、cache hit/miss、finish 与短回复。
+输入诊断为 `below target` / `at target (or above)`；未上报时为 `unknown`，绝不补造计数。
+单元测试使用 fake 客户端和注入的 sleeper，既不联网也不真实等待。
 
 ## 本地冒烟（显式选择，花真钱）
 
@@ -98,9 +114,15 @@ npm run smoke:user-message
 ## 不假定缓存行为
 
 本切片只测量、不假定：provider 未上报 cache 字段时，`cachedInputTokens` /
-`uncachedInputTokens` 保持 `undefined`；探测的三个阶段只如实转述上报值，不据此
+`uncachedInputTokens` 保持 `undefined`；探测的所有阶段只如实转述上报值，不据此
 断言命中/未命中，也不推断 continuation / prefix cache 的存在、TTL 或取消语义。
-任何缓存结论都必须是后续实测的结果。
+真实结果也只是该次条件下的观测，不是 provider 保证；最近一次升级方法的本机观测记录在下方。
+
+[当前官方缓存指南](https://api-docs.deepseek.com/guides/kv_cache/)说明缓存默认开启、尽力而为，
+只有完全匹配已持久化的前缀单元才能命中，构建可能需要数秒；分叉请求可触发公共前缀识别。
+[历史官方公告](https://api-docs.deepseek.com/zh-cn/news/news0802/)曾说明存储单元为 64 tokens，
+不足 64 tokens 不缓存。这是历史说明；当前指南没有承诺固定的 token cutoff，不能将 64
+或本探测的 512 目标当作当前服务的命中保证。
 
 ## Stage 1.2c：持久化主 Agent 终端入口
 
@@ -129,7 +151,14 @@ npm run main:chat -- --data-dir /private/path/to/main-chat
 
 ### 2026-09-16 本机探测记录（非 provider 保证）
 
-本机三阶段 API probe 当日仅观测到 `cache hit=0`：baseline 输入 49 token、约 571ms；
-continuation 输入 65 token、约 603ms；common-prefix 输入 50 token、约 487ms。它只是这一次
-调用的 telemetry，**不能**推广为 provider 对 continuation / prefix cache、TTL、取消语义或未来
-请求的任何保证。
+旧版短 prompt 探测的输入仅 49 / 65 / 50 token，报告 `cache hit=0`。这是**prompt 太小、
+方法不足的观测**，不是缓存能力判决；总输入达到 65 也不代表有足够长且已持久化的共享前缀。
+该轮没有充分预热和持久化等待，不能据此推断 provider 不支持缓存、continuation 或 prefix cache，
+也不能判断 TTL、取消语义或未来请求行为。
+
+2026-09-17 使用升级后的五阶段探测（`deepseek-flash`、本机、默认 2000ms settle）时，provider
+实际输入为 1074 / 1074 / 1076 / 1090 / 1075 token，均达到 512 token 目标。首次预热上报
+`cache hit=0, miss=1074`；重复预热、分叉预热、continuation、common-prefix 依次上报
+`cache hit=896`（miss 为 178 / 180 / 194 / 179）。对应延迟约为 516 / 478 / 601 / 508 / 622ms。
+这说明该**一次本机调用形状**在预热后获得了 provider 报告的共享前缀命中；它不证明命中阈值、
+缓存 TTL、跨会话行为、稳定延迟收益或 provider 的任何 SLA。
