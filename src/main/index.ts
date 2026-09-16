@@ -1,4 +1,3 @@
-export { SQLiteMainConversationStore } from './conversation.js'
 export { SQLiteMainInboxStore } from './inbox.js'
 export { MainAgent } from './service.js'
 export { MainAgentRuntime } from './runtime.js'

@@ -125,6 +125,10 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
 
   constructor(databasePath: string, options: SQLiteMainInboxStoreOptions = {}) {
     this.#db = new DatabaseSync(databasePath)
+    // SQLite foreign-key checks are disabled per connection by default. Turn
+    // them on before creating or migrating either table so the declared
+    // inbox_events.user_message_id reference is enforced by this store.
+    this.#db.exec('PRAGMA foreign_keys = ON')
     this.#clock = options.clock ?? (() => new Date().toISOString())
     this.#initializeSchema()
   }
@@ -150,8 +154,8 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
     }
     const rows = this.#db.prepare(`
       SELECT * FROM (
-        SELECT * FROM main_conversation_messages ORDER BY created_at DESC, append_order DESC LIMIT ?
-      ) ORDER BY created_at, append_order
+        SELECT * FROM main_conversation_messages ORDER BY append_order DESC LIMIT ?
+      ) ORDER BY append_order
     `).all(limit) as ConversationRow[]
     return rows.map(toMessage)
   }
@@ -162,7 +166,8 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
    * messages. The window is selected by append order — the deterministic
    * admission sequence — so the anchor is always inside it no matter how
    * small the limit is, and nothing appended after the anchor ever leaks in.
-   * The result is then returned in the usual chronological order.
+   * The result is returned in durable append order. Caller-supplied timestamps
+   * are descriptive metadata and may legitimately be backfilled.
    */
   readContextThroughMessage(messageId: MainConversationMessageId, limit = 20): MainConversationMessage[] {
     requireText(messageId, 'messageId')
@@ -175,7 +180,7 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
         JOIN main_conversation_messages anchor ON anchor.id = ?
         WHERE m.append_order <= anchor.append_order
         ORDER BY m.append_order DESC LIMIT ?
-      ) ORDER BY created_at, append_order
+      ) ORDER BY append_order
     `).all(messageId, limit) as ConversationRow[]
     if (!rows.some(row => row.id === messageId)) {
       throw new Error(`Main conversation message not found: ${messageId}`)
@@ -476,8 +481,6 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
     }
     this.#db.exec(`
       DROP INDEX IF EXISTS main_conversation_messages_by_created;
-      CREATE INDEX main_conversation_messages_by_created
-        ON main_conversation_messages(created_at, append_order);
       CREATE UNIQUE INDEX IF NOT EXISTS main_conversation_messages_by_append_order
         ON main_conversation_messages(append_order);
       CREATE UNIQUE INDEX IF NOT EXISTS inbox_events_by_append_order ON inbox_events(append_order);

@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { MainAgent, SQLiteMainConversationStore } from '../src/main/index.js'
+import { MainAgent, SQLiteMainInboxStore } from '../src/main/index.js'
 import {
   SQLitePersonalStore,
   type AccessBoundary,
@@ -39,7 +39,7 @@ describe('main control plane', () => {
   })
 
   it('persists a bounded main transcript without promoting messages into Sources or Claims', () => {
-    const conversation = new SQLiteMainConversationStore(conversationDatabasePath)
+    const conversation = new SQLiteMainInboxStore(conversationDatabasePath)
     const first = conversation.appendMessage({
       role: 'user',
       content: '这个项目这周要推进。',
@@ -59,7 +59,7 @@ describe('main control plane', () => {
     expect(conversation.readRecentContext(2)).toEqual([second, third])
     conversation.close()
 
-    const reopened = new SQLiteMainConversationStore(conversationDatabasePath)
+    const reopened = new SQLiteMainInboxStore(conversationDatabasePath)
     expect(reopened.readRecentContext()).toEqual([first, second, third])
     expect(() => reopened.readRecentContext(101)).toThrow('limit must be a positive integer no greater than 100')
     reopened.close()
@@ -69,18 +69,18 @@ describe('main control plane', () => {
     direct.close()
   })
 
-  it('uses a durable append sequence for equal-time transcript messages, including migrated databases', () => {
+  it('uses a durable append sequence rather than createdAt, including migrated databases', () => {
     const createdAt = '2026-09-10T09:00:00.000Z'
-    const conversation = new SQLiteMainConversationStore(conversationDatabasePath)
-    const first = conversation.appendMessage({ role: 'user', content: 'first', createdAt })
-    const second = conversation.appendMessage({ role: 'assistant', content: 'second', createdAt })
+    const conversation = new SQLiteMainInboxStore(conversationDatabasePath)
+    const first = conversation.appendMessage({ role: 'user', content: 'first', createdAt: '2026-09-10T09:02:00.000Z' })
+    const second = conversation.appendMessage({ role: 'assistant', content: 'second', createdAt: '2026-09-10T08:59:00.000Z' })
     const third = conversation.appendMessage({ role: 'system', content: 'third', createdAt })
 
     expect(conversation.readRecentContext()).toEqual([first, second, third])
     expect(conversation.readRecentContext(2)).toEqual([second, third])
     conversation.close()
 
-    const reopened = new SQLiteMainConversationStore(conversationDatabasePath)
+    const reopened = new SQLiteMainInboxStore(conversationDatabasePath)
     expect(reopened.readRecentContext(2)).toEqual([second, third])
     reopened.close()
 
@@ -104,7 +104,7 @@ describe('main control plane', () => {
     )
     legacy.close()
 
-    const migrated = new SQLiteMainConversationStore(legacyPath)
+    const migrated = new SQLiteMainInboxStore(legacyPath)
     const appended = migrated.appendMessage({ role: 'system', content: 'third migrated', createdAt })
     expect(migrated.readRecentContext()).toEqual([
       { id: 'inserted-first', role: 'user', content: 'first migrated', createdAt },
@@ -120,7 +120,7 @@ describe('main control plane', () => {
 
   it('records messages and exposes explicit task operations without any executor surface', () => {
     const taskStore = new SQLitePersonalStore(personalDatabasePath)
-    const conversationStore = new SQLiteMainConversationStore(conversationDatabasePath)
+    const conversationStore = new SQLiteMainInboxStore(conversationDatabasePath)
     const main = new MainAgent({ taskStore, conversationStore, taskContext: mainContext })
 
     const message = main.recordMessage({

@@ -7,11 +7,11 @@
 ## 用法
 
 ```ts
-import { SQLiteMainConversationStore } from '../src/main/index.js'
+import { SQLiteMainInboxStore } from '../src/main/index.js'
 import { composeFrontBrainContext, createFrontBrain } from '../src/frontbrain/index.js'
 
 const brain = createFrontBrain(config) // 模型取 config.toml 的 [llm]，key 只走 DEEPSEEK_API_KEY
-const store = new SQLiteMainConversationStore(conversationDbPath)
+const store = new SQLiteMainInboxStore(mainAgentDbPath)
 const messages = composeFrontBrainContext({
   instructions: '你是主 Agent 的前台……',
   checkpoint: '检查点 v1：……', // 可选
@@ -22,8 +22,11 @@ const response = await brain.complete({ messages, maxOutputTokens: 1024 })
 ```
 
 - `composeFrontBrainContext` 是纯函数：稳定前缀（instructions，可选 checkpoint）原样
-  输出、永不改写，其后按 `createdAt` 稳定排序追加持久化主对话消息。历史追加不会改变
-  前缀字节。
+  输出、永不改写，其后按存储提供的 durable append order 追加持久化主对话消息。`createdAt`
+  是可回填的描述性时间，不参与上下文排序；历史追加不会改变前缀字节。
+- `SQLiteMainInboxStore` 是唯一的运行时主对话所有者和
+  `main_conversation_messages` DDL/migration 路径：它与 inbox event 共用一个连接，因而可将
+  assistant 回复和 event 状态原子写入。已不再提供独立的 SQLite conversation store。
 - 实现（`DeepSeekFrontBrain`，OpenAI 兼容接口）每次调用都显式发送
   `thinking: { type: 'disabled' }`、非流式、`max_tokens` 上限（1–8192，越界抛错），
   保证前台输出有界。
@@ -49,7 +52,7 @@ const result = await runtime.processNextUserMessageEvent({
 - 只领取下一个可领取的 **pending `user-message` 事件**（interrupt 用户消息优先），
   绝不领取或改动 `timer` / `domain-update` 事件；旧领取/完成接口行为不变。
 - 请求 = 不可变 instructions + 可选 checkpoint（稳定前缀，原样输出）+
-  持久化主对话（含本条用户消息）按时间顺序追加，由 `composeFrontBrainContext`
+  持久化主对话（含本条用户消息）按 durable append order 追加，由 `composeFrontBrainContext`
   组装。领取前会校验 instructions 为非空字符串、checkpoint（如提供）为字符串、
   maxOutputTokens 为 1–8192 的安全整数，以及 contextMessageLimit（如提供）为
   1–100 的安全整数；任一不合法时事件保持 pending。成功领取后，调用失败或空回复时

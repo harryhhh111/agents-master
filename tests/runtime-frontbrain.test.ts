@@ -59,7 +59,7 @@ describe('runtime user-message processing with a fake FrontBrain', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  it('claims the next user message, composes the stable prefix plus chronological conversation, and persists reply with processed state', async () => {
+  it('claims the next user message, composes the stable prefix plus durable conversation order, and persists reply with processed state', async () => {
     const store = openStore(databasePath)
     store.appendMessage({ role: 'assistant', content: '更早的回复', createdAt: '2026-09-15T00:58:00.000Z' })
     store.appendMessage({ role: 'user', content: '更早的追问', createdAt: '2026-09-15T00:59:00.000Z' })
@@ -81,7 +81,7 @@ describe('runtime user-message processing with a fake FrontBrain', () => {
     expect(result!.message).toMatchObject({ role: 'assistant', content: '今天很好，谢谢。' })
     expect(result!.response).toMatchObject({ text: '今天很好，谢谢。', finishReason: 'stop' })
     // The composed request: stable prefix verbatim, then the persisted
-    // conversation (including the triggering user message) chronologically.
+    // conversation (including the triggering user message) in durable order.
     expect(requests).toHaveLength(1)
     expect(requests[0].maxOutputTokens).toBe(128)
     expect(requests[0].messages).toEqual([
@@ -401,6 +401,32 @@ describe('runtime user-message processing with a fake FrontBrain', () => {
       { role: 'system', content: instructions },
       { role: 'user', content: '更早的历史' },
       { role: 'user', content: '要处理的这条' },
+    ])
+    store.close()
+  })
+
+  it('keeps a later-admitted backdated message after earlier admissions while preserving its anchor boundary', async () => {
+    const store = openStore(databasePath)
+    store.appendMessage({ role: 'assistant', content: '先入库的回复', createdAt: '2026-09-15T01:00:00.000Z' })
+    store.appendMessage({ role: 'user', content: '先入库的追问', createdAt: '2026-09-15T01:01:00.000Z' })
+    const backdated = store.receiveUserMessage({
+      conversationId: 'main', idempotencyKey: 'backfilled-anchor', content: '后来补录但时间更早的消息',
+      receivedAt: '2026-09-15T00:01:00.000Z',
+    })
+    // This message is later in durable admission order even though its
+    // timestamp is earlier. It must not cross the claimed anchor boundary.
+    store.appendMessage({ role: 'assistant', content: '锚点之后才入库的消息', createdAt: '2026-09-15T00:00:00.000Z' })
+    const { brain, requests } = makeFakeBrain(['已按入库顺序读取'])
+    const runtime = new MainAgentRuntime(store, brain)
+
+    const result = await runtime.processNextUserMessageEvent({ instructions, maxOutputTokens: 64 })
+
+    expect(result!.event.id).toBe(backdated.event.id)
+    expect(requests[0].messages).toEqual([
+      { role: 'system', content: instructions },
+      { role: 'assistant', content: '先入库的回复' },
+      { role: 'user', content: '先入库的追问' },
+      { role: 'user', content: '后来补录但时间更早的消息' },
     ])
     store.close()
   })

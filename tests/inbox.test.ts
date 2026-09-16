@@ -49,6 +49,30 @@ describe('durable main inbox and runtime', () => {
     direct.close()
   })
 
+  it('enforces the declared inbox user_message_id foreign-key reference', () => {
+    const store = new SQLiteMainInboxStore(databasePath)
+    store.close()
+
+    // Foreign-key enforcement is per SQLite connection. The store enables it
+    // before installing this DDL; exercise the declared reference directly.
+    const direct = new DatabaseSync(databasePath)
+    try {
+      direct.exec('PRAGMA foreign_keys = ON')
+      expect(() => direct.prepare(`
+        INSERT INTO inbox_events (
+          id, conversation_id, idempotency_key, type, priority, payload, status,
+          created_at, updated_at, claimed_at, processed_at, cancelled_at, user_message_id, append_order
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        'orphan-event', 'main', 'orphan-key', 'user-message', 'normal', '{}', 'pending',
+        '2026-09-15T01:00:00.000Z', '2026-09-15T01:00:00.000Z', null, null, null,
+        'missing-user-message', 1,
+      )).toThrow(/FOREIGN KEY constraint failed/)
+    } finally {
+      direct.close()
+    }
+  })
+
   it('returns the originally admitted event for an exact user-message retry', () => {
     const store = new SQLiteMainInboxStore(databasePath)
     const first = store.receiveUserMessage({

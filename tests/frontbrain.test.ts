@@ -24,7 +24,7 @@ function message(role: MainConversationMessage['role'], content: string, created
 }
 
 describe('composeFrontBrainContext', () => {
-  it('keeps the stable prefix verbatim and appends messages in chronological order', () => {
+  it('keeps the stable prefix verbatim and preserves supplied durable message order', () => {
     const context = composeFrontBrainContext({
       instructions,
       checkpoint,
@@ -37,8 +37,8 @@ describe('composeFrontBrainContext', () => {
     expect(context).toEqual([
       { role: 'system', content: instructions },
       { role: 'system', content: checkpoint },
-      { role: 'user', content: '早上的问题' },
       { role: 'assistant', content: '早于用户消息' },
+      { role: 'user', content: '早上的问题' },
       { role: 'assistant', content: '补充' },
     ])
   })

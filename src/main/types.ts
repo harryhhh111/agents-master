@@ -32,7 +32,7 @@ export interface AppendMainConversationMessageInput {
 
 export interface MainConversationStore {
   appendMessage(input: AppendMainConversationMessageInput): MainConversationMessage
-  /** Returns the latest bounded window in chronological order. */
+  /** Returns the latest bounded window in durable append (admission) order. */
   readRecentContext(limit?: number): MainConversationMessage[]
   close(): void
 }
@@ -167,8 +167,9 @@ export interface MainAgentRuntimeStore extends MainConversationStore {
    * the anchor message in append order, windowed to the most recent `limit`
    * messages. The anchor is always included no matter how small the limit is;
    * messages appended after the anchor never appear. Window selection is by
-   * append order (the deterministic admission sequence), then the window is
-   * returned in the usual chronological order.
+   * append order (the deterministic admission sequence), and is returned in
+   * that same durable order. Caller-supplied timestamps are not used to order
+   * foreground context and may legitimately be backfilled.
    */
   readContextThroughMessage(messageId: MainConversationMessageId, limit?: number): MainConversationMessage[]
   /**
