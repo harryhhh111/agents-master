@@ -12,6 +12,8 @@ import type {
 
 /** Maximum persisted messages that one foreground context may compose. */
 export const maxMainConversationContextMessages = 100
+/** Upper bound for a stable checkpoint captured at user-message admission. */
+export const maxMainAgentCheckpointSnapshotCharacters = 16_000
 
 export type MainConversationRole = 'user' | 'assistant' | 'system'
 export type MainConversationMessageId = string
@@ -81,6 +83,12 @@ export interface ReceiveUserMessageInput {
   priority?: InboxEventPriority
   /** Must be canonical UTC ISO text when supplied. */
   receivedAt?: string
+  /**
+   * Optional stable checkpoint captured by the trusted foreground host at
+   * admission. It is kept with the event so an explicit retry uses identical
+   * prefix bytes even after the host restarts or its current checkpoint moves.
+   */
+  checkpointSnapshot?: string
 }
 
 export interface ReceiveUserMessageResult {
@@ -114,8 +122,10 @@ export class InboxIdempotencyConflictError extends Error {
 
 /**
  * Foreground-turn input for the FrontBrain-wired runtime. Instructions and
- * checkpoint are immutable stable-prefix bytes; nothing here is persisted
- * into the conversation or the cognitive store.
+ * checkpoint is a fallback for legacy events with no admission snapshot.
+ * Trusted foreground admission persists a bounded checkpoint snapshot in its
+ * own durable inbox payload; neither value enters conversation history or the
+ * cognitive store.
  */
 export interface ProcessNextUserMessageEventInput {
   /** Stable system instructions; must be non-empty and is passed verbatim. */

@@ -11,7 +11,7 @@ import type {
   ReceiveUserMessageInput,
   ReceiveUserMessageResult,
 } from './types.js'
-import { maxMainConversationContextMessages } from './types.js'
+import { maxMainAgentCheckpointSnapshotCharacters, maxMainConversationContextMessages } from './types.js'
 
 function validateProcessNextUserMessageEventInput(input: ProcessNextUserMessageEventInput): void {
   if (!input || typeof input !== 'object') {
@@ -42,6 +42,20 @@ function validateProcessNextUserMessageEventInput(input: ProcessNextUserMessageE
       `contextMessageLimit must be a positive integer no greater than ${maxMainConversationContextMessages}`,
     )
   }
+}
+
+function checkpointSnapshotForEvent(event: InboxEvent): string | undefined {
+  const payload = event.payload
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined
+  const value = (payload as Record<string, unknown>).checkpointSnapshot
+  if (value === undefined) return undefined
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error(`User-message inbox event ${event.id} has an invalid checkpoint snapshot`)
+  }
+  if (value.length > maxMainAgentCheckpointSnapshotCharacters) {
+    throw new Error(`User-message inbox event ${event.id} has an oversized checkpoint snapshot`)
+  }
+  return value
 }
 
 /**
@@ -124,9 +138,10 @@ export class MainAgentRuntime implements MainAgentRuntimePort {
         `User-message inbox event ${event.id} has no conversation message to anchor the foreground context on`,
       )
     }
+    const checkpoint = checkpointSnapshotForEvent(event) ?? input.checkpoint
     const messages = composeFrontBrainContext({
       instructions: input.instructions,
-      ...(input.checkpoint !== undefined ? { checkpoint: input.checkpoint } : {}),
+      ...(checkpoint !== undefined ? { checkpoint } : {}),
       messages: this.#store.readContextThroughMessage(event.userMessageId, input.contextMessageLimit),
     })
     const response = await frontBrain.complete({ messages, maxOutputTokens: input.maxOutputTokens })

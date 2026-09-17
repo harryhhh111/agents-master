@@ -2,7 +2,8 @@
 
 快速主 Agent Runtime 的低延迟前台模型边界。本切片落地：接口与实现、确定性上下文
 组装、能力探测脚本、不假定缓存的遥测，以及**仅用户消息事件**的 runtime 领取/完成
-接线。**不含** UI、任务/记忆写入、后台循环、自动委派或领域事件处理。
+接线。Dogfood Alpha Slice 1 另在其上提供私有本地 Web 聊天；仍**不含**任务/记忆写入、后台循环、
+自动委派或领域事件处理。
 
 ## 用法
 
@@ -146,8 +147,51 @@ npm run main:chat -- --data-dir /private/path/to/main-chat
 - 稳定 system instructions 固定在 `src/main/foreground.ts`，要求主 Agent 自然理解、简短
   回答、信息不足时澄清，并明确当前没有任务/记忆写入或外部动作能力，不能假装已经执行。
 
-本切片仍**不具备**任务或记忆工具调用/写入、自动委派、领域事件处理、Web UI、子 Agent，或
-并行前台推理；也不改变 Runtime 的原子持久化和失败恢复语义。
+本切片仍**不具备**任务或记忆工具调用/写入、自动委派、领域事件处理、子 Agent，或并行前台
+推理；也不改变 Runtime 的原子持久化和失败恢复语义。
+
+## Dogfood Alpha Slice 1：私有本地 Web 主聊天
+
+```bash
+npm run main:web -- --data-dir /private/path/to/main-chat --port 31415
+# 或：agent main-web --data-dir /private/path/to/main-chat --port 31415
+```
+
+- Web 服务只绑定 `127.0.0.1`，`--port` 只接受一次、范围为 1–65535 的十进制整数；没有 host
+  覆盖参数，也绝不监听公网地址。远程机器上的浏览器访问必须使用 SSH 端口转发，例如：
+
+  ```bash
+  ssh -N -L 31415:127.0.0.1:31415 user@server
+  ```
+
+  启动命令会只向拥有该终端的用户打印一条带高熵访问凭据的 URL，例如
+  `http://127.0.0.1:31415/#access_token=…`；必须打开这条 URL，不能自行只打开根地址。
+  凭据位于 URL fragment，浏览器不会把它作为 HTTP 路径或查询发送；页面只在内存中读取它，普通
+  `fetch` 以请求头发送，SSE 因浏览器限制才使用连接查询参数。服务每次启动重新生成凭据，绝不
+  写入数据目录、日志或源码。没有 fragment 凭据的根页面只显示非敏感提示，且不会加载任何数据。
+  所有 `/api/*` 读写端点都要求此凭据；这层保护补足多用户机器上“仅 loopback”仍可能被本机其他
+  用户访问的问题。
+- 页面只提供持久聊天历史、消息输入、排队/发送/回复状态、错误提示和实时 SSE 回复；刷新会从同一
+  SQLite 对话读取耐久历史。每条网页消息仍先同步进入 durable inbox，随后由同一个
+  `MainAgentForegroundHost` 单飞处理，因此模型请求在飞行时后续输入仍能入库。启动仍只做 scoped
+  `recoverClaimedUserMessageEvents()` 恢复。
+- 首次从 Web 启动时，在所选私有数据目录创建 `owner-context.md`（Linux: 当前用户拥有、`0600`）。
+  数据目录必须在 Git worktree 之外，避免私有内容进入 git；文件初始内容是通用、非个人化模板，
+  已有文件绝不覆盖。页面可查看并**明确保存**它，保存后立即重新加载为
+  **未来**前台回合的稳定 checkpoint。每条用户消息在进入 durable inbox 时都会带上一个受长度限制的
+  checkpoint 快照；已开始、排队、失败后显式恢复、以及重启后恢复的消息都使用自己的原始快照，
+  不会被后来保存的主人上下文改写。它不是自动记忆、Claim、任务或外部动作授权；文件内容不写入 git、
+  服务器日志或错误输出，只会在该用户的后续对话需要时作为模型上下文发送。
+- `/api/history` 返回历史和事件 cursor；浏览器随后带 cursor 订阅 SSE。服务重放该 snapshot 之后、
+  订阅之前发生的有限事件，每条至多一次；若客户端 cursor 已超出有界重放窗口，页面重新获取历史。
+  这避免了“历史读取和 SSE 建连之间”丢失即时状态更新的竞态。
+- 私有数据目录的 Git 防护完全由文件系统祖先检查完成：任一祖先的 `.git` 目录或 linked-worktree
+  `.git` 文件都会在创建 owner context 或 SQLite 前被拒绝。检查本身不能完成时失败关闭，不依赖
+  `git` 可执行文件是否存在。
+
+Dogfood Alpha Slice 1 的明确非目标是任务 UI、任务/记忆/Claim 创建、自动学习、反馈/复盘、工作项目
+委派、子 Agent、多 Agent 协作和任何外部动作。主 Agent 的稳定 instructions 也明确这些限制，不能
+声称已经完成它们。
 
 ### 2026-09-16 本机探测记录（非 provider 保证）
 

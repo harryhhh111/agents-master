@@ -310,4 +310,30 @@ describe('MainAgentForegroundHost', () => {
       event.type === 'reply' ? event.result.message.content : '',
     )).toEqual(['reply:first', 'reply:later'])
   })
+
+  it('uses a replaced checkpoint only for foreground work that starts after the replacement', async () => {
+    const runtime = new FakeRuntime()
+    const gate = deferred<void>()
+    runtime.blockNextProcess(gate.promise)
+    const host = new MainAgentForegroundHost(runtime)
+
+    host.start()
+    host.submit({ content: 'first', idempotencyKey: 'one' })
+    await Promise.resolve()
+    host.setCheckpoint('replacement checkpoint')
+    host.submit({ content: 'second', idempotencyKey: 'two' })
+    gate.resolve()
+    await host.waitForIdle()
+
+    expect(runtime.processInputs.slice(1, 3).map(input => input.checkpoint)).toEqual([
+      defaultMainAgentCheckpoint,
+      'replacement checkpoint',
+    ])
+    // The admission snapshots — not just transient drain inputs — retain the
+    // value each user message observed while the prior turn was active.
+    expect(runtime.received.map(input => input.checkpointSnapshot)).toEqual([
+      defaultMainAgentCheckpoint,
+      'replacement checkpoint',
+    ])
+  })
 })

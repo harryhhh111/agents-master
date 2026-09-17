@@ -17,7 +17,11 @@ import type {
   RecordProcessedUserMessageEventInput,
   RecordProcessedUserMessageEventResult,
 } from './types.js'
-import { InboxIdempotencyConflictError, maxMainConversationContextMessages } from './types.js'
+import {
+  InboxIdempotencyConflictError,
+  maxMainAgentCheckpointSnapshotCharacters,
+  maxMainConversationContextMessages,
+} from './types.js'
 
 type InboxRow = {
   id: string
@@ -60,6 +64,16 @@ function requireIsoTime(value: string, field: string): void {
 
 function requirePriority(value: InboxEventPriority): void {
   if (value !== 'normal' && value !== 'interrupt') throw new Error(`Unsupported inbox priority: ${value}`)
+}
+
+function requireCheckpointSnapshot(value: string | undefined): void {
+  if (value === undefined) return
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error('checkpointSnapshot must be a non-empty string when provided')
+  }
+  if (value.length > maxMainAgentCheckpointSnapshotCharacters) {
+    throw new Error(`checkpointSnapshot must not exceed ${maxMainAgentCheckpointSnapshotCharacters} characters`)
+  }
 }
 
 function requireEventType(value: InboxEventType): void {
@@ -196,6 +210,7 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
     requirePriority(priority)
     const receivedAt = input.receivedAt ?? this.#now()
     requireIsoTime(receivedAt, 'receivedAt')
+    requireCheckpointSnapshot(input.checkpointSnapshot)
 
     this.#db.exec('BEGIN IMMEDIATE')
     try {
@@ -209,6 +224,7 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
           || existing.priority !== priority
           || !message
           || message.content !== input.content
+          || this.#checkpointSnapshot(existing) !== input.checkpointSnapshot
         ) {
           throw new InboxIdempotencyConflictError(input.conversationId, input.idempotencyKey)
         }
@@ -225,7 +241,11 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
         idempotencyKey: input.idempotencyKey,
         type: 'user-message',
         priority,
-        payload: { messageId: message.id, text: message.content },
+        payload: {
+          messageId: message.id,
+          text: message.content,
+          ...(input.checkpointSnapshot === undefined ? {} : { checkpointSnapshot: input.checkpointSnapshot }),
+        },
         status: 'pending',
         createdAt: receivedAt,
         updatedAt: receivedAt,
@@ -428,6 +448,15 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
 
   #findMessage(id: string): ConversationRow | undefined {
     return this.#db.prepare('SELECT * FROM main_conversation_messages WHERE id = ?').get(id) as ConversationRow | undefined
+  }
+
+  #checkpointSnapshot(event: InboxRow): string | undefined {
+    const payload = parsePayload(event.payload)
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined
+    const value = (payload as Record<string, InboxPayload>).checkpointSnapshot
+    if (value === undefined) return undefined
+    requireCheckpointSnapshot(value as string | undefined)
+    return value as string
   }
 
   #transitionClaimedEvent(id: InboxEventId, status: 'processed' | 'cancelled', at: string, field: string): InboxEvent {

@@ -114,6 +114,14 @@ if (cmd === 'doctor') {
     console.error(e instanceof Error ? e.message : String(e))
     process.exit(1)
   }
+} else if (cmd === 'main-web') {
+  const { runMainWeb } = await import('../scripts/main-web.js')
+  try {
+    await runMainWeb(process.argv.slice(3))
+  } catch {
+    console.error('无法启动本地 Web 主聊天。')
+    process.exit(1)
+  }
 } else if (cmd === 'chat') {
   const projectName = process.argv[3]
   if (!projectName) {
@@ -132,5 +140,5 @@ if (cmd === 'doctor') {
     process.exit(1)
   }
 } else {
-  console.log('用法: agent <项目名> | agent doctor | agent main [--data-dir <目录>] | agent chat <项目名>')
+  console.log('用法: agent <项目名> | agent doctor | agent main [--data-dir <目录>] | agent main-web [--data-dir <目录>] [--port <1-65535>] | agent chat <项目名>')
 }

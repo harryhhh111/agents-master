@@ -457,6 +457,67 @@ describe('runtime user-message processing with a fake FrontBrain', () => {
     store.close()
   })
 
+  it('uses each admitted checkpoint snapshot for queued work and explicit recovery, not the later process input', async () => {
+    const store = openStore(databasePath)
+    store.receiveUserMessage({
+      conversationId: 'main', idempotencyKey: 'first', content: 'first', checkpointSnapshot: 'checkpoint at first admission',
+      receivedAt: '2026-09-15T01:00:00.000Z',
+    })
+    store.receiveUserMessage({
+      conversationId: 'main', idempotencyKey: 'second', content: 'second', checkpointSnapshot: 'checkpoint at second admission',
+      receivedAt: '2026-09-15T01:01:00.000Z',
+    })
+    const { brain, requests } = makeFakeBrain([new Error('provider boom'), 'first retry', 'second reply'])
+    const runtime = new MainAgentRuntime(store, brain)
+
+    await expect(runtime.processNextUserMessageEvent({
+      instructions, checkpoint: 'later checkpoint that must not apply', maxOutputTokens: 64,
+    })).rejects.toThrow('provider boom')
+    expect(runtime.recoverClaimedUserMessageEvents('2026-09-15T02:01:00.000Z')).toBe(1)
+    await runtime.processNextUserMessageEvent({
+      instructions, checkpoint: 'another later checkpoint', maxOutputTokens: 64,
+    })
+    await runtime.processNextUserMessageEvent({
+      instructions, checkpoint: 'yet another later checkpoint', maxOutputTokens: 64,
+    })
+
+    expect(requests.map(request => request.messages[1])).toEqual([
+      { role: 'system', content: 'checkpoint at first admission' },
+      { role: 'system', content: 'checkpoint at first admission' },
+      { role: 'system', content: 'checkpoint at second admission' },
+    ])
+    store.close()
+  })
+
+  it('retains an admitted checkpoint snapshot after a claimed event is recovered from a reopened store', async () => {
+    const firstStore = openStore(databasePath)
+    firstStore.receiveUserMessage({
+      conversationId: 'main', idempotencyKey: 'restart-retry', content: 'survives restart', checkpointSnapshot: 'checkpoint before restart',
+      receivedAt: '2026-09-15T01:00:00.000Z',
+    })
+    const firstBrain = makeFakeBrain([new Error('provider boom')])
+    const firstRuntime = new MainAgentRuntime(firstStore, firstBrain.brain)
+    await expect(firstRuntime.processNextUserMessageEvent({
+      instructions, checkpoint: 'current before restart', maxOutputTokens: 64,
+    })).rejects.toThrow('provider boom')
+    firstStore.close()
+
+    const reopened = openStore(databasePath)
+    expect(reopened.recoverClaimedUserMessageEvents('2026-09-15T02:01:00.000Z')).toBe(1)
+    const secondBrain = makeFakeBrain(['recovered reply'])
+    const secondRuntime = new MainAgentRuntime(reopened, secondBrain.brain)
+    await secondRuntime.processNextUserMessageEvent({
+      instructions, checkpoint: 'current after restart', maxOutputTokens: 64,
+    })
+    expect(secondBrain.requests[0]!.messages).toContainEqual({
+      role: 'system', content: 'checkpoint before restart',
+    })
+    expect(secondBrain.requests[0]!.messages).not.toContainEqual({
+      role: 'system', content: 'current after restart',
+    })
+    reopened.close()
+  })
+
   it('recovers only claimed user-message events; claimed timer/domain-update events keep their claims', async () => {
     const store = openStore(databasePath)
     const timer = store.enqueueEvent({

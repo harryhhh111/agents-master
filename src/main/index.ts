@@ -3,6 +3,16 @@ export { MainAgent } from './service.js'
 export { MainAgentRuntime } from './runtime.js'
 export { createMainAgentRuntime } from './factory.js'
 export {
+  defaultOwnerContextTemplate,
+  initializeOwnerContext,
+  maxOwnerContextCharacters,
+  ownerContextCheckpoint,
+  ownerContextFileName,
+  readOwnerContext,
+  saveOwnerContext,
+  validateOwnerContext,
+} from './owner-context.js'
+export {
   MainAgentForegroundHost,
   defaultMainAgentCheckpoint,
   defaultMainAgentInstructions,

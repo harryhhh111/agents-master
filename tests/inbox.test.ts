@@ -89,6 +89,24 @@ describe('durable main inbox and runtime', () => {
     store.close()
   })
 
+  it('persists a bounded checkpoint snapshot and rejects an idempotent retry that changes it', () => {
+    const store = new SQLiteMainInboxStore(databasePath)
+    const first = store.receiveUserMessage({
+      conversationId: 'main', idempotencyKey: 'checkpointed', content: 'keep my admission checkpoint',
+      checkpointSnapshot: 'checkpoint v1', receivedAt: '2026-09-15T01:00:00.000Z',
+    })
+    expect(first.event.payload).toMatchObject({ checkpointSnapshot: 'checkpoint v1' })
+    expect(() => store.receiveUserMessage({
+      conversationId: 'main', idempotencyKey: 'checkpointed', content: 'keep my admission checkpoint',
+      checkpointSnapshot: 'checkpoint v2', receivedAt: '2026-09-15T01:01:00.000Z',
+    })).toThrow(InboxIdempotencyConflictError)
+    expect(() => store.receiveUserMessage({
+      conversationId: 'main', idempotencyKey: 'oversized-checkpoint', content: 'bounded',
+      checkpointSnapshot: 'x'.repeat(16_001), receivedAt: '2026-09-15T01:02:00.000Z',
+    })).toThrow('checkpointSnapshot must not exceed 16000 characters')
+    store.close()
+  })
+
   it('rejects a normal user-message retry changed to interrupt priority', () => {
     const store = new SQLiteMainInboxStore(databasePath)
     store.receiveUserMessage({

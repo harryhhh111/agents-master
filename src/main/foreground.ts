@@ -13,6 +13,7 @@ import type {
 export const defaultMainAgentInstructions = [
   '你是 agents-master 的主 Agent。自然理解用户的话，并用简短、直接的中文回答。',
   '信息不足时先澄清，不要猜测。',
+  '可能会提供一份由用户明确查看、编辑和保存的主人上下文。它只是透明、稳定的本轮背景，不是自动记忆、认识、任务或授权。',
   '当前你不能创建或写入任务、记忆或认识，也不能执行外部动作、联系他人或声称已经完成这些事。',
   '可以说明限制、整理用户已说的信息，并提出下一步需要用户确认的内容。',
 ].join('\n')
@@ -57,7 +58,7 @@ export type ForegroundHostEvent =
 export class MainAgentForegroundHost {
   readonly #runtime: MainAgentRuntimePort
   readonly #conversationId: string
-  readonly #processInput: ProcessNextUserMessageEventInput
+  #processInput: ProcessNextUserMessageEventInput
   readonly #onEvent: (event: ForegroundHostEvent) => void
   #drainPromise: Promise<void> | undefined
   #drainRequested = false
@@ -100,6 +101,7 @@ export class MainAgentForegroundHost {
       content: input.content,
       ...(input.priority === undefined ? {} : { priority: input.priority }),
       ...(input.receivedAt === undefined ? {} : { receivedAt: input.receivedAt }),
+      ...(this.#processInput.checkpoint === undefined ? {} : { checkpointSnapshot: this.#processInput.checkpoint }),
     })
     this.#emit({ type: 'submitted', result })
     this.#startDrain()
@@ -114,6 +116,22 @@ export class MainAgentForegroundHost {
     this.#emit({ type: 'recovered', source: 'explicit', count })
     this.#startDrain()
     return count
+  }
+
+  /**
+   * Replaces only the stable checkpoint used by foreground work that starts
+   * after this call. A request already passed to Runtime retains its exact
+   * input bytes, so a saved owner-context edit never rewrites work in flight.
+   */
+  setCheckpoint(checkpoint?: string): void {
+    if (checkpoint !== undefined && (typeof checkpoint !== 'string' || !checkpoint.trim())) {
+      throw new Error('checkpoint must be a non-empty string when provided')
+    }
+    this.#processInput = {
+      ...this.#processInput,
+      ...(checkpoint === undefined ? {} : { checkpoint }),
+    }
+    if (checkpoint === undefined) delete this.#processInput.checkpoint
   }
 
   /** Test/UI seam: resolves after the current serial drain, if any, is idle. */
