@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
+import { initializeMainSchema, type CoordinationSchemaOptions } from './schema.js'
+import { CoordinationStore } from './coordination/store.js'
 import type {
   EnqueueInboxEventInput,
   EnqueueInboxEventResult,
@@ -50,6 +52,9 @@ type ConversationRow = {
 
 export interface SQLiteMainInboxStoreOptions {
   clock?: () => string
+  coordination?: CoordinationSchemaOptions
+  /** Synthetic failure injection; never set by normal startup. */
+  coordinationFault?: (point: string) => void
 }
 
 function requireText(value: string, field: string): void {
@@ -136,15 +141,26 @@ function toMessage(row: ConversationRow): MainConversationMessage {
 export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
   readonly #db: DatabaseSync
   readonly #clock: () => string
+  readonly #upgraded: boolean
+  readonly #coordination: CoordinationStore | undefined
+
+  get coordination(): CoordinationStore {
+    if (!this.#coordination) throw new Error('Coordination requires explicit opt-in')
+    return this.#coordination
+  }
 
   constructor(databasePath: string, options: SQLiteMainInboxStoreOptions = {}) {
     this.#db = new DatabaseSync(databasePath)
+    this.#db.function('coordination_writer', () => 1)
     // SQLite foreign-key checks are disabled per connection by default. Turn
     // them on before creating or migrating either table so the declared
     // inbox_events.user_message_id reference is enforced by this store.
     this.#db.exec('PRAGMA foreign_keys = ON')
     this.#clock = options.clock ?? (() => new Date().toISOString())
-    this.#initializeSchema()
+    try {
+      this.#upgraded = initializeMainSchema(this.#db, options.coordination)
+      if (this.#upgraded && options.coordination) this.#coordination = new CoordinationStore(this.#db, this.#clock, options.coordinationFault)
+    } catch (error) { this.#db.close(); throw error }
   }
 
   appendMessage(input: { role: 'user' | 'assistant' | 'system'; content: string; createdAt?: string }): MainConversationMessage {
@@ -156,8 +172,8 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
     requireIsoTime(createdAt, 'createdAt')
     const message = { id: randomUUID(), role: input.role, content: input.content, createdAt }
     this.#db.prepare(`
-      INSERT INTO main_conversation_messages (id, role, content, created_at, append_order)
-      VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(append_order), 0) + 1 FROM main_conversation_messages))
+      INSERT INTO main_conversation_messages (id, role, content, created_at, append_order${this.#messageColumns()})
+      VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(append_order), 0) + 1 FROM main_conversation_messages)${this.#messageValues(input.role === 'assistant' ? 'main-agent' : 'runtime', 'chat')})
     `).run(message.id, message.role, message.content, message.createdAt)
     return message
   }
@@ -168,7 +184,7 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
     }
     const rows = this.#db.prepare(`
       SELECT * FROM (
-        SELECT * FROM main_conversation_messages ORDER BY append_order DESC LIMIT ?
+        SELECT * FROM main_conversation_messages ${this.#upgraded ? "WHERE conversation_id='main'" : ''} ORDER BY append_order DESC LIMIT ?
       ) ORDER BY append_order
     `).all(limit) as ConversationRow[]
     return rows.map(toMessage)
@@ -193,6 +209,7 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
         SELECT m.* FROM main_conversation_messages m
         JOIN main_conversation_messages anchor ON anchor.id = ?
         WHERE m.append_order <= anchor.append_order
+        ${this.#upgraded ? "AND m.conversation_id='main' AND anchor.conversation_id='main'" : ''}
         ORDER BY m.append_order DESC LIMIT ?
       ) ORDER BY append_order
     `).all(messageId, limit) as ConversationRow[]
@@ -203,6 +220,7 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
   }
 
   receiveUserMessage(input: ReceiveUserMessageInput): ReceiveUserMessageResult {
+    if (this.#upgraded && input.conversationId !== 'main') throw new Error('Use explicit coordination admission for domain conversations')
     requireText(input.conversationId, 'conversationId')
     requireText(input.idempotencyKey, 'idempotencyKey')
     requireText(input.content, 'content')
@@ -252,8 +270,8 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
         userMessageId: message.id,
       }
       this.#db.prepare(`
-        INSERT INTO main_conversation_messages (id, role, content, created_at, append_order)
-        VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(append_order), 0) + 1 FROM main_conversation_messages))
+        INSERT INTO main_conversation_messages (id, role, content, created_at, append_order${this.#messageColumns()})
+        VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(append_order), 0) + 1 FROM main_conversation_messages)${this.#messageValues('user', 'input')})
       `).run(message.id, message.role, message.content, message.createdAt)
       this.#insertEvent(event)
       this.#db.exec('COMMIT')
@@ -325,6 +343,7 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
     this.#db.exec('BEGIN IMMEDIATE')
     try {
       const event = this.#findEvent(input.eventId)
+      if (this.#upgraded && event.conversation_id !== 'main') throw new Error('Event outside main conversation')
       if (event.type !== 'user-message') {
         throw new Error(`Cannot record a processed reply for non-user inbox event ${input.eventId} (type ${event.type})`)
       }
@@ -332,8 +351,8 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
         id: randomUUID(), role: 'assistant', content: input.content, createdAt: processedAt,
       }
       this.#db.prepare(`
-        INSERT INTO main_conversation_messages (id, role, content, created_at, append_order)
-        VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(append_order), 0) + 1 FROM main_conversation_messages))
+        INSERT INTO main_conversation_messages (id, role, content, created_at, append_order${this.#messageColumns()})
+        VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(append_order), 0) + 1 FROM main_conversation_messages)${this.#messageValues('main-agent', 'chat')})
       `).run(message.id, message.role, message.content, message.createdAt)
       const update = this.#db.prepare(`
         UPDATE inbox_events SET status = 'processed', processed_at = ?, updated_at = ?
@@ -364,6 +383,7 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
     requireIsoTime(recoveredAt, 'recoveredAt')
     return Number(this.#db.prepare(`
       UPDATE inbox_events SET status = 'pending', claimed_at = NULL, updated_at = ? WHERE status = 'claimed'
+      ${this.#mainScope()}
     `).run(recoveredAt).changes)
   }
 
@@ -377,6 +397,7 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
     return Number(this.#db.prepare(`
       UPDATE inbox_events SET status = 'pending', claimed_at = NULL, updated_at = ?
       WHERE status = 'claimed' AND type = 'user-message'
+      ${this.#mainScope()}
     `).run(recoveredAt).changes)
   }
 
@@ -397,10 +418,12 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
       const candidate = (type === undefined
         ? this.#db.prepare(`
             SELECT * FROM inbox_events WHERE status = 'pending'
+            ${this.#mainScope()}
             ORDER BY CASE priority WHEN 'interrupt' THEN 0 ELSE 1 END, append_order LIMIT 1
           `).get()
         : this.#db.prepare(`
             SELECT * FROM inbox_events WHERE status = 'pending' AND type = ?
+            ${this.#mainScope()}
             ORDER BY CASE priority WHEN 'interrupt' THEN 0 ELSE 1 END, append_order LIMIT 1
           `).get(type)) as InboxRow | undefined
       if (!candidate) {
@@ -465,6 +488,7 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
     const column = status === 'processed' ? 'processed_at' : 'cancelled_at'
     const result = this.#db.prepare(`
       UPDATE inbox_events SET status = ?, ${column} = ?, updated_at = ? WHERE id = ? AND status = 'claimed'
+      ${this.#mainScope()}
     `).run(status, at, at, id)
     if (result.changes !== 1) {
       const event = this.#db.prepare('SELECT status FROM inbox_events WHERE id = ?').get(id) as { status: InboxEventStatus } | undefined
@@ -474,45 +498,10 @@ export class SQLiteMainInboxStore implements MainAgentRuntimeStore {
     return toEvent(this.#findEvent(id))
   }
 
-  #initializeSchema(): void {
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS main_conversation_messages (
-        id TEXT PRIMARY KEY,
-        role TEXT NOT NULL,
-        content TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        append_order INTEGER NOT NULL
-      ) STRICT;
-      CREATE TABLE IF NOT EXISTS inbox_events (
-        id TEXT PRIMARY KEY,
-        conversation_id TEXT NOT NULL,
-        idempotency_key TEXT NOT NULL,
-        type TEXT NOT NULL CHECK (type IN ('user-message', 'domain-update', 'timer')),
-        priority TEXT NOT NULL CHECK (priority IN ('normal', 'interrupt')),
-        payload TEXT NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('pending', 'claimed', 'processed', 'cancelled')),
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        claimed_at TEXT,
-        processed_at TEXT,
-        cancelled_at TEXT,
-        user_message_id TEXT REFERENCES main_conversation_messages(id),
-        append_order INTEGER NOT NULL,
-        UNIQUE (conversation_id, idempotency_key)
-      ) STRICT;
-      CREATE INDEX IF NOT EXISTS inbox_events_next_pending
-        ON inbox_events(status, priority, append_order);
-    `)
-    const columns = this.#db.prepare('PRAGMA table_info(main_conversation_messages)').all() as Array<{ name: string }>
-    if (!columns.some(column => column.name === 'append_order')) {
-      this.#db.exec('ALTER TABLE main_conversation_messages ADD COLUMN append_order INTEGER')
-      this.#db.exec('UPDATE main_conversation_messages SET append_order = rowid WHERE append_order IS NULL')
-    }
-    this.#db.exec(`
-      DROP INDEX IF EXISTS main_conversation_messages_by_created;
-      CREATE UNIQUE INDEX IF NOT EXISTS main_conversation_messages_by_append_order
-        ON main_conversation_messages(append_order);
-      CREATE UNIQUE INDEX IF NOT EXISTS inbox_events_by_append_order ON inbox_events(append_order);
-    `)
+  #mainScope(): string { return this.#upgraded ? "AND conversation_id='main'" : '' }
+  #messageColumns(): string { return this.#upgraded ? ',conversation_id,author,presentation' : '' }
+  #messageValues(author: string, presentation: string): string {
+    // All arguments are internal constants, never input text.
+    return this.#upgraded ? `,'main','${author}','${presentation}'` : ''
   }
 }

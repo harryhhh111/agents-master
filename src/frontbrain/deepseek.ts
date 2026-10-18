@@ -6,10 +6,25 @@ import type {
   FrontBrainClient,
   FrontBrainCompletion,
   FrontBrainCreateParams,
+  FrontBrainMessage,
   FrontBrainRequest,
   FrontBrainResponse,
   FrontBrainUsage,
 } from './types.js'
+
+function providerMessages(messages: readonly FrontBrainMessage[]): FrontBrainCreateParams['messages'] {
+  let prefixLength = 0
+  while (messages[prefixLength]?.role === 'system') prefixLength += 1
+  // DeepSeek receives the stable instructions and checkpoint as one leading
+  // system message. Preserve all later conversation messages and caller input.
+  if (prefixLength < 2) {
+    return messages.map(message => ({ role: message.role, content: message.content }))
+  }
+  return [
+    { role: 'system', content: messages.slice(0, prefixLength).map(message => message.content).join('\n\n') },
+    ...messages.slice(prefixLength).map(message => ({ role: message.role, content: message.content })),
+  ]
+}
 
 function requireMaxOutputTokens(value: number): void {
   if (!Number.isSafeInteger(value) || value < 1 || value > maxFrontBrainOutputTokens) {
@@ -55,13 +70,25 @@ export class DeepSeekFrontBrain implements FrontBrain {
     requireMaxOutputTokens(request.maxOutputTokens)
     const params: FrontBrainCreateParams = {
       model: this.#model,
-      messages: request.messages.map(message => ({ role: message.role, content: message.content })),
+      messages: providerMessages(request.messages),
       max_tokens: request.maxOutputTokens,
       stream: false,
       thinking: { type: 'disabled' },
     }
     const startedAt = performance.now()
-    const completion = await this.#client.chat.completions.create(params)
+    // SDK timeout aborts the underlying request; foreground turns must not
+    // inherit the SDK's ten-minute timeout and automatic retries.
+    const controller = new AbortController()
+    const deadline = setTimeout(() => controller.abort(), 30_000)
+    let completion: FrontBrainCompletion
+    try {
+      completion = await this.#client.chat.completions.create(params, { timeout: 30_000, maxRetries: 0, signal: controller.signal })
+    } catch (error) {
+      if (controller.signal.aborted) throw Object.assign(new Error('Foreground request deadline exceeded'), { name: 'APIConnectionTimeoutError' })
+      throw error
+    } finally {
+      clearTimeout(deadline)
+    }
     const latencyMs = performance.now() - startedAt
     const choice = completion.choices?.[0]
     if (!choice) {

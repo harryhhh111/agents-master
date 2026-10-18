@@ -47,10 +47,16 @@ describe('owner context', () => {
     expect(readOwnerContext(directory)).toBe('A bounded explicit context.')
   })
 
-  it('marks owner context as explicit stable material rather than automatic memory', () => {
-    const checkpoint = ownerContextCheckpoint('A bounded explicit context.')
+  it('allows explicit facts as knowledge without implying automatic learning or authority, preserving the content verbatim', () => {
+    const content = 'A bounded explicit context.\n\n  User-maintained text.\n'
+    const checkpoint = ownerContextCheckpoint(content)
     expect(checkpoint).toContain('显式主人上下文')
     expect(checkpoint).toContain('不是自动记忆')
+    expect(checkpoint).toContain('明示的事实是本轮可直接使用的用户背景')
+    expect(checkpoint).toContain('可据此回答对用户的了解')
+    expect(checkpoint).toContain('不等于自动创建持久的认识（Claim）或任务')
+    expect(checkpoint).toContain('也不提供任何授权')
+    expect(checkpoint.slice(checkpoint.indexOf('\n\n') + 2)).toBe(content)
   })
 
   it('refuses a selected directory inside a Git worktree before creating context there', () => {

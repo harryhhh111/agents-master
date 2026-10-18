@@ -35,12 +35,14 @@
   仅是完成当前任务所需的最小上下文。外部联络、承诺、发布、消费、删除或改变外部系统必须获得
   用户的具体授权。
 
-## 当前机器环境（vinci 云服务器，2026-09-12 实测）
+## 当前机器环境（vinci 云服务器，2026-10-15 实测）
 
-- `codex` 0.153.0（`/home/vinci/.local/bin/codex`）。
-- `kimi` 0.39.1（`/home/vinci/.kimi-code/bin/kimi`）。
+- `codex` 0.161.0（`/home/vinci/.local/bin/codex`）；`codex exec -s <sandbox> -C <dir>` 可非交互执行。
+- `kimi` 2.2.0（`/home/vinci/.kimi-code/bin/kimi`）；`kimi -p "..."` 非交互执行，
+  print 模式默认 auto 权限（不能与 `--yolo`/`--auto` 组合，组合会在启动时直接报错）。
 - `claude` 2.1.195（`/home/vinci/.nvm/versions/node/v22.22.2/bin/claude`）；可通过 `-p` 非交互
-  调用。当前 Kimi 额度不足，技术切片期间以 Claude Code 作为第二个独立 CLI。
+  调用。2026-10-15 实测 Kimi 额度可用（完整执行预检与复核任务）；此前"额度不足"结论仅保留为
+  历史记录，需要时 Claude Code 仍可作为第二个独立 CLI。
 - Node v22.22.2、Python3 可用；到 `api.deepseek.com` 网络可达。
 - 项目 `.env` 存在且可用；不要输出其内容或把密钥复制到任何持久位置。
 - `ckrunner` 位于 `/home/vinci/projects/ckrunner`；如复用其代码，先确认版本和边界。

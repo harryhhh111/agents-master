@@ -1,0 +1,110 @@
+import { ScopedProtocolError, ScopedTimeoutError, type ScopedModel, type WireMessage } from '../../agent/scoped-protocol.js'
+import { scopedTurn, safeFailedTurn, type ScopedState, type ScopedTool } from '../../agent/scoped-turn.js'
+import { CoordinationStore, FAKE_GROUP, type FrontTurn } from './store.js'
+import { FakeBackgroundScheduler, type FakeExecutor } from './fake.js'
+
+export function addressedMain(conversation: string, content: string): boolean {
+  return conversation === 'main' || content.startsWith('@main ') || content.startsWith('@主 Agent ')
+}
+export class CoordinationHost {
+  private readonly busy = new Set<string>()
+  private readonly blocked = new Set<string>()
+  private readonly controllers = new Set<AbortController>()
+  private readonly background: FakeBackgroundScheduler
+  private timer?: ReturnType<typeof setInterval>
+  private stopped = false
+  private foregroundActive = false
+  private nextScope = 0
+  checkpoint = '模拟/联调主 Agent；仅受限合成任务，不能声称真实检查。含糊需求先澄清。'
+  constructor(readonly store: CoordinationStore, private readonly mainModel: ScopedModel, private readonly domainModel: ScopedModel,
+    private readonly executor: FakeExecutor & { stop?(id: string): void }, private readonly changed: () => void = () => {}) {
+    this.background = new FakeBackgroundScheduler(store, executor, changed)
+  }
+  start(): void {
+    for (const c of ['main', FAKE_GROUP]) this.store.recover(c)
+    this.timer = setInterval(() => this.pump(), 25); this.timer.unref(); this.pump()
+  }
+  status(c: string): 'idle' | 'processing' | 'blocked' { return this.blocked.has(c) ? 'blocked' : this.busy.has(c) ? 'processing' : 'idle' }
+  submit(c: string, key: string, text: string): unknown { const r = this.store.admit(c, key, text); if (!r.duplicate) this.changed(); this.pump(); return r }
+  retry(c: string): void { this.blocked.delete(c); this.pump() }
+  cancel(c: string, eventId: string, id: string): unknown {
+    // Source-bound cancellation is committed through the same protocol path.
+    const turn = { conversation: c, event: { id: eventId } } as FrontTurn
+    const prior = this.store.protocol<ScopedState>(turn)
+    if (prior?.final) return prior.final
+    return this.store.commitProtocol(turn, () => this.store.cancel(FAKE_GROUP, id), result => ({ messages: [], rounds: 0, ids: [], final: '模拟取消请求已记录：' + result.status }))
+  }
+  private tools(turn: FrontTurn): Record<string, ScopedTool> {
+    return {
+      directory: { fields: {}, execute: () => ({ conversation: FAKE_GROUP, project: 'FAKE-project', scope: 'synthetic' }) },
+      status: { fields: {}, execute: () => ({ assignments: this.store.assignments(FAKE_GROUP).map(a => ({ id: a.id, status: a.status })), questions: this.store.questions(FAKE_GROUP) }) },
+      delegate: { fields: { objective: 'text', completionCriteria: 'texts' }, terminal: true, execute: a => this.store.accept(turn.conversation, turn.event.id, { action: 'fake-check', objective: String(a.objective), scope: ['synthetic'], completionCriteria: a.completionCriteria as string[] }) },
+      answer: { fields: { questionId: 'text' }, terminal: true, execute: a => this.store.answer(FAKE_GROUP, String(a.questionId), turn.conversation, turn.event.id) },
+      cancel: { fields: { assignmentId: 'text' }, terminal: true, execute: a => this.store.cancel(FAKE_GROUP, String(a.assignmentId)) },
+    }
+  }
+  private async step(c: string): Promise<boolean> {
+    let turn: FrontTurn | undefined
+    let progressed = false
+    let author = c === 'main' ? 'main-agent' : 'fake-work-agent'
+    const controller = new AbortController(); this.controllers.add(controller)
+    try {
+      const deliver = () => { for (const o of this.store.pendingOutbox(c)) if (this.store.deliver(c, o.id, '模拟/联调回传：' + o.body)) { progressed = true; return true }; return false }
+      if (this.store.userTurnCount(c) >= 3 && deliver()) return true
+      turn = this.store.beginChat(c)
+      if (!turn) return deliver()
+      this.busy.add(c); this.changed()
+      const main = addressedMain(c, turn.context.at(-1)?.content ?? '')
+      author = main ? 'main-agent' : 'fake-work-agent'
+      const policy = '仅模拟联调，不能声称真实项目执行。仅明确工作委托使用 delegate；含糊需求用普通文本澄清，不创建任务。answer 只回答绑定待决问题，cancel 只取消指定任务。'
+      const initial: WireMessage[] = [{ role: 'system', content: (main ? (c === 'main' ? this.checkpoint : '群内主 Agent，仅使用本群上下文。') : '工作项目 Agent，仅使用本群上下文；可通过受限协调工具委派合成工作。') + '\n' + policy }, ...turn.context.map(m => ({ role: m.role, content: JSON.stringify({ author: m.author, text: m.content }) }))]
+      const current = turn
+      const reply = await scopedTurn({ model: main ? this.mainModel : this.domainModel, initial, tools: this.tools(turn), signal: controller.signal,
+        load: () => this.store.protocol<ScopedState>(current), save: s => this.store.saveProtocol(current, s),
+        commit: work => this.store.commitProtocol(current, work, s => s),
+      })
+      if (!this.stopped) this.store.finishChat(turn, reply, author)
+    } catch (error) {
+      if (turn) {
+        const state = this.store.protocol<ScopedState>(turn)
+        const e = error as { name?: string; status?: number }
+        const transient = error instanceof ScopedTimeoutError || ['APIConnectionError','APIConnectionTimeoutError'].includes(e?.name ?? '') || [408,429,500,502,503,504].includes(e?.status ?? 0)
+        if (state?.final && !state.failure) {
+          // Reply persistence failed after an accepted decision. Keep its
+          // durable result intact; retry only the reply, never the action.
+          this.store.releaseChat(turn); if (!this.stopped) this.blocked.add(c)
+        } else if (!this.stopped && (error instanceof ScopedProtocolError || !transient || (state?.rounds ?? 0) >= 3)) {
+          const failed: ScopedState = state?.failure ? state : { ...(state ?? { messages: [], rounds: 0, ids: [] }), final: safeFailedTurn, failure: { kind: 'provider', reason: 'Provider request failed or attempts exhausted' } }
+          this.store.commitProtocol(turn, () => this.store.finishChat(turn!, failed.final!, author), () => failed)
+        } else { this.store.releaseChat(turn); if (!this.stopped) this.blocked.add(c) }
+      }
+    } finally { this.controllers.delete(controller); this.busy.delete(c); if (turn || progressed) this.changed() }
+    return !!turn || progressed
+  }
+  /** One foreground writer across both scopes; rotate after actual progress.
+   * Background claiming/execution and input admission do not enter this queue. */
+  private async foregroundSafePoint(): Promise<void> {
+    this.foregroundActive = true
+    const scopes = ['main', FAKE_GROUP]
+    try {
+      for (let offset = 0; offset < scopes.length && !this.stopped; offset++) {
+        const index = (this.nextScope + offset) % scopes.length, c = scopes[index]!
+        if (this.blocked.has(c)) continue
+        if (await this.step(c)) { this.nextScope = (index + 1) % scopes.length; break }
+      }
+    } finally { this.foregroundActive = false }
+  }
+  pump(): void {
+    if (this.stopped) return
+    for (const r of this.store.runs(FAKE_GROUP)) if (r.status === 'cancel_requested') this.executor.stop?.(r.id)
+    this.background.startNext(FAKE_GROUP)
+    if (!this.foregroundActive) void this.foregroundSafePoint()
+  }
+  async close(): Promise<void> {
+    this.stopped = true; clearInterval(this.timer)
+    for (const c of this.controllers) c.abort()
+    for (const r of this.store.runs(FAKE_GROUP)) this.executor.stop?.(r.id)
+    while (this.foregroundActive) await new Promise(resolve => setTimeout(resolve, 1))
+    this.background.close()
+  }
+}

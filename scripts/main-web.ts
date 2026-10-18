@@ -1,6 +1,5 @@
 #!/usr/bin/env tsx
-import 'dotenv/config'
-import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import path from 'node:path'
@@ -21,13 +20,12 @@ import {
   readOwnerContext,
   saveOwnerContext,
 } from '../src/main/owner-context.js'
-import { defaultMainChatDataDirectory } from './main-chat.js'
+import { MainWebAuth, sessionFromCookie, sessionCookie, validateWriteOrigin } from '../src/main/web-auth.js'
 
 export const mainWebLoopbackAddress = '127.0.0.1'
 export const defaultMainWebPort = 31415
 export const maxMainWebMessageCharacters = 8_000
 const maxJsonBodyBytes = 32_000
-const mainWebAccessTokenHeader = 'x-agents-main-web-token'
 const mainWebEventReplayLimit = 256
 
 export interface MainWebArguments {
@@ -35,13 +33,8 @@ export interface MainWebArguments {
   port: number
 }
 
-/** Fresh, in-memory bearer secret for one local Web-server lifetime. */
-export function generateMainWebAccessToken(): string {
-  return randomBytes(32).toString('base64url')
-}
-
 export function parseMainWebArguments(args: readonly string[], homeDirectory = homedir()): MainWebArguments {
-  let dataDirectory = defaultMainChatDataDirectory(homeDirectory)
+  let dataDirectory = path.join(homeDirectory, '.local', 'share', 'agents-master', 'main-chat')
   let port = defaultMainWebPort
   let sawDataDirectory = false
   let sawPort = false
@@ -98,12 +91,12 @@ function safeErrorMessage(error: unknown): string {
   return '请求无法完成。'
 }
 
-function json(response: ServerResponse, status: number, value: unknown): void {
+export function json(response: ServerResponse, status: number, value: unknown): void {
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
   response.end(JSON.stringify(value))
 }
 
-function html(response: ServerResponse): void {
+function html(response: ServerResponse, page = mainWebPage): void {
   response.writeHead(200, {
     'Content-Type': 'text/html; charset=utf-8',
     'Cache-Control': 'no-store',
@@ -111,10 +104,10 @@ function html(response: ServerResponse): void {
     'Referrer-Policy': 'no-referrer',
     'Content-Security-Policy': "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
   })
-  response.end(mainWebPage)
+  response.end(page)
 }
 
-async function readJson(request: IncomingMessage): Promise<Record<string, unknown>> {
+export async function readJson(request: IncomingMessage): Promise<Record<string, unknown>> {
   const contentType = request.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase()
   if (contentType !== 'application/json') throw new Error('请求体必须是 JSON 对象')
   const chunks: Buffer[] = []
@@ -145,9 +138,12 @@ type MainWebEventRecord = { cursor: number; event: MainWebEvent }
 
 /** Small fan-out seam: the foreground host remains the sole runtime owner. */
 export class MainWebEventBus {
-  readonly #clients = new Set<ServerResponse>()
+  readonly #clients = new Map<ServerResponse, () => boolean>()
   readonly #history: MainWebEventRecord[] = []
   #cursor = 0
+  #failure: string | undefined
+
+  getFailure(): string | undefined { return this.#failure }
 
   snapshot<T>(read: () => T): { value: T; cursor: number } {
     // Node runs this synchronous section without an interleaving publish, so
@@ -155,14 +151,14 @@ export class MainWebEventBus {
     return { value: read(), cursor: this.#cursor }
   }
 
-  subscribe(response: ServerResponse, afterCursor?: number): void {
+  subscribe(response: ServerResponse, afterCursor?: number, authorized = () => true): void {
     const oldestCursor = this.#history[0]?.cursor
     if (afterCursor !== undefined && oldestCursor !== undefined && afterCursor < oldestCursor - 1) {
       response.write('event: reset\ndata: {"type":"reset"}\n\n')
       response.end()
       return
     }
-    this.#clients.add(response)
+    this.#clients.set(response, authorized)
     response.once('close', () => this.#clients.delete(response))
     if (afterCursor !== undefined) {
       for (const record of this.#history) {
@@ -172,27 +168,47 @@ export class MainWebEventBus {
   }
 
   publish(event: MainWebEvent): void {
+    if (event.type === 'error') this.#failure = event.message
+    if (event.type === 'recovered' || event.type === 'reply') this.#failure = undefined
     const record = { cursor: ++this.#cursor, event }
     this.#history.push(record)
     if (this.#history.length > mainWebEventReplayLimit) this.#history.shift()
-    for (const client of this.#clients) this.#write(client, record)
+    for (const client of this.#clients.keys()) this.#write(client, record)
   }
 
   close(): void {
-    for (const client of this.#clients) client.end()
+    for (const client of this.#clients.keys()) client.end()
     this.#clients.clear()
   }
 
   #write(response: ServerResponse, record: MainWebEventRecord): void {
+    if (!this.#clients.get(response)?.()) { response.end(); return }
     response.write(`id: ${record.cursor}\nevent: update\ndata: ${JSON.stringify(record.event)}\n\n`)
   }
+}
+
+/** Deliberately exclude provider messages, URLs, headers and request bodies. */
+export function safeProviderFailure(error: unknown): { category: string; status?: number; message: string } {
+  const source = error && typeof error === 'object' ? error as Record<string, unknown> : {}
+  const status = typeof source.status === 'number' && Number.isInteger(source.status) && source.status >= 400 && source.status <= 599 ? source.status : undefined
+  const name = source.name
+  const category = name === 'APIConnectionTimeoutError' ? 'timeout'
+    : name === 'APIConnectionError' ? 'network'
+      : status === 401 ? 'authentication' : status === 402 ? 'balance'
+        : status === 429 ? 'rate_limit' : status && status >= 500 ? 'provider' : 'unknown'
+  const labels: Record<string, string> = {
+    timeout: '模型请求超时（30 秒）', network: '无法连接模型服务',
+    authentication: '模型服务认证失败', balance: '模型服务返回余额不足',
+    rate_limit: '模型服务请求受限', provider: '模型服务暂时出错', unknown: '模型请求失败',
+  }
+  return { category, ...(status === undefined ? {} : { status }), message: labels[category] + '；消息已保留，请点击“重试失败回合”。' }
 }
 
 export function foregroundEventForWeb(event: ForegroundHostEvent): MainWebEvent {
   switch (event.type) {
     case 'submitted': return { type: 'submitted', message: event.result.message }
     case 'reply': return { type: 'reply', message: event.result.message }
-    case 'error': return { type: 'error', message: '模型请求失败；消息已保留，等待明确重试。' }
+    case 'error': return { type: 'error', message: safeProviderFailure(event.error).message }
     case 'recovered': return { type: 'recovered', count: event.count }
   }
 }
@@ -202,15 +218,16 @@ export interface MainWebHost {
   submit(input: { content: string; idempotencyKey: string }): unknown
   recover(): number | undefined
   setCheckpoint(checkpoint?: string): void
+  getStatus(): 'idle' | 'processing' | 'blocked'
 }
 
 export interface MainWebServerOptions {
+  preview?: { page: string; handle(request: IncomingMessage, response: ServerResponse, authorized: () => boolean): Promise<boolean>; close(): void }
   host: MainWebHost
   readHistory(): MainConversationMessage[]
   dataDirectory: string
   events: MainWebEventBus
-  /** In-memory secret generated once by the process entrypoint. */
-  accessToken: string
+  auth: MainWebAuth
 }
 
 export function createMainWebServer(options: MainWebServerOptions): Server {
@@ -222,7 +239,7 @@ export function createMainWebServer(options: MainWebServerOptions): Server {
   })
 }
 
-async function handleMainWebRequest(
+export async function handleMainWebRequest(
   request: IncomingMessage,
   response: ServerResponse,
   options: MainWebServerOptions,
@@ -230,9 +247,45 @@ async function handleMainWebRequest(
   const method = request.method ?? 'GET'
   const url = new URL(request.url ?? '/', 'http://localhost')
   const pathname = url.pathname
-  if (method === 'GET' && pathname === '/') return html(response)
-  if (pathname.startsWith('/api/') && !isAuthorized(request, url, options.accessToken)) {
+  if (method === 'GET' && pathname === '/') return html(response, options.preview?.page)
+  const session = sessionFromCookie(request.headers.cookie)
+  const writeOrigin = validateWriteOrigin(request.headers.origin, request.headers.host)
+  if (pathname.startsWith('/api/') && !['GET', 'HEAD'].includes(method)) {
+    if (!writeOrigin) return json(response, 403, { error: '请从本站页面提交请求。' })
+    if (request.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') {
+      return json(response, 400, { error: '请求体必须是 JSON 对象' })
+    }
+  }
+  if (method === 'GET' && pathname === '/api/auth') {
+    return json(response, 200, { configured: options.auth.configured, authenticated: options.auth.authorized(session) })
+  }
+  if (method === 'POST' && (pathname === '/api/auth/login' || pathname === '/api/auth/setup')) {
+    try {
+      const body = await readJson(request)
+      const newSession = pathname.endsWith('/setup')
+        ? await options.auth.setup(body.password, body.setupToken)
+        : await options.auth.login(body.password)
+      response.setHeader('Set-Cookie', sessionCookie(newSession, writeOrigin!.secure))
+      return json(response, 200, { authenticated: true })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : ''
+      const allowed = ['设置凭据无效或已失效。', '尝试过于频繁，请稍后再试。', '密码不正确。', '密码必须为 8 到 256 个字符。', '请求体必须是 JSON 对象', '请求体过大']
+      return json(response, message === '尝试过于频繁，请稍后再试。' ? 429 : 400, { error: allowed.includes(message) ? message : '登录失败。' })
+    }
+  }
+  if (pathname.startsWith('/api/') && !options.auth.authorized(session)) {
     return json(response, 401, { error: '未授权。' })
+  }
+  if (method === 'POST' && pathname === '/api/auth/logout') {
+    options.auth.logout(session)
+    options.events.close()
+    options.preview?.close()
+    response.setHeader('Set-Cookie', sessionCookie('', writeOrigin!.secure, true))
+    return json(response, 200, { authenticated: false })
+  }
+  if (options.preview && await options.preview.handle(request, response, () => options.auth.authorized(session))) return
+  if (method === 'GET' && pathname === '/api/status') {
+    return json(response, 200, { state: options.host.getStatus(), message: options.events.getFailure() })
   }
   if (method === 'GET' && pathname === '/api/history') {
     const history = options.events.snapshot(options.readHistory)
@@ -249,7 +302,12 @@ async function handleMainWebRequest(
       'X-Content-Type-Options': 'nosniff',
     })
     response.write(': connected\n\n')
-    options.events.subscribe(response, parseEventCursor(url.searchParams.get('cursor')))
+    options.events.subscribe(response, parseEventCursor(url.searchParams.get('cursor')), () => options.auth.authorized(session))
+    const expiryCheck = setInterval(() => {
+      if (!options.auth.authorized(session)) response.end()
+    }, 30_000)
+    expiryCheck.unref()
+    response.once('close', () => clearInterval(expiryCheck))
     return
   }
   if (method === 'POST' && pathname === '/api/messages') {
@@ -281,16 +339,6 @@ async function handleMainWebRequest(
   return json(response, 404, { error: '未找到此地址。' })
 }
 
-function isAuthorized(request: IncomingMessage, url: URL, expectedToken: string): boolean {
-  const provided = url.pathname === '/api/events'
-    ? url.searchParams.get('access_token')
-    : request.headers[mainWebAccessTokenHeader]
-  if (typeof provided !== 'string') return false
-  const expected = Buffer.from(expectedToken)
-  const actual = Buffer.from(provided)
-  return actual.length === expected.length && timingSafeEqual(actual, expected)
-}
-
 function parseEventCursor(value: string | null): number | undefined {
   if (value === null) return undefined
   if (!/^(?:0|[1-9]\d*)$/.test(value)) return undefined
@@ -316,6 +364,7 @@ export async function listenMainWebServer(server: Server, port: number): Promise
 }
 
 export async function runMainWeb(args = process.argv.slice(2)): Promise<void> {
+  await import('dotenv/config')
   const { dataDirectory, port } = parseMainWebArguments(args)
   // Check this before creating SQLite so an accidentally selected repository
   // never receives either the private context or the Web runtime database.
@@ -323,17 +372,23 @@ export async function runMainWeb(args = process.argv.slice(2)): Promise<void> {
   const config = loadConfig()
   const resources = createMainAgentRuntime({ dataDirectory, frontBrain: createFrontBrain(config) })
   const events = new MainWebEventBus()
-  const accessToken = generateMainWebAccessToken()
+  const auth = new MainWebAuth(dataDirectory)
   const host = new MainAgentForegroundHost(resources.runtime, {
     checkpoint: mainCheckpoint(readOwnerContext(dataDirectory)),
-    onEvent: event => events.publish(foregroundEventForWeb(event)),
+    onEvent: event => {
+      if (event.type === 'error') {
+        const failure = safeProviderFailure(event.error)
+        process.stderr.write(`[main-web] provider_failure category=${failure.category}${failure.status === undefined ? '' : ` status=${failure.status}`}\n`)
+      }
+      events.publish(foregroundEventForWeb(event))
+    },
   })
   const server = createMainWebServer({
     host,
     readHistory: () => resources.store.readRecentContext(100),
     dataDirectory,
     events,
-    accessToken,
+    auth,
   })
   let closing: Promise<void> | undefined
   const close = (): Promise<void> => {
@@ -353,8 +408,9 @@ export async function runMainWeb(args = process.argv.slice(2)): Promise<void> {
   try {
     const actualPort = await listenMainWebServer(server, port)
     host.start()
-    process.stdout.write(`本地 Web 主聊天已启动：http://${mainWebLoopbackAddress}:${actualPort}/#access_token=${accessToken}\n`)
-    process.stdout.write('仅监听 127.0.0.1；远程使用必须通过 SSH 端口转发，绝不提供公网监听。\n')
+    const fragment = auth.setupToken ? `#setup_token=${auth.setupToken}` : ''
+    process.stdout.write(`本地 Web 主聊天已启动：http://${mainWebLoopbackAddress}:${actualPort}/${fragment}\n`)
+    process.stdout.write(auth.configured ? '使用密码登录，登录状态保持 30 天。\n' : '首次使用：请从上面的设置链接创建登录密码。\n')
     await new Promise<void>(resolve => {
       process.once('SIGINT', resolve)
       process.once('SIGTERM', resolve)
@@ -366,28 +422,196 @@ export async function runMainWeb(args = process.argv.slice(2)): Promise<void> {
   }
 }
 
-const mainWebPage = `<!doctype html>
-<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+export const mainWebPage = `<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
 <title>主 Agent</title>
 <style>
-body{font:16px system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;color:#202124}h1{font-size:1.25rem}.notice{color:#555}.messages{border:1px solid #ccc;min-height:18rem;padding:1rem;white-space:pre-wrap}.message{margin:.55rem 0}.role{font-weight:600}.status{min-height:1.5rem;margin:.75rem 0}.error{color:#a00}textarea,input,button{font:inherit}textarea{width:100%;box-sizing:border-box;min-height:6rem}.chat{display:flex;gap:.5rem}.chat input{flex:1}.owner{margin-top:2rem;border-top:1px solid #ccc;padding-top:1rem}
+*{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden}body{font:16px/1.6 system-ui,sans-serif;color:#202c32;background:#edf1f3}button,input,textarea{font:inherit}button{cursor:pointer;border:1px solid #cbd5da;border-radius:12px;padding:.5rem .85rem;background:#fff;color:inherit;touch-action:manipulation}button:disabled{opacity:.45;cursor:default}button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:2px solid #087d69;outline-offset:2px}[hidden]{display:none!important}main{height:100vh;height:100dvh;max-width:860px;margin:auto;background:#f7f9fa;display:flex;flex-direction:column;overflow:hidden}h1,h2,p{margin:0}h1{font-size:1.05rem}h2{font-size:1rem;margin-bottom:.5rem}.app-header{padding:.65rem 1rem;border-bottom:1px solid #dee5e8;background:#fff;flex:none}.status{font-size:.8rem;color:#63737b;min-height:1.3em}.private-panel{display:flex;flex:1;min-height:0;flex-direction:column;position:relative}.conversation{position:relative;flex:1;min-height:0}.messages{height:100%;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;overflow-anchor:none;padding:1rem}.message{display:flex;flex-direction:column;align-items:flex-start;margin:0 0 1rem;min-width:0}.message.user{align-items:flex-end}.bubble{max-width:85%;min-width:0;padding:.65rem .85rem;border-radius:16px 16px 16px 4px;background:#fff;border:1px solid #e2e8eb;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65}.user .bubble{background:#d9f3e9;border-color:#c3e7da;border-radius:16px 16px 4px 16px}.role{font-size:.72rem;color:#63737b;margin:0 .3rem .2rem}.empty-state{position:absolute;top:30%;left:1rem;right:1rem;text-align:center;color:#63737b;pointer-events:none}.latest{position:absolute;bottom:.75rem;left:50%;transform:translateX(-50%);box-shadow:0 2px 10px #20303020;white-space:nowrap;font-size:.85rem}.composer{flex:none;background:#fff;border-top:1px solid #dee5e8;padding:.65rem 1rem max(.65rem,env(safe-area-inset-bottom))}.chat{display:flex;align-items:flex-end;gap:.6rem;min-width:0}.chat textarea{display:block;flex:1;min-width:0;width:0;resize:none;min-height:46px;max-height:160px;overflow-y:auto;border:1px solid #cbd5da;border-radius:14px;padding:.6rem .75rem;line-height:1.5}.chat button{background:#087d69;color:#fff;border-color:#087d69;min-height:46px}.hint{font-size:.72rem;color:#63737b;margin-top:.25rem}.feedback{flex:none;padding:0 1rem;background:#fff;max-height:25vh;overflow:auto;font-size:.85rem}.error{color:#a12525;overflow-wrap:anywhere}.error:not(:empty){padding:.4rem 0}.send-failure{padding:.5rem 0;border-bottom:1px solid #edf1f3;overflow-wrap:anywhere}.send-failure button{font-size:.8rem;padding:.2rem .5rem;margin-left:.5rem}.settings{flex:none;border-bottom:1px solid #dee5e8;background:#fff;max-height:50%;overflow:auto}.settings summary{cursor:pointer;padding:.4rem 1rem;font-size:.85rem;color:#52636c}.settings-body{padding:.5rem 1rem 1rem;font-size:.85rem}.settings-body p{color:#63737b;margin:.5rem 0}.settings textarea{display:block;width:100%;min-height:8rem;resize:vertical;max-height:24vh;padding:.6rem;border:1px solid #cbd5da;border-radius:10px}.settings button{margin-top:.5rem}.login-panel{padding:1.5rem;overflow:auto}.login-panel form{display:grid;gap:.8rem;max-width:400px}.login-panel input{display:block;width:100%;min-width:0;border:1px solid #cbd5da;padding:.6rem;border-radius:10px}.login-panel p{margin-top:.75rem;font-size:.85rem}#login-error{padding:0 1rem}#reload-chat{align-self:center;margin:.5rem}@media(max-width:600px){.messages{padding:.8rem}.composer{padding-left:.65rem;padding-right:.65rem}.bubble{max-width:92%}.hint{display:none}}@media(pointer:coarse){.hint{display:none}}
 </style>
-<main><h1>主 Agent</h1><p class="notice">私有本地入口。当前不能创建任务、记忆或认识，也不能执行外部动作。</p>
-<div id="messages" class="messages" aria-live="polite"></div><p id="status" class="status">正在加载…</p><p id="error" class="error" role="alert"></p>
-<form id="chat" class="chat"><input id="message" aria-label="消息" autocomplete="off" maxlength="8000"><button>发送</button></form><button id="recover" type="button">重试失败回合</button>
-<section class="owner"><h2>显式主人上下文</h2><p>这是你明确维护的稳定背景，不是自动记忆。保存后仅影响未来回合。</p><textarea id="owner" aria-label="主人上下文" maxlength="12000"></textarea><button id="save-owner" type="button">明确保存主人上下文</button></section></main>
+<main><header class="app-header"><h1>主 Agent</h1><p id="status" class="status" role="status">正在连接…</p></header>
+<section id="login-panel" class="login-panel" hidden><h2 id="login-title">登录</h2><form id="login"><label id="setup-credential-panel" hidden>初始化凭据<input id="setup-credential" type="password" aria-label="初始化凭据" autocomplete="off" maxlength="200"></label><input id="password" type="password" aria-label="密码" autocomplete="current-password" minlength="8" maxlength="256" required><button id="login-button">登录</button></form><p id="login-notice"></p></section>
+<section id="private-panel" class="private-panel" hidden>
+<details id="settings" class="settings"><summary>设置</summary><div class="settings-body"><h2>主人上下文</h2><p>你明确维护的稳定背景，不是自动记忆。保存后仅影响未来回合。</p><textarea id="owner" aria-label="主人上下文" maxlength="12000"></textarea><button id="save-owner" type="button">明确保存主人上下文</button><p id="owner-status" role="status"></p><p>当前支持持续聊天。还不能创建任务、自动记忆或执行外部动作。</p><button id="logout" type="button">退出登录</button></div></details>
+<div class="conversation"><div id="messages" class="messages" role="log" aria-label="聊天记录" aria-live="polite" tabindex="0"></div><p id="empty-state" class="empty-state">正在加载聊天…</p><button id="latest" class="latest" type="button" hidden>回到最新</button></div>
+<div class="feedback"><p id="error" class="error" role="alert"></p><button id="recover" type="button" hidden>重试回复</button><div id="send-errors" aria-live="polite"></div></div><button id="reload-chat" type="button" hidden>重新加载聊天</button>
+<div class="composer"><form id="chat" class="chat"><textarea id="message" rows="1" aria-label="消息" placeholder="聊点什么…" autocomplete="off" maxlength="8000" enterkeyhint="enter"></textarea><button id="send" disabled>发送</button></form><p class="hint">Enter 发送 · Shift + Enter 换行</p></div></section><p id="login-error" class="error" role="alert"></p></main>
 <script>
 const messages=document.querySelector('#messages'),status=document.querySelector('#status'),error=document.querySelector('#error'),input=document.querySelector('#message'),owner=document.querySelector('#owner');
-const accessToken=new URLSearchParams(location.hash.slice(1)).get('access_token');
+const setupStorageKey='agents-main-web-pending-setup';
+const fragmentSetupToken=new URLSearchParams(location.hash.slice(1)).get('setup_token');
+let setupToken=fragmentSetupToken;
+try{if(fragmentSetupToken!==null){if(fragmentSetupToken)sessionStorage.setItem(setupStorageKey,fragmentSetupToken);else sessionStorage.removeItem(setupStorageKey)}else setupToken=sessionStorage.getItem(setupStorageKey)}catch(e){}
+if(location.hash)history.replaceState(null,'',location.pathname+location.search);
+let stream,pollTimer,viewGeneration=0,eventRevision=0;
+const loginPanel=document.querySelector('#login-panel'),privatePanel=document.querySelector('#private-panel'),password=document.querySelector('#password'),loginError=document.querySelector('#login-error');
+const sendButton=document.querySelector('#send'),recoverButton=document.querySelector('#recover'),latest=document.querySelector('#latest'),emptyState=document.querySelector('#empty-state'),sendErrors=document.querySelector('#send-errors'),reloadButton=document.querySelector('#reload-chat'),ownerStatus=document.querySelector('#owner-status');
+let loaded=false,loading=false,connectionLost=false,liveDisconnected=false,replyState='idle',replyError='',sending=false,recovering=false,composing=false,compositionEndedAt=-Infinity,draftRevision=0,unread=0;
+let failedSends=[];
+let followingLatest=true,scrollWidth=messages.clientWidth,scrollHeight=messages.clientHeight,touchY;
 const seen=new Set();
-function add(message){if(seen.has(message.id))return;seen.add(message.id);const row=document.createElement('div'),role=document.createElement('span');row.className='message';role.className='role';role.textContent=(message.role==='assistant'?'主 Agent':'你')+'：';row.append(role,document.createTextNode(message.content));messages.append(row);messages.scrollTop=messages.scrollHeight}
-async function request(url,options){const headers=new Headers(options&&options.headers);headers.set('${mainWebAccessTokenHeader}',accessToken);const response=await fetch(url,{...options,headers});const body=await response.json();if(!response.ok)throw new Error(body.error||'请求无法完成。');return body}
-function openEvents(cursor){const stream=new EventSource('/api/events?access_token='+encodeURIComponent(accessToken)+'&cursor='+encodeURIComponent(cursor));stream.addEventListener('update',event=>{const update=JSON.parse(event.data);if(update.type==='submitted'){add(update.message);status.textContent='已排队，正在等待回复。'}if(update.type==='reply'){add(update.message);status.textContent='已回复。'}if(update.type==='error'){error.textContent=update.message;status.textContent='回复失败。'}if(update.type==='recovered'){status.textContent='已恢复 '+update.count+' 条消息。'}});stream.addEventListener('reset',()=>location.reload());stream.onerror=()=>{status.textContent='实时连接暂时断开；刷新可读取已持久化的历史。'}}
-async function load(){try{const history=await request('/api/history');const context=await request('/api/owner-context');history.messages.forEach(add);owner.value=context.content;status.textContent='准备就绪。';openEvents(history.cursor)}catch(e){error.textContent=e.message;status.textContent='加载失败。'}}
-document.querySelector('#chat').addEventListener('submit',async e=>{e.preventDefault();error.textContent='';const content=input.value;if(!content.trim()){error.textContent='消息不能为空';return}status.textContent='发送中；消息会先保存。';try{await request('/api/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content,idempotencyKey:crypto.randomUUID()})});input.value='';status.textContent='已排队，正在等待回复。'}catch(e){error.textContent=e.message;status.textContent='发送失败。'}});
-document.querySelector('#save-owner').addEventListener('click',async()=>{error.textContent='';try{await request('/api/owner-context',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:owner.value})});status.textContent='主人上下文已明确保存；仅未来回合会使用它。'}catch(e){error.textContent=e.message}});
-document.querySelector('#recover').addEventListener('click',async()=>{try{const body=await request('/api/recover',{method:'POST'});status.textContent=body.started?'已恢复，正在重试。':'当前没有可恢复的失败回合。'}catch(e){error.textContent=e.message}});
-if(!accessToken){error.textContent='此页面需要从启动终端提供的本地访问链接打开。';status.textContent='未连接。';document.querySelectorAll('input,textarea,button').forEach(element=>{element.disabled=true})}else load();
+function clearSetupToken(){setupToken=null;document.querySelector('#setup-credential').value='';try{sessionStorage.removeItem(setupStorageKey)}catch(e){}}
+function stopPolling(){if(pollTimer!==undefined)clearTimeout(pollTimer);pollTimer=undefined}
+function active(generation){return generation===viewGeneration&&!privatePanel.hidden}
+function resizeInput(){input.style.height='auto';input.style.height=Math.min(input.scrollHeight+2,160)+'px';syncChatSize()}
+function updateSend(){sendButton.disabled=!loaded||sending||!input.value.trim();sendButton.textContent=sending?'发送中…':'发送'}
+function replyFailure(message){return typeof message==='string'&&message.trim()?message.replaceAll('重试失败回合','重试回复'):'回复暂时失败，消息已保留。点击「重试回复」继续。'}
+function renderState(){
+  status.textContent=loading?'正在加载聊天…':!loaded?'聊天加载失败':connectionLost?'连接中断，正在重连…':liveDisconnected?'实时连接重连中…':replyState==='blocked'?'回复失败':replyState==='processing'?'正在回复…':'在线';
+  error.textContent=replyState==='blocked'?(replyError||'回复暂时失败，消息已保留。'):'';
+  recoverButton.hidden=replyState!=='blocked';recoverButton.disabled=recovering;
+  emptyState.hidden=seen.size>0;emptyState.textContent=loading?'正在加载聊天…':loaded?'从一句话开始聊天吧。':'聊天未能加载，请重试。';updateSend();
+}
+function renderSendErrors(){
+  sendErrors.replaceChildren();
+  for(const attempt of failedSends){
+    const row=document.createElement('div'),label=document.createElement('span'),button=document.createElement('button');row.className='send-failure';
+    label.textContent=(attempt.uncertain?'尚未确认是否送达':'发送失败')+'：「'+attempt.content.slice(0,60)+(attempt.content.length>60?'…':'')+'」。'+attempt.error;
+    button.type='button';button.textContent='重试发送';button.disabled=sending;button.addEventListener('click',()=>send(attempt));row.append(label,button);sendErrors.append(row);
+  }
+}
+function showLogin(configured=true){
+  viewGeneration++;stopPolling();if(stream){stream.close();stream=null}
+  messages.replaceChildren();seen.clear();owner.value='';input.value='';error.textContent='';status.textContent='';privatePanel.hidden=true;loginPanel.hidden=false;
+  loaded=false;loading=false;sending=false;recovering=false;composing=false;compositionEndedAt=-Infinity;draftRevision++;failedSends=[];replyState='idle';replyError='';connectionLost=false;liveDisconnected=false;unread=0;followingLatest=true;
+  latest.hidden=true;reloadButton.hidden=true;ownerStatus.textContent='';document.querySelector('#settings').open=false;document.querySelector('#save-owner').disabled=false;document.querySelector('#login-button').disabled=false;
+  renderSendErrors();resizeInput();updateSend();if(configured)clearSetupToken();
+  document.querySelector('#setup-credential-panel').hidden=configured;document.querySelector('#setup-credential').value=setupToken||'';document.querySelector('#login-title').textContent=configured?'登录':'设置登录密码';document.querySelector('#login-button').textContent=configured?'登录':'设置密码';password.autocomplete=configured?'current-password':'new-password';
+  document.querySelector('#login-notice').textContent=configured?'登录状态保持 30 天。':'请设置至少 8 个字符的密码。若没有初始化凭据，请从服务器本次启动日志中的 #setup_token= 后复制凭据并填入上方。';
+}
+async function pollStatus(generation){
+  const revision=eventRevision;
+  try{
+    const current=await request('/api/status');if(!active(generation))return;
+    const history=await request('/api/history');if(!active(generation))return;
+    history.messages.forEach(add);connectionLost=false;if(!stream)openEvents(history.cursor);
+    if(revision===eventRevision){replyState=current.state;replyError=current.state==='blocked'?replyFailure(current.message):''}
+    renderState();
+  }catch(e){if(active(generation)){connectionLost=true;renderState()}}
+  finally{if(active(generation))pollTimer=setTimeout(()=>pollStatus(generation),3000)}
+}
+function nearBottom(){return messages.scrollHeight-messages.scrollTop-messages.clientHeight<80}
+function showLatest(){latest.hidden=nearBottom();latest.textContent=unread?'有新消息 · 回到最新':'回到最新'}
+function sizeChanged(){return scrollWidth!==messages.clientWidth||scrollHeight!==messages.clientHeight}
+function rememberSize(){scrollWidth=messages.clientWidth;scrollHeight=messages.clientHeight}
+function goLatest(){followingLatest=true;rememberSize();messages.scrollTop=messages.scrollHeight;unread=0;latest.hidden=true}
+function syncChatSize(){
+  if(privatePanel.hidden||!sizeChanged())return;
+  rememberSize();if(followingLatest)goLatest();else showLatest();
+}
+messages.addEventListener('scroll',()=>{
+  // Reflow can itself dispatch scroll before ResizeObserver runs. Preserve the
+  // previous intent in that case instead of treating it as reading history.
+  if(sizeChanged()){syncChatSize();return}
+  followingLatest=nearBottom();if(followingLatest)unread=0;showLatest();
+});
+// An explicit move towards history wins even if a resize notification is pending.
+messages.addEventListener('wheel',event=>{if(event.deltaY<0)followingLatest=false},{passive:true});
+messages.addEventListener('touchstart',event=>{touchY=event.touches[0]?.clientY},{passive:true});
+messages.addEventListener('touchmove',event=>{const y=event.touches[0]?.clientY;if(y>touchY)followingLatest=false;touchY=y},{passive:true});
+messages.addEventListener('keydown',event=>{if(['ArrowUp','PageUp','Home'].includes(event.key)||(event.key===' '&&event.shiftKey))followingLatest=false});
+if(typeof ResizeObserver==='function')new ResizeObserver(syncChatSize).observe(messages);
+if(typeof window!=='undefined'){
+  window.addEventListener('resize',syncChatSize);
+  window.visualViewport?.addEventListener('resize',syncChatSize);
+}
+document.querySelector('#settings').addEventListener('toggle',syncChatSize);
+latest.addEventListener('click',goLatest);
+function add(message){
+  if(seen.has(message.id))return;const follow=sizeChanged()?followingLatest:nearBottom();followingLatest=follow;seen.add(message.id);
+  const row=document.createElement('div'),role=document.createElement('span'),body=document.createElement('div');
+  row.className='message '+(message.role==='assistant'?'assistant':'user');role.className='role';role.textContent=message.role==='assistant'?'主 Agent':'你';body.className='bubble';body.textContent=message.content;
+  row.append(role,body);messages.append(row);emptyState.hidden=true;
+  if(follow)goLatest();else{unread++;showLatest()}
+}
+async function request(url,options){
+  const generation=viewGeneration;const response=await fetch(url,{...options,credentials:'same-origin'});
+  if(generation!==viewGeneration)throw new Error('会话已切换');
+  if(response.status===401){showLogin();loginError.textContent='请重新登录。';throw new Error('请重新登录。')}
+  // The status already confirms acceptance even if the response body is lost.
+  if(url==='/api/messages'&&response.ok)return {};
+  let body;try{body=await response.json()}catch(e){if(response.ok)throw new Error('无法读取服务器响应。');body={}}
+  if(generation!==viewGeneration)throw new Error('会话已切换');
+  if(!response.ok){const failure=new Error(body.error||'请求无法完成。');failure.status=response.status;throw failure}return body;
+}
+function openEvents(cursor){
+  if(stream)stream.close();stream=new EventSource('/api/events?cursor='+encodeURIComponent(cursor));const current=stream,generation=viewGeneration;
+  const isCurrent=()=>stream===current&&active(generation);
+  current.addEventListener('open',()=>{if(isCurrent()){liveDisconnected=false;renderState()}});
+  current.addEventListener('update',event=>{
+    if(!isCurrent())return;const update=JSON.parse(event.data);eventRevision++;
+    if(update.type==='submitted'){add(update.message);if(replyState!=='blocked')replyState='processing'}
+    if(update.type==='reply'){add(update.message);replyState='idle';replyError=''}
+    if(update.type==='error'){replyError=replyFailure(update.message);replyState='blocked'}
+    if(update.type==='recovered'){replyState=update.count?'processing':'idle';replyError=''}renderState();
+  });
+  // Reload only the chat snapshot: a replay reset must not discard a draft or uncertain send.
+  current.addEventListener('reset',async()=>{
+    if(!isCurrent())return;current.close();
+    try{const history=await request('/api/history');if(!isCurrent())return;history.messages.forEach(add);openEvents(history.cursor)}catch(e){if(isCurrent()){liveDisconnected=true;renderState();current.close();stream=null}}
+  });
+  current.onerror=async()=>{
+    if(!isCurrent())return;liveDisconnected=true;renderState();
+    try{const auth=await request('/api/auth');if(!isCurrent())return;if(!auth.authenticated){showLogin();loginError.textContent='请重新登录。'}}catch(e){if(isCurrent()){liveDisconnected=true;renderState()}}
+  };
+}
+async function load(){
+  stopPolling();if(stream){stream.close();stream=null}const generation=++viewGeneration;loading=true;loaded=false;loginError.textContent='';loginPanel.hidden=true;privatePanel.hidden=false;reloadButton.hidden=true;renderState();
+  try{
+    const history=await request('/api/history');if(!active(generation))return;
+    const context=await request('/api/owner-context');if(!active(generation))return;
+    history.messages.forEach(add);goLatest();owner.value=context.content;loaded=true;loading=false;renderState();resizeInput();openEvents(history.cursor);await pollStatus(generation);
+  }catch(e){if(active(generation)){loading=false;reloadButton.hidden=false;renderState()}}
+}
+reloadButton.addEventListener('click',load);
+async function initialize(){try{const auth=await request('/api/auth');if(auth.configured)clearSetupToken();if(auth.authenticated)await load();else showLogin(auth.configured)}catch(e){showLogin(false);loginError.textContent='无法连接服务器，请稍后刷新。'}}
+document.querySelector('#login').addEventListener('submit',async e=>{e.preventDefault();loginError.textContent='';const button=document.querySelector('#login-button');if(button.disabled)return;button.disabled=true;try{const auth=await request('/api/auth');if(auth.configured)clearSetupToken();const credential=document.querySelector('#setup-credential').value.trim()||setupToken;if(!auth.configured&&!credential){loginError.textContent='请从服务器本次启动日志的 #setup_token= 后复制初始化凭据，填入上方后再设置密码。';document.querySelector('#setup-credential-panel').hidden=false;document.querySelector('#setup-credential').focus();return}await request(auth.configured?'/api/auth/login':'/api/auth/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:password.value,...(!auth.configured?{setupToken:credential}:{})})});clearSetupToken();password.value='';await load()}catch(e){loginError.textContent=e.message}finally{button.disabled=false}});
+document.querySelector('#logout').addEventListener('click',async()=>{
+  showLogin();const generation=viewGeneration,button=document.querySelector('#login-button');button.disabled=true;
+  try{await request('/api/auth/logout',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(generation===viewGeneration)loginError.textContent='已退出登录。'}
+  catch(e){if(generation===viewGeneration)loginError.textContent='退出请求未确认，请刷新页面后再次退出。'}finally{if(generation===viewGeneration)button.disabled=false}
+});
+input.addEventListener('input',()=>{draftRevision++;resizeInput();updateSend()});
+input.addEventListener('compositionstart',()=>{composing=true});
+input.addEventListener('compositionend',()=>{composing=false;compositionEndedAt=Date.now()});
+function isComposing(event){return composing||event.isComposing||event.keyCode===229||Date.now()-compositionEndedAt<60}
+input.addEventListener('keydown',event=>{
+  if(event.key!=='Enter'||event.shiftKey||isComposing(event))return;
+  if(typeof matchMedia==='function'&&matchMedia('(pointer: coarse)').matches)return;
+  event.preventDefault();if(!event.repeat)void send();
+});
+document.querySelector('#chat').addEventListener('submit',event=>{event.preventDefault();if(!isComposing(event))return send()});
+async function send(retry){
+  if(!loaded||privatePanel.hidden||sending||composing)return;
+  const content=retry?retry.content:input.value;if(!content.trim())return;
+  // Reuse a failed attempt even when resubmitted from the composer. A successful
+  // attempt is removed, so intentionally sending the same text again gets a new key.
+  const attempt=retry||failedSends.find(item=>item.content===content)||{content,idempotencyKey:crypto.randomUUID(),revision:draftRevision};
+  const generation=viewGeneration,revision=eventRevision;sending=true;updateSend();renderSendErrors();
+  try{
+    await request('/api/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:attempt.content,idempotencyKey:attempt.idempotencyKey})});
+    if(!active(generation))return;
+    failedSends=failedSends.filter(item=>item!==attempt);
+    if(input.value===attempt.content&&draftRevision===attempt.revision){input.value='';draftRevision++;resizeInput()}
+    if(eventRevision===revision&&replyState!=='blocked')replyState='processing';
+    eventRevision++;
+  }catch(e){
+    if(!active(generation))return;
+    attempt.uncertain=!e.status||e.status>=500||e.status===408;
+    attempt.error=attempt.uncertain?'可重试确认，同一条消息不会重复保存。':e.message;
+    if(!failedSends.includes(attempt))failedSends.push(attempt);
+  }finally{if(active(generation)){sending=false;renderState();renderSendErrors()}}
+}
+document.querySelector('#save-owner').addEventListener('click',async()=>{
+  const generation=viewGeneration,button=document.querySelector('#save-owner');if(button.disabled)return;button.disabled=true;ownerStatus.textContent='正在保存…';
+  try{await request('/api/owner-context',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:owner.value})});if(active(generation))ownerStatus.textContent='已明确保存，仅未来回合会使用。'}
+  catch(e){if(active(generation))ownerStatus.textContent=e.message}finally{if(active(generation))button.disabled=false}
+});
+recoverButton.addEventListener('click',async()=>{
+  if(recovering||replyState!=='blocked')return;const generation=viewGeneration;recovering=true;eventRevision++;renderState();const revision=eventRevision;
+  try{const body=await request('/api/recover',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(!active(generation))return;if(eventRevision===revision){replyState=body.started?'processing':'idle';replyError=''}eventRevision++}
+  catch(e){if(active(generation)){replyState='blocked';replyError='暂时无法重试，请稍后再试。'}}finally{if(active(generation)){recovering=false;renderState()}}
+});
+initialize();
 </script>`
 
 function isMainEntry(): boolean {

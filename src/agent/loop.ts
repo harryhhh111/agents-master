@@ -14,6 +14,7 @@ import { PinStore } from '../state/pins.js'
 import { RunRegistry, type RunRecord } from '../state/runs.js'
 import { buildSystemPrompt } from './prompt.js'
 import { executeTool, toolDefinitions, type ToolContext } from './tools.js'
+import { boundedRounds, pairedToolResult } from './scoped-protocol.js'
 
 export type AgentEvent =
   | { type: 'text'; text: string } // assistant 的文字输出（流式或整段均可）
@@ -177,7 +178,7 @@ export class AgentCore {
     await this.systemReady
     this.inLoop = true
     try {
-      for (let i = 0; i < MAX_ITERATIONS; i++) {
+      for (const i of boundedRounds(MAX_ITERATIONS)) {
         const resp = await this.llm.chat.completions.create({
           model: this.opts.config.llm.model,
           messages: this.messages,
@@ -228,11 +229,7 @@ export class AgentCore {
             ok: !result.startsWith('错误'),
             summary: summarize(result),
           })
-          this.messages.push({
-            role: 'tool',
-            tool_call_id: tc.id,
-            content: truncateToolResult(result, fullPath),
-          })
+          this.messages.push(pairedToolResult(tc.id, truncateToolResult(result, fullPath)))
         }
         // 安全点：本轮全部 tool 响应已入列，flush 排队中的 run 完成通知
         this.flushNotices()

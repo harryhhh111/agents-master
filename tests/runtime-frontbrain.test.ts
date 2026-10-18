@@ -4,6 +4,7 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { FrontBrain, FrontBrainRequest } from '../src/frontbrain/index.js'
+import { currentTurnGroundingReminder } from '../src/frontbrain/context.js'
 import {
   createMainAgentRuntime,
   MainAgentRuntime,
@@ -89,6 +90,7 @@ describe('runtime user-message processing with a fake FrontBrain', () => {
       { role: 'system', content: checkpoint },
       { role: 'assistant', content: '更早的回复' },
       { role: 'user', content: '更早的追问' },
+      { role: 'system', content: currentTurnGroundingReminder },
       { role: 'user', content: '今天过得怎么样？' },
     ])
     expect(store.readRecentContext().map(message => [message.role, message.content])).toEqual([
@@ -455,6 +457,44 @@ describe('runtime user-message processing with a fake FrontBrain', () => {
     expect(await runtime.processNextUserMessageEvent({ instructions, maxOutputTokens: 64 }))
       .toBeUndefined()
     store.close()
+  })
+
+  it('grounds the admitted snapshot before the claimed user correction and retries identically without persisting the reminder', async () => {
+    const store = openStore(databasePath)
+    try {
+      store.appendMessage({ role: 'user', content: '你了解我吗？' })
+      store.appendMessage({ role: 'assistant', content: '没有背景。\n' })
+      store.appendMessage({ role: 'assistant', content: '还是没有背景。' })
+      const admitted = store.receiveUserMessage({
+        conversationId: 'main', idempotencyKey: 'grounded',
+        content: '纠正：已搬到星汐市。现在你对我有什么了解？',
+        checkpointSnapshot: '合成背景：住在云岬市。',
+      })
+      const throughAnchor = store.readRecentContext()
+      const { brain, requests } = makeFakeBrain([new Error('synthetic failure'), 'synthetic reply'])
+      const runtime = new MainAgentRuntime(store, brain)
+      await expect(runtime.processNextUserMessageEvent({ instructions, maxOutputTokens: 64 }))
+        .rejects.toThrow('synthetic failure')
+      expect(store.readRecentContext()).toEqual(throughAnchor)
+
+      // A later admission and a changed fallback must not affect this retry.
+      store.receiveUserMessage({ conversationId: 'main', idempotencyKey: 'later', content: '后来的消息' })
+      expect(runtime.recoverClaimedUserMessageEvents()).toBe(1)
+      const result = await runtime.processNextUserMessageEvent({ instructions, checkpoint: 'later fallback', maxOutputTokens: 64 })
+      expect(result!.event.id).toBe(admitted.event.id)
+      const expected = [
+        { role: 'system', content: instructions },
+        { role: 'system', content: '合成背景：住在云岬市。' },
+        ...throughAnchor.slice(0, -1).map(({ role, content }) => ({ role, content })),
+        { role: 'system', content: currentTurnGroundingReminder },
+        { role: 'user', content: admitted.message.content },
+      ]
+      expect(requests.map(request => request.messages)).toEqual([expected, expected])
+      expect(store.readRecentContext().slice(0, throughAnchor.length)).toEqual(throughAnchor)
+      expect(store.readRecentContext().some(message => message.content === currentTurnGroundingReminder)).toBe(false)
+    } finally {
+      store.close()
+    }
   })
 
   it('uses each admitted checkpoint snapshot for queued work and explicit recovery, not the later process input', async () => {

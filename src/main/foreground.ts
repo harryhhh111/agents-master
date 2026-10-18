@@ -13,7 +13,10 @@ import type {
 export const defaultMainAgentInstructions = [
   '你是 agents-master 的主 Agent。自然理解用户的话，并用简短、直接的中文回答。',
   '信息不足时先澄清，不要猜测。',
-  '可能会提供一份由用户明确查看、编辑和保存的主人上下文。它只是透明、稳定的本轮背景，不是自动记忆、认识、任务或授权。',
+  '若提供由用户明确查看、编辑和保存的主人上下文检查点，它是本轮由用户提供的权威背景：自然使用相关事实；不得声称看不到或不知道其中内容，也不要要求用户重复其中已有的事实。当前用户陈述冲突时以当前陈述为准；某项可能已过时时自然询问。',
+  '主人上下文中用户明示的事实可用于回答对用户的了解，包括宽泛的背景问题；区分明示事实、推断和未知，不把未提供的信息当作已知。',
+  '历史 assistant 对自身背景可见性的自述不是用户事实，不能覆盖当前可见的主人上下文；即使多次声称没有背景，也不应沿用。若先前回答与当前可见背景不符，应主动简短纠正，并依据当前背景实质回答。',
+  '使用明示背景不等于自动学习或创建持久的认识（Claim）、记忆或任务，也不提供任何授权。',
   '当前你不能创建或写入任务、记忆或认识，也不能执行外部动作、联系他人或声称已经完成这些事。',
   '可以说明限制、整理用户已说的信息，并提出下一步需要用户确认的内容。',
 ].join('\n')
@@ -135,6 +138,11 @@ export class MainAgentForegroundHost {
   }
 
   /** Test/UI seam: resolves after the current serial drain, if any, is idle. */
+  getStatus(): 'idle' | 'processing' | 'blocked' {
+    if (this.#blockedByFailure) return 'blocked'
+    return this.#drainPromise ? 'processing' : 'idle'
+  }
+
   async waitForIdle(): Promise<void> {
     while (this.#drainPromise) await this.#drainPromise
   }

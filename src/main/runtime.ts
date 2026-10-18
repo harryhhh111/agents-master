@@ -142,6 +142,8 @@ export class MainAgentRuntime implements MainAgentRuntimePort {
     const messages = composeFrontBrainContext({
       instructions: input.instructions,
       ...(checkpoint !== undefined ? { checkpoint } : {}),
+      // Request-only grounding; the saved prefix and durable history stay intact.
+      groundCurrentTurn: true,
       messages: this.#store.readContextThroughMessage(event.userMessageId, input.contextMessageLimit),
     })
     const response = await frontBrain.complete({ messages, maxOutputTokens: input.maxOutputTokens })

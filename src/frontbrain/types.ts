@@ -78,7 +78,7 @@ export interface FrontBrainCompletion {
 export interface FrontBrainClient {
   chat: {
     completions: {
-      create(params: FrontBrainCreateParams): Promise<FrontBrainCompletion>
+      create(params: FrontBrainCreateParams, options?: { timeout: number; maxRetries: number; signal: AbortSignal }): Promise<FrontBrainCompletion>
     }
   }
 }

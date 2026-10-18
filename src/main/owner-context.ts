@@ -143,7 +143,7 @@ export function saveOwnerContext(dataDirectory: string, content: string): void {
 export function ownerContextCheckpoint(content: string): string {
   validateOwnerContext(content)
   return [
-    '显式主人上下文（用户可查看、编辑和保存；不是自动记忆，也不代表任务、认识或授权）：',
+    '显式主人上下文（用户可查看、编辑和保存；其中明示的事实是本轮可直接使用的用户背景，可据此回答对用户的了解。不是自动记忆；使用这些事实不等于自动创建持久的认识（Claim）或任务，也不提供任何授权）：',
     content,
   ].join('\n\n')
 }
