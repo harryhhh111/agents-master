@@ -50,3 +50,6 @@
   `~/.kimi-code/sessions/wd_<项目>_<hash>/session_*/agents/main/wire.jsonl`。
 - `~/projects/stock_data` 存在，两个 CLI 共用同一 repo 与远端，可能并发写入；派活前必须检查
   git 状态并协调写入范围。
+- 2026-10-19 实测：本机 `/tmp` 存在 `.git` 探测标记，`owner-context` 会拒绝在 `/tmp` 下创建
+  数据目录（旧版协调 demo 入口因此在本机无法用默认 tmp 目录启动，非回归）；演示/测试请用
+  `--preview-parent /dev/shm`（或同级无 .git 的私有目录），测试内对 `/tmp/.git` 探测做 mock。
