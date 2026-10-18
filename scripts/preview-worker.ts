@@ -1,43 +1,60 @@
 /** 预览 worker:业务运行时 + 私有 Unix socket。无认证实例、无 TCP 旁路、无 .env/模型凭据。 */
-import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from 'node:fs'
 import http from 'node:http'
+import net from 'node:net'
 import path from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { pathToFileURL } from 'node:url'
 import { createCoordinationRuntime, createFreshPreviewDirectory, openPreviewDirectory, type CoordinationRuntime, type PreviewDirectoryMode } from './coordination-preview-runtime.js'
 import { demoModel } from './main-web-coordination-demo.js'
 import { HeldFakeExecutor } from '../src/main/coordination/fake.js'
 import { json } from './main-web.js'
 
-const lockFilename = '.preview-worker.lock'
+export const previewWorkerLockFilename = '.preview-worker.lock.sqlite'
 
-function processStartTime(pid: number): string | undefined {
-  try { return readFileSync(`/proc/${pid}/stat`, 'utf8').split(' ')[21] } catch { return undefined }
-}
-
-/** pid 存活且 starttime 一致才视为同进程,防止 pid 复用误判。 */
-function lockHeldByLiveProcess(saved: { pid?: unknown; start?: unknown }): boolean {
-  if (typeof saved.pid !== 'number' || typeof saved.start !== 'string') return false
-  const start = processStartTime(saved.pid)
-  return start !== undefined && start === saved.start
-}
-
-/** 在打开数据库/恢复运行之前取得数据目录的跨进程独占锁。 */
+/** 在打开数据库/恢复运行之前取得数据目录的跨进程独占锁。进程退出由 OS 释放 SQLite 文件锁。 */
 export function acquirePreviewInstanceLock(directory: string): { release(): void } {
-  const file = path.join(directory, lockFilename)
-  if (existsSync(file)) {
-    let held = false
-    try { held = lockHeldByLiveProcess(JSON.parse(readFileSync(file, 'utf8'))) } catch { /* 读不了的锁按过期处理 */ }
-    if (held) throw new Error('该预览数据目录已有运行中的 worker（单实例锁生效），拒绝第二个 worker。')
-    try { unlinkSync(file) } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('无法清理过期的单实例锁')
+  const file = path.join(directory, previewWorkerLockFilename)
+  const db = new DatabaseSync(file)
+  let locked = false
+  try {
+    db.exec('PRAGMA busy_timeout=0')
+    try {
+      db.exec('BEGIN IMMEDIATE')
+    } catch {
+      throw new Error('该预览数据目录已有运行中的 worker（单实例锁生效），拒绝第二个 worker。')
     }
+    locked = true
+    db.exec('CREATE TABLE IF NOT EXISTS preview_worker_lock (id INTEGER PRIMARY KEY CHECK (id = 1)) STRICT')
+    chmodSync(file, 0o600)
+    let released = false
+    return {
+      release() {
+        if (released) return
+        released = true
+        try { if (locked) db.exec('ROLLBACK') } finally { db.close() }
+      },
+    }
+  } catch (error) {
+    try { if (locked) db.exec('ROLLBACK') } catch { /* lock is already gone */ }
+    db.close()
+    throw error
   }
-  const start = processStartTime(process.pid)
-  if (start === undefined) throw new Error('无法确定本进程标识，拒绝获取单实例锁')
-  const fd = openSync(file, 'wx', 0o600)
-  try { writeFileSync(fd, JSON.stringify({ pid: process.pid, start })) } finally { closeSync(fd) }
-  let released = false
-  return { release() { if (released) return; released = true; try { unlinkSync(file) } catch { /* 已不存在 */ } } }
+}
+
+async function ensureReusableSocketPath(socketPath: string): Promise<void> {
+  if (!existsSync(socketPath)) return
+  if (!lstatSync(socketPath).isSocket()) throw new Error('预览 socket 路径已被非 socket 文件占用')
+  const live = await new Promise<boolean>((resolve, reject) => {
+    const connection = net.createConnection({ path: socketPath })
+    connection.once('connect', () => { connection.end(); resolve(true) })
+    connection.once('error', error => {
+      if ((error as NodeJS.ErrnoException).code === 'ECONNREFUSED') resolve(false)
+      else reject(error)
+    })
+  })
+  if (live) throw new Error('预览 socket 已被运行中的服务使用，拒绝接管或删除。')
+  unlinkSync(socketPath)
 }
 
 export interface PreviewWorker {
@@ -52,6 +69,7 @@ export interface PreviewWorker {
 export async function startPreviewWorker(options: { dataDirectory: string; socketPath: string }): Promise<PreviewWorker> {
   const directory = path.resolve(options.dataDirectory)
   const socketPath = path.resolve(options.socketPath)
+  await ensureReusableSocketPath(socketPath)
   const stat = existsSync(directory) ? lstatSync(directory) : undefined
   if (stat?.isSymbolicLink()) throw new Error('预览数据目录不能是符号链接')
   const mode: PreviewDirectoryMode = stat ? openPreviewDirectory(directory) : createFreshPreviewDirectory(directory)
@@ -69,10 +87,18 @@ export async function startPreviewWorker(options: { dataDirectory: string; socke
     mkdirSync(socketDir, { recursive: true, mode: 0o700 })
     chmodSync(socketDir, 0o700)
     const server = http.createServer((request, response) => {
-      if (request.url === '/healthz') { json(response, 200, { ok: true, synthetic: true }); return }
-      void runtime.handle(request, response, () => true).then(handled => { if (!handled) json(response, 404, { error: '未知端点。' }) })
+      if (request.url === '/healthz') {
+        if (request.method !== 'GET') json(response, 405, { error: '方法不可用。' })
+        else json(response, 200, { ok: true, synthetic: true })
+        return
+      }
+      void runtime.handle(request, response, () => true)
+        .then(handled => { if (!handled) json(response, 404, { error: '未知端点。' }) })
+        .catch(() => {
+          if (!response.headersSent) json(response, 500, { error: '预览 worker 无法完成请求。' })
+          else response.end()
+        })
     })
-    if (existsSync(socketPath)) unlinkSync(socketPath)
     await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(socketPath, () => resolve()) })
     chmodSync(socketPath, 0o600)
     return {
@@ -94,9 +120,10 @@ export async function startPreviewWorker(options: { dataDirectory: string; socke
 }
 
 export async function runPreviewWorker(args: string[]): Promise<void> {
-  const data = args[args.indexOf('--data-dir') + 1], socket = args[args.indexOf('--socket') + 1]
-  if (args.length !== 4 || !data || !socket || args[0] !== '--data-dir') throw new Error('Use --data-dir PRIVATE_V2_DIRECTORY --socket PRIVATE_SOCKET_PATH')
-  const worker = await startPreviewWorker({ dataDirectory: data, socketPath: socket })
+  if (args.length !== 4 || args[0] !== '--data-dir' || !args[1] || args[2] !== '--socket' || !args[3]) {
+    throw new Error('Use --data-dir PRIVATE_V2_DIRECTORY --socket PRIVATE_SOCKET_PATH')
+  }
+  const worker = await startPreviewWorker({ dataDirectory: args[1], socketPath: args[3] })
   console.log(`preview worker ready（模拟演示，非真实智能对话）: socket=${worker.socketPath} data=${worker.directory}`)
   const stop = () => { void worker.close().then(() => { process.exitCode = 0 }) }
   process.once('SIGINT', stop)

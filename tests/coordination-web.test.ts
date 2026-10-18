@@ -43,13 +43,15 @@ it('auth, origin, scope spoofing, durable questions and shared answer controls u
     // separate HTTP/browser smoke retains the real EPERM/path obstacles.
     const request=async(url:string,body?:unknown,origin=base)=>{
       const req=Object.assign(Readable.from(body?[JSON.stringify(body)]:[]),{url,method:body?'POST':'GET',headers:{host:'127.0.0.1:31416',cookie,...(body?{'content-type':'application/json',origin}:{})}})
-      let status=0,text='';const headers=new Headers()
-      const response=Object.assign(new EventEmitter(),{setHeader:(n:string,v:string)=>headers.set(n,v),writeHead:(s:number,h:Record<string,string>)=>{status=s;for(const [k,v] of Object.entries(h))headers.set(k,v)},write:(v:string)=>{text+=v},end:(v='')=>{text+=v;response.emit('close')}})
+      let status=0,text='',closed=false;const headers=new Headers()
+      const response=Object.assign(new EventEmitter(),{setHeader:(n:string,v:string)=>headers.set(n,v),writeHead:(s:number,h:Record<string,string>)=>{status=s;for(const [k,v] of Object.entries(h))headers.set(k,v)},write:(v:string)=>{text+=v},end:(v='')=>{text+=v;closed=true;response.emit('close')}})
       await app.handle(req as unknown as IncomingMessage,response as unknown as ServerResponse)
-      return {status,headers,text:async()=>text}
+      return {status,headers,closed:()=>closed,text:async()=>text}
     }
     for(const url of ['/api/conversations','/api/history','/api/status','/api/events','/api/control']) expect((await request(url)).status).toBe(401)
     cookie=(await request('/api/auth/setup',{password:'synthetic-password',setupToken:app.auth.setupToken})).headers.get('set-cookie')!.split(';')[0]!
+    const events=await request('/api/events?conversation=main')
+    expect(events.status).toBe(200);expect(events.closed()).toBe(false)
     expect((await request('/api/messages',{content:'x',idempotencyKey:'bad'},'https://other.invalid')).status).toBe(403)
     expect((await request('/api/messages',{content:'x',idempotencyKey:'bad',author:'user',project:'private'})).status).toBe(400)
     expect((await request('/api/history?conversation=secret')).status).toBe(400)
@@ -64,6 +66,7 @@ it('auth, origin, scope spoofing, durable questions and shared answer controls u
     await until(()=>app.store.coordination.assignments('fake-work')[0]?.status==='completed')
     const page=await (await request('/')).text();expect(page).toContain('模拟 / 联调');expect(page).toContain('message.conversation_id!==conversation');expect(page).toContain('generation!==viewGeneration')
     expect((await request('/api/auth/logout',{})).status).toBe(200)
+    expect(events.closed()).toBe(true)
     expect((await request('/api/status')).status).toBe(401)
   } finally {await app.close();rmSync(directory,{recursive:true})}
 })

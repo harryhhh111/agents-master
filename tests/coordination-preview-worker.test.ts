@@ -1,4 +1,5 @@
 import { it, expect, vi } from 'vitest'
+import { spawn } from 'node:child_process'
 import http from 'node:http'
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
@@ -15,7 +16,7 @@ vi.mock('node:fs', async original => {
   } }
 })
 import { createCoordinationRuntime, createFreshPreviewDirectory, previewMarkerContent, previewMarkerFilename } from '../scripts/coordination-preview-runtime.js'
-import { acquirePreviewInstanceLock, startPreviewWorker } from '../scripts/preview-worker.js'
+import { acquirePreviewInstanceLock, previewWorkerLockFilename, startPreviewWorker } from '../scripts/preview-worker.js'
 
 const base = () => mkdtempSync('/tmp/preview-worker-test-')
 const socketRequest = (socketPath: string, route: string, method = 'GET', body?: unknown) => new Promise<{ status: number; body: string }>((resolve, reject) => {
@@ -41,6 +42,32 @@ const runtimeRequest = async (handle: (req: IncomingMessage, res: ServerResponse
   const response = new Response()
   await handle(request as unknown as IncomingMessage, response as unknown as ServerResponse, () => true)
   return response
+}
+
+const spawnWorker = (dataDirectory: string, socketPath: string) => {
+  const child = spawn(process.execPath, ['--import', 'tsx', 'scripts/preview-worker.ts', '--data-dir', dataDirectory, '--socket', socketPath], {
+    cwd: process.cwd(),
+    env: { ...process.env, DOTENV_CONFIG_PATH: '/dev/null' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let output = ''
+  child.stdout.on('data', chunk => { output += chunk })
+  child.stderr.on('data', chunk => { output += chunk })
+  return { child, output: () => output }
+}
+
+const waitForExit = (child: ReturnType<typeof spawn>) => new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(resolve => {
+  if (child.exitCode !== null || child.signalCode !== null) resolve({ code: child.exitCode, signal: child.signalCode })
+  else child.once('exit', (code, signal) => resolve({ code, signal }))
+})
+
+const waitForWorker = async (socketPath: string): Promise<void> => {
+  let lastError = ''
+  for (let i = 0; i < 300; i += 1) {
+    try { if ((await socketRequest(socketPath, '/healthz')).status === 200) return } catch (error) { lastError = (error as Error).message }
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`worker did not become ready: ${lastError}`)
 }
 
 it('runtime 不创建认证实例:业务 handler 可用且目录无 web-auth.json', async () => {
@@ -98,37 +125,20 @@ it('重复启动保护:第二个 worker 在打开数据前被拒,原进程与其
   }
 })
 
-it('持久重启:同一目录历史保留,标记与锁清理;过期锁(进程消失)可恢复', async () => {
+it('持久重启:同一目录历史与标记保留,SQLite 锁文件可安全重开', async () => {
   const parent = base()
   const data = path.join(parent, 'data'), socketPath = path.join(parent, 'run', 'preview.sock')
   const first = await startPreviewWorker({ dataDirectory: data, socketPath })
   await socketRequest(socketPath, '/api/messages?conversation=main', 'POST', { content: 'persistent hello', idempotencyKey: 'k1' })
   await new Promise(resolve => setTimeout(resolve, 50))
   await first.close()
-  expect(existsSync(path.join(data, '.preview-worker.lock'))).toBe(false)
+  expect(existsSync(path.join(data, previewWorkerLockFilename))).toBe(true)
   expect(readFileSync(path.join(data, previewMarkerFilename), 'utf8')).toBe(previewMarkerContent)
-  // 过期锁:不存在的 pid
-  writeFileSync(path.join(data, '.preview-worker.lock'), JSON.stringify({ pid: 999999999, start: '1' }))
   const second = await startPreviewWorker({ dataDirectory: data, socketPath })
   try {
     const history = await socketRequest(socketPath, '/api/history?conversation=main')
     expect(history.status).toBe(200)
     expect(history.body).toContain('persistent hello')
-  } finally {
-    await second.close()
-    rmSync(parent, { recursive: true, force: true })
-  }
-})
-
-it('pid 复用防护:存活 pid 但 starttime 不匹配的锁按过期处理(安全方向)', async () => {
-  const parent = base()
-  const data = path.join(parent, 'data'), socketPath = path.join(parent, 'run', 'preview.sock')
-  const first = await startPreviewWorker({ dataDirectory: data, socketPath })
-  await first.close()
-  writeFileSync(path.join(data, '.preview-worker.lock'), JSON.stringify({ pid: process.pid, start: '1' }))
-  const second = await startPreviewWorker({ dataDirectory: data, socketPath })
-  try {
-    expect((await socketRequest(socketPath, '/healthz')).status).toBe(200)
   } finally {
     await second.close()
     rmSync(parent, { recursive: true, force: true })
@@ -149,18 +159,50 @@ it('目录边界:无标记的已有目录与符号链接目录都被拒绝,内�
   rmSync(parent, { recursive: true, force: true })
 })
 
-it('worker 崩溃恢复:socket 残留但无存活持有者时被安全替换', async () => {
-  const parent = base()
+it('真实跨进程:重复启动与活跃 socket 接管被拒,正常停止后同目录恢复历史', async () => {
+  const parent = mkdtempSync('/dev/shm/preview-worker-process-')
   const data = path.join(parent, 'data'), socketPath = path.join(parent, 'run', 'preview.sock')
-  const first = await startPreviewWorker({ dataDirectory: data, socketPath })
-  // 模拟崩溃:锁与监听直接消失(不走 close),socket 文件残留
-  rmSync(path.join(data, '.preview-worker.lock'))
-  await new Promise<void>(resolve => first.server.close(() => resolve()))
-  const second = await startPreviewWorker({ dataDirectory: data, socketPath })
-  expect((await socketRequest(socketPath, '/healthz')).status).toBe(200)
-  await second.close()
-  await first.runtime.close()
-  rmSync(parent, { recursive: true, force: true })
+  const children: ReturnType<typeof spawnWorker>[] = []
+  const stop = async (worker: ReturnType<typeof spawnWorker>) => {
+    if (worker.child.exitCode === null && worker.child.signalCode === null) worker.child.kill('SIGTERM')
+    await waitForExit(worker.child)
+  }
+  try {
+    const first = spawnWorker(data, socketPath); children.push(first)
+    await waitForWorker(socketPath)
+
+    const duplicate = spawnWorker(data, path.join(parent, 'run', 'other.sock')); children.push(duplicate)
+    expect((await waitForExit(duplicate.child)).code).toBe(1)
+    expect(duplicate.output()).toContain('单实例锁')
+    expect((await socketRequest(socketPath, '/healthz')).status).toBe(200)
+
+    const otherData = path.join(parent, 'other-data')
+    const takeover = spawnWorker(otherData, socketPath); children.push(takeover)
+    expect((await waitForExit(takeover.child)).code).toBe(1)
+    expect(takeover.output()).toContain('预览 socket')
+    expect(existsSync(otherData)).toBe(false)
+    expect((await socketRequest(socketPath, '/healthz')).status).toBe(200)
+
+    await socketRequest(socketPath, '/api/messages?conversation=main', 'POST', { content: 'process persistent hello', idempotencyKey: 'process-k1' })
+    await stop(first)
+    expect(first.child.exitCode).toBe(0)
+
+    const reopened = spawnWorker(data, socketPath); children.push(reopened)
+    await waitForWorker(socketPath)
+    const history = await socketRequest(socketPath, '/api/history?conversation=main')
+    expect(history.status).toBe(200)
+    expect(history.body).toContain('process persistent hello')
+    await stop(reopened)
+    expect(reopened.child.exitCode).toBe(0)
+  } finally {
+    await Promise.all(children.map(async worker => {
+      if (worker.child.exitCode === null && worker.child.signalCode === null) {
+        worker.child.kill('SIGKILL')
+        await waitForExit(worker.child)
+      }
+    }))
+    rmSync(parent, { recursive: true, force: true })
+  }
 })
 
 it('demo 目录规则:兼容标记缺失的新建目录按 fresh 创建,重开必须带标记', async () => {

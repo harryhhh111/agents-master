@@ -62,11 +62,13 @@ export function createCoordinationRuntime(options: {
     })
     host.checkpoint = previewCheckpoint(readOwnerContext(directory))
     host.start()
+    const closeConnections = () => { for (const bus of buses.values()) bus.close() }
     return {
       directory,
       mode: options.mode,
       store,
       host,
+      closeConnections,
       async handle(request: IncomingMessage, response: ServerResponse, authorized: () => boolean): Promise<boolean> {
         const url = new URL(request.url!, 'http://localhost'), route = url.pathname, method = request.method
         if (route === '/api/conversations' && method === 'GET') { json(response, 200, { conversations: [{ id: 'main', pinned: true }, { id: 'fake-work', synthetic: true }] }); return true }
@@ -98,7 +100,7 @@ export function createCoordinationRuntime(options: {
           json(response, 405, { error: '方法不可用。' }); return true
         } catch { json(response, 400, { error: '模拟操作未接受：参数、来源或问题状态无效。' }); return true }
       },
-      async close() { for (const bus of buses.values()) bus.close(); await host.close(); store.close() },
+      async close() { closeConnections(); await host.close(); store.close() },
     }
   } catch (error) {
     openedStore?.close()
