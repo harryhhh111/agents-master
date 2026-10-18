@@ -159,7 +159,7 @@ it('目录边界:无标记的已有目录与符号链接目录都被拒绝,内�
   rmSync(parent, { recursive: true, force: true })
 })
 
-it('真实跨进程:重复启动与活跃 socket 接管被拒,正常停止后同目录恢复历史', async () => {
+it('真实跨进程:重复启动与活跃 socket 接管被拒,停止或崩溃后同目录恢复历史', async () => {
   const parent = mkdtempSync('/dev/shm/preview-worker-process-')
   const data = path.join(parent, 'data'), socketPath = path.join(parent, 'run', 'preview.sock')
   const children: ReturnType<typeof spawnWorker>[] = []
@@ -192,8 +192,14 @@ it('真实跨进程:重复启动与活跃 socket 接管被拒,正常停止后同
     const history = await socketRequest(socketPath, '/api/history?conversation=main')
     expect(history.status).toBe(200)
     expect(history.body).toContain('process persistent hello')
-    await stop(reopened)
-    expect(reopened.child.exitCode).toBe(0)
+
+    reopened.child.kill('SIGKILL')
+    expect((await waitForExit(reopened.child)).signal).toBe('SIGKILL')
+    const afterCrash = spawnWorker(data, socketPath); children.push(afterCrash)
+    await waitForWorker(socketPath)
+    expect((await socketRequest(socketPath, '/api/history?conversation=main')).body).toContain('process persistent hello')
+    await stop(afterCrash)
+    expect(afterCrash.child.exitCode).toBe(0)
   } finally {
     await Promise.all(children.map(async worker => {
       if (worker.child.exitCode === null && worker.child.signalCode === null) {
