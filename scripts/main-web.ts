@@ -21,23 +21,30 @@ import {
   saveOwnerContext,
 } from '../src/main/owner-context.js'
 import { MainWebAuth, sessionFromCookie, sessionCookie, validateWriteOrigin } from '../src/main/web-auth.js'
+import { coordinationPage } from '../src/main/coordination/web-page.js'
+import { createMainWebPreviewChannel, type MainWebPreviewChannel } from './main-web-preview.js'
 
 export const mainWebLoopbackAddress = '127.0.0.1'
 export const defaultMainWebPort = 31415
 export const maxMainWebMessageCharacters = 8_000
 const maxJsonBodyBytes = 32_000
 const mainWebEventReplayLimit = 256
+export const mainWebStableReleaseId = 'main-web-stable-local'
+export const coordinationPreviewReleaseId = 'coordination-preview-step-b-local'
 
 export interface MainWebArguments {
   dataDirectory: string
   port: number
+  previewSocketPath?: string
 }
 
 export function parseMainWebArguments(args: readonly string[], homeDirectory = homedir()): MainWebArguments {
   let dataDirectory = path.join(homeDirectory, '.local', 'share', 'agents-master', 'main-chat')
   let port = defaultMainWebPort
+  let previewSocketPath: string | undefined
   let sawDataDirectory = false
   let sawPort = false
+  let sawPreviewSocket = false
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]
     const value = args[index + 1]
@@ -58,9 +65,17 @@ export function parseMainWebArguments(args: readonly string[], homeDirectory = h
       index += 1
       continue
     }
+    if (arg === '--preview-socket') {
+      if (sawPreviewSocket) throw new Error('--preview-socket 只能指定一次')
+      if (!value || !value.trim()) throw new Error('--preview-socket 需要一个非空路径')
+      previewSocketPath = value
+      sawPreviewSocket = true
+      index += 1
+      continue
+    }
     throw new Error(`未知参数: ${arg ?? ''}`)
   }
-  return { dataDirectory, port }
+  return previewSocketPath === undefined ? { dataDirectory, port } : { dataDirectory, port, previewSocketPath }
 }
 
 export function validateMainWebMessage(content: unknown): asserts content is string {
@@ -223,6 +238,7 @@ export interface MainWebHost {
 
 export interface MainWebServerOptions {
   preview?: { page: string; handle(request: IncomingMessage, response: ServerResponse, authorized: () => boolean): Promise<boolean>; close(): void }
+  previewChannel?: MainWebPreviewChannel
   host: MainWebHost
   readHistory(): MainConversationMessage[]
   dataDirectory: string
@@ -247,10 +263,13 @@ export async function handleMainWebRequest(
   const method = request.method ?? 'GET'
   const url = new URL(request.url ?? '/', 'http://localhost')
   const pathname = url.pathname
-  if (method === 'GET' && pathname === '/') return html(response, options.preview?.page)
+  if (method === 'GET' && pathname === '/') {
+    return html(response, options.preview?.page ?? createMainWebPage({ previewEnabled: options.previewChannel !== undefined }))
+  }
   const session = sessionFromCookie(request.headers.cookie)
   const writeOrigin = validateWriteOrigin(request.headers.origin, request.headers.host)
-  if (pathname.startsWith('/api/') && !['GET', 'HEAD'].includes(method)) {
+  const apiPath = pathname.startsWith('/api/') || pathname.startsWith('/preview/api/')
+  if (apiPath && !['GET', 'HEAD'].includes(method)) {
     if (!writeOrigin) return json(response, 403, { error: '请从本站页面提交请求。' })
     if (request.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') {
       return json(response, 400, { error: '请求体必须是 JSON 对象' })
@@ -273,15 +292,45 @@ export async function handleMainWebRequest(
       return json(response, message === '尝试过于频繁，请稍后再试。' ? 429 : 400, { error: allowed.includes(message) ? message : '登录失败。' })
     }
   }
-  if (pathname.startsWith('/api/') && !options.auth.authorized(session)) {
+  if ((pathname === '/preview' || pathname === '/preview/') && options.previewChannel === undefined) {
+    return json(response, 404, { error: '未找到此地址。' })
+  }
+  if (pathname === '/preview' && options.previewChannel) {
+    if (await options.previewChannel.handle(request, response, () => options.auth.authorized(session))) return
+  }
+  if (pathname === '/preview/' && options.previewChannel) {
+    if (!options.auth.authorized(session)) {
+      return html(response, coordinationPage(createMainWebPage({
+        channel: 'preview',
+        businessApiBase: '/preview/api',
+        releaseId: coordinationPreviewReleaseId,
+        previewEnabled: true,
+      })))
+    }
+    if (await options.previewChannel.handle(request, response, () => options.auth.authorized(session))) return
+  }
+  if (apiPath && !options.auth.authorized(session)) {
     return json(response, 401, { error: '未授权。' })
   }
   if (method === 'POST' && pathname === '/api/auth/logout') {
     options.auth.logout(session)
     options.events.close()
     options.preview?.close()
+    options.previewChannel?.close()
     response.setHeader('Set-Cookie', sessionCookie('', writeOrigin!.secure, true))
     return json(response, 200, { authenticated: false })
+  }
+  if (method === 'GET' && pathname === '/api/versions') {
+    const preview = options.previewChannel
+      ? await options.previewChannel.status()
+      : { enabled: false, available: false, releaseId: undefined, capabilities: [], synthetic: true }
+    return json(response, 200, {
+      stable: { enabled: true, available: true, releaseId: mainWebStableReleaseId, capabilities: ['main-chat'], synthetic: false },
+      preview,
+    })
+  }
+  if (pathname.startsWith('/preview/api/') && options.previewChannel) {
+    if (await options.previewChannel.handle(request, response, () => options.auth.authorized(session))) return
   }
   if (options.preview && await options.preview.handle(request, response, () => options.auth.authorized(session))) return
   if (method === 'GET' && pathname === '/api/status') {
@@ -365,7 +414,7 @@ export async function listenMainWebServer(server: Server, port: number): Promise
 
 export async function runMainWeb(args = process.argv.slice(2)): Promise<void> {
   await import('dotenv/config')
-  const { dataDirectory, port } = parseMainWebArguments(args)
+  const { dataDirectory, port, previewSocketPath } = parseMainWebArguments(args)
   // Check this before creating SQLite so an accidentally selected repository
   // never receives either the private context or the Web runtime database.
   initializeOwnerContext(dataDirectory)
@@ -383,12 +432,16 @@ export async function runMainWeb(args = process.argv.slice(2)): Promise<void> {
       events.publish(foregroundEventForWeb(event))
     },
   })
+  const previewChannel = previewSocketPath === undefined
+    ? undefined
+    : createMainWebPreviewChannel({ socketPath: previewSocketPath, releaseId: coordinationPreviewReleaseId })
   const server = createMainWebServer({
     host,
     readHistory: () => resources.store.readRecentContext(100),
     dataDirectory,
     events,
     auth,
+    ...(previewChannel ? { previewChannel } : {}),
   })
   let closing: Promise<void> | undefined
   const close = (): Promise<void> => {
@@ -400,6 +453,7 @@ export async function runMainWeb(args = process.argv.slice(2)): Promise<void> {
         })
       }
       events.close()
+      previewChannel?.close()
       if (server.listening) server.close(finalize)
       else finalize()
     })
@@ -422,13 +476,13 @@ export async function runMainWeb(args = process.argv.slice(2)): Promise<void> {
   }
 }
 
-export const mainWebPage = `<!doctype html>
+const mainWebPageTemplate = `<!doctype html>
 <html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
 <title>主 Agent</title>
 <style>
-*{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden}body{font:16px/1.6 system-ui,sans-serif;color:#202c32;background:#edf1f3}button,input,textarea{font:inherit}button{cursor:pointer;border:1px solid #cbd5da;border-radius:12px;padding:.5rem .85rem;background:#fff;color:inherit;touch-action:manipulation}button:disabled{opacity:.45;cursor:default}button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:2px solid #087d69;outline-offset:2px}[hidden]{display:none!important}main{height:100vh;height:100dvh;max-width:860px;margin:auto;background:#f7f9fa;display:flex;flex-direction:column;overflow:hidden}h1,h2,p{margin:0}h1{font-size:1.05rem}h2{font-size:1rem;margin-bottom:.5rem}.app-header{padding:.65rem 1rem;border-bottom:1px solid #dee5e8;background:#fff;flex:none}.status{font-size:.8rem;color:#63737b;min-height:1.3em}.private-panel{display:flex;flex:1;min-height:0;flex-direction:column;position:relative}.conversation{position:relative;flex:1;min-height:0}.messages{height:100%;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;overflow-anchor:none;padding:1rem}.message{display:flex;flex-direction:column;align-items:flex-start;margin:0 0 1rem;min-width:0}.message.user{align-items:flex-end}.bubble{max-width:85%;min-width:0;padding:.65rem .85rem;border-radius:16px 16px 16px 4px;background:#fff;border:1px solid #e2e8eb;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65}.user .bubble{background:#d9f3e9;border-color:#c3e7da;border-radius:16px 16px 4px 16px}.role{font-size:.72rem;color:#63737b;margin:0 .3rem .2rem}.empty-state{position:absolute;top:30%;left:1rem;right:1rem;text-align:center;color:#63737b;pointer-events:none}.latest{position:absolute;bottom:.75rem;left:50%;transform:translateX(-50%);box-shadow:0 2px 10px #20303020;white-space:nowrap;font-size:.85rem}.composer{flex:none;background:#fff;border-top:1px solid #dee5e8;padding:.65rem 1rem max(.65rem,env(safe-area-inset-bottom))}.chat{display:flex;align-items:flex-end;gap:.6rem;min-width:0}.chat textarea{display:block;flex:1;min-width:0;width:0;resize:none;min-height:46px;max-height:160px;overflow-y:auto;border:1px solid #cbd5da;border-radius:14px;padding:.6rem .75rem;line-height:1.5}.chat button{background:#087d69;color:#fff;border-color:#087d69;min-height:46px}.hint{font-size:.72rem;color:#63737b;margin-top:.25rem}.feedback{flex:none;padding:0 1rem;background:#fff;max-height:25vh;overflow:auto;font-size:.85rem}.error{color:#a12525;overflow-wrap:anywhere}.error:not(:empty){padding:.4rem 0}.send-failure{padding:.5rem 0;border-bottom:1px solid #edf1f3;overflow-wrap:anywhere}.send-failure button{font-size:.8rem;padding:.2rem .5rem;margin-left:.5rem}.settings{flex:none;border-bottom:1px solid #dee5e8;background:#fff;max-height:50%;overflow:auto}.settings summary{cursor:pointer;padding:.4rem 1rem;font-size:.85rem;color:#52636c}.settings-body{padding:.5rem 1rem 1rem;font-size:.85rem}.settings-body p{color:#63737b;margin:.5rem 0}.settings textarea{display:block;width:100%;min-height:8rem;resize:vertical;max-height:24vh;padding:.6rem;border:1px solid #cbd5da;border-radius:10px}.settings button{margin-top:.5rem}.login-panel{padding:1.5rem;overflow:auto}.login-panel form{display:grid;gap:.8rem;max-width:400px}.login-panel input{display:block;width:100%;min-width:0;border:1px solid #cbd5da;padding:.6rem;border-radius:10px}.login-panel p{margin-top:.75rem;font-size:.85rem}#login-error{padding:0 1rem}#reload-chat{align-self:center;margin:.5rem}@media(max-width:600px){.messages{padding:.8rem}.composer{padding-left:.65rem;padding-right:.65rem}.bubble{max-width:92%}.hint{display:none}}@media(pointer:coarse){.hint{display:none}}
+*{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden}body{font:16px/1.6 system-ui,sans-serif;color:#202c32;background:#edf1f3}button,input,textarea{font:inherit}button{cursor:pointer;border:1px solid #cbd5da;border-radius:12px;padding:.5rem .85rem;background:#fff;color:inherit;touch-action:manipulation}button:disabled{opacity:.45;cursor:default}button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:2px solid #087d69;outline-offset:2px}[hidden]{display:none!important}main{height:100vh;height:100dvh;max-width:860px;margin:auto;background:#f7f9fa;display:flex;flex-direction:column;overflow:hidden}h1,h2,p{margin:0}h1{font-size:1.05rem}h2{font-size:1rem;margin-bottom:.5rem}.app-header{padding:.65rem 1rem;border-bottom:1px solid #dee5e8;background:#fff;flex:none}.status{font-size:.8rem;color:#63737b;min-height:1.3em}.private-panel{display:flex;flex:1;min-height:0;flex-direction:column;position:relative}.conversation{position:relative;flex:1;min-height:0}.messages{height:100%;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;overflow-anchor:none;padding:1rem}.message{display:flex;flex-direction:column;align-items:flex-start;margin:0 0 1rem;min-width:0}.message.user{align-items:flex-end}.bubble{max-width:85%;min-width:0;padding:.65rem .85rem;border-radius:16px 16px 16px 4px;background:#fff;border:1px solid #e2e8eb;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65}.user .bubble{background:#d9f3e9;border-color:#c3e7da;border-radius:16px 16px 4px 16px}.role{font-size:.72rem;color:#63737b;margin:0 .3rem .2rem}.empty-state{position:absolute;top:30%;left:1rem;right:1rem;text-align:center;color:#63737b;pointer-events:none}.latest{position:absolute;bottom:.75rem;left:50%;transform:translateX(-50%);box-shadow:0 2px 10px #20303020;white-space:nowrap;font-size:.85rem}.composer{flex:none;background:#fff;border-top:1px solid #dee5e8;padding:.65rem 1rem max(.65rem,env(safe-area-inset-bottom))}.chat{display:flex;align-items:flex-end;gap:.6rem;min-width:0}.chat textarea{display:block;flex:1;min-width:0;width:0;resize:none;min-height:46px;max-height:160px;overflow-y:auto;border:1px solid #cbd5da;border-radius:14px;padding:.6rem .75rem;line-height:1.5}.chat button{background:#087d69;color:#fff;border-color:#087d69;min-height:46px}.hint{font-size:.72rem;color:#63737b;margin-top:.25rem}.feedback{flex:none;padding:0 1rem;background:#fff;max-height:25vh;overflow:auto;font-size:.85rem}.error{color:#a12525;overflow-wrap:anywhere}.error:not(:empty){padding:.4rem 0}.send-failure{padding:.5rem 0;border-bottom:1px solid #edf1f3;overflow-wrap:anywhere}.send-failure button{font-size:.8rem;padding:.2rem .5rem;margin-left:.5rem}.settings{flex:none;border-bottom:1px solid #dee5e8;background:#fff;max-height:50%;overflow:auto}.settings summary{cursor:pointer;padding:.4rem 1rem;font-size:.85rem;color:#52636c}.settings-body{padding:.5rem 1rem 1rem;font-size:.85rem}.settings-body p{color:#63737b;margin:.5rem 0}.settings textarea{display:block;width:100%;min-height:8rem;resize:vertical;max-height:24vh;padding:.6rem;border:1px solid #cbd5da;border-radius:10px}.settings button{margin-top:.5rem}.login-panel{padding:1.5rem;overflow:auto}.login-panel form{display:grid;gap:.8rem;max-width:400px}.login-panel input{display:block;width:100%;min-width:0;border:1px solid #cbd5da;padding:.6rem;border-radius:10px}.login-panel p{margin-top:.75rem;font-size:.85rem}#login-error{padding:0 1rem}#reload-chat{align-self:center;margin:.5rem}.titlebar{display:flex;align-items:center;justify-content:space-between;gap:1rem}.version-switch{display:flex;align-items:center;gap:.4rem;font-size:.78rem;white-space:nowrap}.version-switch a{color:#087d69;text-decoration:none;border:1px solid #b8d9d1;border-radius:999px;padding:.15rem .55rem}.version-current{color:#63737b}@media(max-width:600px){.messages{padding:.8rem}.composer{padding-left:.65rem;padding-right:.65rem}.bubble{max-width:92%}.hint{display:none}.titlebar{align-items:flex-start;flex-direction:column;gap:.35rem}}@media(pointer:coarse){.hint{display:none}}
 </style>
-<main><header class="app-header"><h1>主 Agent</h1><p id="status" class="status" role="status">正在连接…</p></header>
+<main><header class="app-header"><div class="titlebar"><h1>主 Agent</h1><nav id="version-switch" class="version-switch" hidden><span id="version-current" class="version-current"></span><a id="to-stable" href="/">稳定版</a><a id="to-preview" href="/preview/">预览版 · 模拟演示</a></nav></div><p id="status" class="status" role="status">正在连接…</p></header>
 <section id="login-panel" class="login-panel" hidden><h2 id="login-title">登录</h2><form id="login"><label id="setup-credential-panel" hidden>初始化凭据<input id="setup-credential" type="password" aria-label="初始化凭据" autocomplete="off" maxlength="200"></label><input id="password" type="password" aria-label="密码" autocomplete="current-password" minlength="8" maxlength="256" required><button id="login-button">登录</button></form><p id="login-notice"></p></section>
 <section id="private-panel" class="private-panel" hidden>
 <details id="settings" class="settings"><summary>设置</summary><div class="settings-body"><h2>主人上下文</h2><p>你明确维护的稳定背景，不是自动记忆。保存后仅影响未来回合。</p><textarea id="owner" aria-label="主人上下文" maxlength="12000"></textarea><button id="save-owner" type="button">明确保存主人上下文</button><p id="owner-status" role="status"></p><p>当前支持持续聊天。还不能创建任务、自动记忆或执行外部动作。</p><button id="logout" type="button">退出登录</button></div></details>
@@ -436,6 +490,8 @@ export const mainWebPage = `<!doctype html>
 <div class="feedback"><p id="error" class="error" role="alert"></p><button id="recover" type="button" hidden>重试回复</button><div id="send-errors" aria-live="polite"></div></div><button id="reload-chat" type="button" hidden>重新加载聊天</button>
 <div class="composer"><form id="chat" class="chat"><textarea id="message" rows="1" aria-label="消息" placeholder="聊点什么…" autocomplete="off" maxlength="8000" enterkeyhint="enter"></textarea><button id="send" disabled>发送</button></form><p class="hint">Enter 发送 · Shift + Enter 换行</p></div></section><p id="login-error" class="error" role="alert"></p></main>
 <script>
+const appConfig=__MAIN_WEB_CONFIG__;
+function channelUrl(url){const base=url.startsWith('/api/auth')?appConfig.authApiBase:appConfig.businessApiBase;return base==='/api'?url:base+url.slice('/api'.length)}
 const messages=document.querySelector('#messages'),status=document.querySelector('#status'),error=document.querySelector('#error'),input=document.querySelector('#message'),owner=document.querySelector('#owner');
 const setupStorageKey='agents-main-web-pending-setup';
 const fragmentSetupToken=new URLSearchParams(location.hash.slice(1)).get('setup_token');
@@ -447,6 +503,7 @@ const loginPanel=document.querySelector('#login-panel'),privatePanel=document.qu
 const sendButton=document.querySelector('#send'),recoverButton=document.querySelector('#recover'),latest=document.querySelector('#latest'),emptyState=document.querySelector('#empty-state'),sendErrors=document.querySelector('#send-errors'),reloadButton=document.querySelector('#reload-chat'),ownerStatus=document.querySelector('#owner-status');
 let loaded=false,loading=false,connectionLost=false,liveDisconnected=false,replyState='idle',replyError='',sending=false,recovering=false,composing=false,compositionEndedAt=-Infinity,draftRevision=0,unread=0;
 let failedSends=[];
+let savedOwnerContent='';
 let followingLatest=true,scrollWidth=messages.clientWidth,scrollHeight=messages.clientHeight,touchY;
 const seen=new Set();
 function clearSetupToken(){setupToken=null;document.querySelector('#setup-credential').value='';try{sessionStorage.removeItem(setupStorageKey)}catch(e){}}
@@ -471,7 +528,7 @@ function renderSendErrors(){
 }
 function showLogin(configured=true){
   viewGeneration++;stopPolling();if(stream){stream.close();stream=null}
-  messages.replaceChildren();seen.clear();owner.value='';input.value='';error.textContent='';status.textContent='';privatePanel.hidden=true;loginPanel.hidden=false;
+  messages.replaceChildren();seen.clear();owner.value='';savedOwnerContent='';input.value='';error.textContent='';status.textContent='';privatePanel.hidden=true;loginPanel.hidden=false;
   loaded=false;loading=false;sending=false;recovering=false;composing=false;compositionEndedAt=-Infinity;draftRevision++;failedSends=[];replyState='idle';replyError='';connectionLost=false;liveDisconnected=false;unread=0;followingLatest=true;
   latest.hidden=true;reloadButton.hidden=true;ownerStatus.textContent='';document.querySelector('#settings').open=false;document.querySelector('#save-owner').disabled=false;document.querySelector('#login-button').disabled=false;
   renderSendErrors();resizeInput();updateSend();if(configured)clearSetupToken();
@@ -524,7 +581,7 @@ function add(message){
   if(follow)goLatest();else{unread++;showLatest()}
 }
 async function request(url,options){
-  const generation=viewGeneration;const response=await fetch(url,{...options,credentials:'same-origin'});
+  const generation=viewGeneration;const response=await fetch(channelUrl(url),{...options,credentials:'same-origin'});
   if(generation!==viewGeneration)throw new Error('会话已切换');
   if(response.status===401){showLogin();loginError.textContent='请重新登录。';throw new Error('请重新登录。')}
   // The status already confirms acceptance even if the response body is lost.
@@ -534,7 +591,7 @@ async function request(url,options){
   if(!response.ok){const failure=new Error(body.error||'请求无法完成。');failure.status=response.status;throw failure}return body;
 }
 function openEvents(cursor){
-  if(stream)stream.close();stream=new EventSource('/api/events?cursor='+encodeURIComponent(cursor));const current=stream,generation=viewGeneration;
+  if(stream)stream.close();stream=new EventSource(channelUrl('/api/events?cursor='+encodeURIComponent(cursor)));const current=stream,generation=viewGeneration;
   const isCurrent=()=>stream===current&&active(generation);
   current.addEventListener('open',()=>{if(isCurrent()){liveDisconnected=false;renderState()}});
   current.addEventListener('update',event=>{
@@ -559,7 +616,7 @@ async function load(){
   try{
     const history=await request('/api/history');if(!active(generation))return;
     const context=await request('/api/owner-context');if(!active(generation))return;
-    history.messages.forEach(add);goLatest();owner.value=context.content;loaded=true;loading=false;renderState();resizeInput();openEvents(history.cursor);await pollStatus(generation);
+    history.messages.forEach(add);goLatest();owner.value=context.content;savedOwnerContent=context.content;loaded=true;loading=false;renderState();resizeInput();openEvents(history.cursor);await pollStatus(generation);
   }catch(e){if(active(generation)){loading=false;reloadButton.hidden=false;renderState()}}
 }
 reloadButton.addEventListener('click',load);
@@ -603,7 +660,7 @@ async function send(retry){
 }
 document.querySelector('#save-owner').addEventListener('click',async()=>{
   const generation=viewGeneration,button=document.querySelector('#save-owner');if(button.disabled)return;button.disabled=true;ownerStatus.textContent='正在保存…';
-  try{await request('/api/owner-context',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:owner.value})});if(active(generation))ownerStatus.textContent='已明确保存，仅未来回合会使用。'}
+  try{await request('/api/owner-context',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:owner.value})});if(active(generation)){savedOwnerContent=owner.value;ownerStatus.textContent='已明确保存，仅未来回合会使用。'}}
   catch(e){if(active(generation))ownerStatus.textContent=e.message}finally{if(active(generation))button.disabled=false}
 });
 recoverButton.addEventListener('click',async()=>{
@@ -611,8 +668,42 @@ recoverButton.addEventListener('click',async()=>{
   try{const body=await request('/api/recover',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(!active(generation))return;if(eventRevision===revision){replyState=body.started?'processing':'idle';replyError=''}eventRevision++}
   catch(e){if(active(generation)){replyState='blocked';replyError='暂时无法重试，请稍后再试。'}}finally{if(active(generation)){recovering=false;renderState()}}
 });
+function setupVersionSwitch(){
+  const nav=document.querySelector('#version-switch');nav.hidden=!appConfig.previewEnabled;
+  document.querySelector('#version-current').textContent=appConfig.channel==='preview'?'当前：预览版 · 模拟演示':'当前：稳定版';
+  const guard=event=>{if(sending){event.preventDefault();status.textContent='发送尚未确认，请完成或超时后再切换。';return}if((input.value.trim()||failedSends.length||owner.value!==savedOwnerContent)&&!confirm('切换将丢弃未提交内容。'))event.preventDefault()};
+  document.querySelector('#to-stable').addEventListener('click',guard);document.querySelector('#to-preview').addEventListener('click',guard);
+}
+setupVersionSwitch();
 initialize();
 </script>`
+
+export interface MainWebPageConfig {
+  channel: 'stable' | 'preview'
+  businessApiBase: '/api' | '/preview/api'
+  authApiBase: '/api'
+  releaseId: string
+  previewEnabled: boolean
+}
+
+const defaultMainWebPageConfig: MainWebPageConfig = {
+  channel: 'stable',
+  businessApiBase: '/api',
+  authApiBase: '/api',
+  releaseId: mainWebStableReleaseId,
+  previewEnabled: false,
+}
+
+function serializedPageConfig(config: MainWebPageConfig): string {
+  return JSON.stringify(config).replace(/</g, '\\u003c')
+}
+
+export function createMainWebPage(overrides: Partial<MainWebPageConfig> = {}): string {
+  const config = { ...defaultMainWebPageConfig, ...overrides }
+  return mainWebPageTemplate.replace('__MAIN_WEB_CONFIG__', serializedPageConfig(config))
+}
+
+export const mainWebPage = createMainWebPage()
 
 function isMainEntry(): boolean {
   const entry = process.argv[1]

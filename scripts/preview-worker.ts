@@ -8,7 +8,8 @@ import { pathToFileURL } from 'node:url'
 import { createCoordinationRuntime, createFreshPreviewDirectory, openPreviewDirectory, type CoordinationRuntime, type PreviewDirectoryMode } from './coordination-preview-runtime.js'
 import { demoModel } from './main-web-coordination-demo.js'
 import { HeldFakeExecutor } from '../src/main/coordination/fake.js'
-import { json } from './main-web.js'
+import { coordinationPage } from '../src/main/coordination/web-page.js'
+import { coordinationPreviewReleaseId, createMainWebPage, json } from './main-web.js'
 
 export const previewWorkerLockFilename = '.preview-worker.lock.sqlite'
 
@@ -86,10 +87,30 @@ export async function startPreviewWorker(options: { dataDirectory: string; socke
     const socketDir = path.dirname(socketPath)
     mkdirSync(socketDir, { recursive: true, mode: 0o700 })
     chmodSync(socketDir, 0o700)
+    const page = coordinationPage(createMainWebPage({
+      channel: 'preview',
+      businessApiBase: '/preview/api',
+      releaseId: coordinationPreviewReleaseId,
+      previewEnabled: true,
+    }))
     const server = http.createServer((request, response) => {
       if (request.url === '/healthz') {
         if (request.method !== 'GET') json(response, 405, { error: '方法不可用。' })
         else json(response, 200, { ok: true, synthetic: true })
+        return
+      }
+      if (request.url === '/preview/') {
+        if (!['GET', 'HEAD'].includes(request.method ?? '')) json(response, 405, { error: '方法不可用。' })
+        else {
+          response.writeHead(200, {
+            'Content-Type': 'text/html; charset=utf-8',
+            'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff',
+            'Referrer-Policy': 'no-referrer',
+            'Content-Security-Policy': "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
+          })
+          response.end(request.method === 'HEAD' ? undefined : page)
+        }
         return
       }
       void runtime.handle(request, response, () => true)

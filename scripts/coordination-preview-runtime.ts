@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdirSync, writeFileSync, readFileSync, lstatSyn
 import path from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { SQLiteMainInboxStore } from '../src/main/inbox.js'
-import { initializeOwnerContext, readOwnerContext, ownerContextCheckpoint } from '../src/main/owner-context.js'
+import { initializeOwnerContext, readOwnerContext, ownerContextCheckpoint, saveOwnerContext } from '../src/main/owner-context.js'
 import { CoordinationHost } from '../src/main/coordination/model-host.js'
 import { ScopedDomainExecutor } from '../src/agent/scoped-domain.js'
 import type { ScopedModel } from '../src/agent/scoped-protocol.js'
@@ -72,6 +72,20 @@ export function createCoordinationRuntime(options: {
       async handle(request: IncomingMessage, response: ServerResponse, authorized: () => boolean): Promise<boolean> {
         const url = new URL(request.url!, 'http://localhost'), route = url.pathname, method = request.method
         if (route === '/api/conversations' && method === 'GET') { json(response, 200, { conversations: [{ id: 'main', pinned: true }, { id: 'fake-work', synthetic: true }] }); return true }
+        if (route === '/api/owner-context') {
+          if (method === 'GET') { json(response, 200, { content: readOwnerContext(directory) }); return true }
+          if (method === 'PUT') {
+            try {
+              const body = await readJson(request)
+              if (Object.keys(body).join() !== 'content' || typeof body.content !== 'string') throw new Error('Unexpected fields')
+              saveOwnerContext(directory, body.content)
+              host.checkpoint = previewCheckpoint(readOwnerContext(directory))
+              json(response, 200, { saved: true })
+            } catch { json(response, 400, { error: '主人上下文未接受：内容为空、过大或请求无效。' }) }
+            return true
+          }
+          json(response, 405, { error: '方法不可用。' }); return true
+        }
         if (!['/api/history','/api/status','/api/events','/api/messages','/api/control','/api/recover'].includes(route)) return false
         const c = url.searchParams.get('conversation') ?? 'main', bus = buses.get(c)
         if (!bus) { json(response, 400, { error: '未知会话。' }); return true }
