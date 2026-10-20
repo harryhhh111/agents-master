@@ -1,5 +1,6 @@
 #!/usr/bin/env tsx
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
 import path from 'node:path'
@@ -31,6 +32,15 @@ const maxJsonBodyBytes = 32_000
 const mainWebEventReplayLimit = 256
 export const mainWebStableReleaseId = 'main-web-stable-local'
 export const coordinationPreviewReleaseId = 'coordination-preview-step-b-local'
+
+/** 从不可变发布目录的 release.json 读取真实发布标识；无 manifest（开发工作树）时退回常量。 */
+export function readPackagedReleaseId(directory: string, fallback: string): string {
+  try {
+    const manifest = JSON.parse(readFileSync(path.join(directory, 'release.json'), 'utf8')) as { releaseId?: unknown }
+    if (typeof manifest.releaseId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(manifest.releaseId)) return manifest.releaseId
+  } catch { /* 非发布目录或 manifest 不可读时使用回退标识 */ }
+  return fallback
+}
 
 export interface MainWebArguments {
   dataDirectory: string
@@ -120,6 +130,18 @@ function html(response: ServerResponse, page = mainWebPage): void {
     'Content-Security-Policy': "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
   })
   response.end(page)
+}
+
+/** 预览关闭时的入口兜底页：由稳定入口提供，不依赖 worker，始终给出返回稳定版的入口。 */
+function previewDisabledPage(response: ServerResponse): void {
+  response.writeHead(404, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': "default-src 'self'; style-src 'unsafe-inline'",
+  })
+  response.end('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>预览版未启用</title><main style="max-width:42rem;margin:4rem auto;font:16px/1.7 system-ui,sans-serif"><h1>预览版未启用</h1><p>当前站点未开启预览通道，稳定版仍可继续使用。</p><p><a href="/">返回稳定版</a></p></main></html>')
 }
 
 export async function readJson(request: IncomingMessage): Promise<Record<string, unknown>> {
@@ -239,6 +261,7 @@ export interface MainWebHost {
 export interface MainWebServerOptions {
   preview?: { page: string; handle(request: IncomingMessage, response: ServerResponse, authorized: () => boolean): Promise<boolean>; close(): void }
   previewChannel?: MainWebPreviewChannel
+  stableReleaseId?: string
   host: MainWebHost
   readHistory(): MainConversationMessage[]
   dataDirectory: string
@@ -264,7 +287,13 @@ export async function handleMainWebRequest(
   const url = new URL(request.url ?? '/', 'http://localhost')
   const pathname = url.pathname
   if (method === 'GET' && pathname === '/') {
-    return html(response, options.preview?.page ?? createMainWebPage({ previewEnabled: options.previewChannel !== undefined }))
+    // 导航链接展示预览实际能力标识；status() 有总时限，worker 不可用时回退默认文案。
+    const previewStatus = options.previewChannel ? await options.previewChannel.status() : undefined
+    return html(response, options.preview?.page ?? createMainWebPage({
+      previewEnabled: options.previewChannel !== undefined,
+      releaseId: options.stableReleaseId ?? mainWebStableReleaseId,
+      previewLabel: previewStatus?.previewLabel,
+    }))
   }
   const session = sessionFromCookie(request.headers.cookie)
   const writeOrigin = validateWriteOrigin(request.headers.origin, request.headers.host)
@@ -293,19 +322,22 @@ export async function handleMainWebRequest(
     }
   }
   if ((pathname === '/preview' || pathname === '/preview/') && options.previewChannel === undefined) {
-    return json(response, 404, { error: '未找到此地址。' })
+    return previewDisabledPage(response)
   }
   if (pathname === '/preview' && options.previewChannel) {
     if (await options.previewChannel.handle(request, response, () => options.auth.authorized(session))) return
   }
   if (pathname === '/preview/' && options.previewChannel) {
     if (!options.auth.authorized(session)) {
+      // 直达预览的登录页也展示 worker 实际发布标识；status() 有总时限，worker 不可用时回退配置值。
+      const previewStatus = await options.previewChannel.status()
       return html(response, coordinationPage(createMainWebPage({
         channel: 'preview',
         businessApiBase: '/preview/api',
-        releaseId: coordinationPreviewReleaseId,
+        releaseId: previewStatus.releaseId,
         previewEnabled: true,
-      })))
+        previewLabel: previewStatus.previewLabel,
+      }), previewStatus.synthetic ? 'synthetic' : 'real-model'))
     }
     if (await options.previewChannel.handle(request, response, () => options.auth.authorized(session))) return
   }
@@ -325,7 +357,7 @@ export async function handleMainWebRequest(
       ? await options.previewChannel.status()
       : { enabled: false, available: false, releaseId: undefined, capabilities: [], synthetic: true }
     return json(response, 200, {
-      stable: { enabled: true, available: true, releaseId: mainWebStableReleaseId, capabilities: ['main-chat'], synthetic: false },
+      stable: { enabled: true, available: true, releaseId: options.stableReleaseId ?? mainWebStableReleaseId, capabilities: ['main-chat'], synthetic: false },
       preview,
     })
   }
@@ -441,6 +473,7 @@ export async function runMainWeb(args = process.argv.slice(2)): Promise<void> {
     dataDirectory,
     events,
     auth,
+    stableReleaseId: readPackagedReleaseId(process.cwd(), mainWebStableReleaseId),
     ...(previewChannel ? { previewChannel } : {}),
   })
   let closing: Promise<void> | undefined
@@ -482,7 +515,7 @@ const mainWebPageTemplate = `<!doctype html>
 <style>
 *{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden}body{font:16px/1.6 system-ui,sans-serif;color:#202c32;background:#edf1f3}button,input,textarea{font:inherit}button{cursor:pointer;border:1px solid #cbd5da;border-radius:12px;padding:.5rem .85rem;background:#fff;color:inherit;touch-action:manipulation}button:disabled{opacity:.45;cursor:default}button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:2px solid #087d69;outline-offset:2px}[hidden]{display:none!important}main{height:100vh;height:100dvh;max-width:860px;margin:auto;background:#f7f9fa;display:flex;flex-direction:column;overflow:hidden}h1,h2,p{margin:0}h1{font-size:1.05rem}h2{font-size:1rem;margin-bottom:.5rem}.app-header{padding:.65rem 1rem;border-bottom:1px solid #dee5e8;background:#fff;flex:none}.status{font-size:.8rem;color:#63737b;min-height:1.3em}.private-panel{display:flex;flex:1;min-height:0;flex-direction:column;position:relative}.conversation{position:relative;flex:1;min-height:0}.messages{height:100%;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;overflow-anchor:none;padding:1rem}.message{display:flex;flex-direction:column;align-items:flex-start;margin:0 0 1rem;min-width:0}.message.user{align-items:flex-end}.bubble{max-width:85%;min-width:0;padding:.65rem .85rem;border-radius:16px 16px 16px 4px;background:#fff;border:1px solid #e2e8eb;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.65}.user .bubble{background:#d9f3e9;border-color:#c3e7da;border-radius:16px 16px 4px 16px}.role{font-size:.72rem;color:#63737b;margin:0 .3rem .2rem}.empty-state{position:absolute;top:30%;left:1rem;right:1rem;text-align:center;color:#63737b;pointer-events:none}.latest{position:absolute;bottom:.75rem;left:50%;transform:translateX(-50%);box-shadow:0 2px 10px #20303020;white-space:nowrap;font-size:.85rem}.composer{flex:none;background:#fff;border-top:1px solid #dee5e8;padding:.65rem 1rem max(.65rem,env(safe-area-inset-bottom))}.chat{display:flex;align-items:flex-end;gap:.6rem;min-width:0}.chat textarea{display:block;flex:1;min-width:0;width:0;resize:none;min-height:46px;max-height:160px;overflow-y:auto;border:1px solid #cbd5da;border-radius:14px;padding:.6rem .75rem;line-height:1.5}.chat button{background:#087d69;color:#fff;border-color:#087d69;min-height:46px}.hint{font-size:.72rem;color:#63737b;margin-top:.25rem}.feedback{flex:none;padding:0 1rem;background:#fff;max-height:25vh;overflow:auto;font-size:.85rem}.error{color:#a12525;overflow-wrap:anywhere}.error:not(:empty){padding:.4rem 0}.send-failure{padding:.5rem 0;border-bottom:1px solid #edf1f3;overflow-wrap:anywhere}.send-failure button{font-size:.8rem;padding:.2rem .5rem;margin-left:.5rem}.settings{flex:none;border-bottom:1px solid #dee5e8;background:#fff;max-height:50%;overflow:auto}.settings summary{cursor:pointer;padding:.4rem 1rem;font-size:.85rem;color:#52636c}.settings-body{padding:.5rem 1rem 1rem;font-size:.85rem}.settings-body p{color:#63737b;margin:.5rem 0}.settings textarea{display:block;width:100%;min-height:8rem;resize:vertical;max-height:24vh;padding:.6rem;border:1px solid #cbd5da;border-radius:10px}.settings button{margin-top:.5rem}.login-panel{padding:1.5rem;overflow:auto}.login-panel form{display:grid;gap:.8rem;max-width:400px}.login-panel input{display:block;width:100%;min-width:0;border:1px solid #cbd5da;padding:.6rem;border-radius:10px}.login-panel p{margin-top:.75rem;font-size:.85rem}#login-error{padding:0 1rem}#reload-chat{align-self:center;margin:.5rem}.titlebar{display:flex;align-items:center;justify-content:space-between;gap:1rem}.version-switch{display:flex;align-items:center;gap:.4rem;font-size:.78rem;white-space:nowrap}.version-switch a{color:#087d69;text-decoration:none;border:1px solid #b8d9d1;border-radius:999px;padding:.15rem .55rem}.version-current{color:#63737b}@media(max-width:600px){.messages{padding:.8rem}.composer{padding-left:.65rem;padding-right:.65rem}.bubble{max-width:92%}.hint{display:none}.titlebar{align-items:flex-start;flex-direction:column;gap:.35rem}}@media(pointer:coarse){.hint{display:none}}
 </style>
-<main><header class="app-header"><div class="titlebar"><h1>主 Agent</h1><nav id="version-switch" class="version-switch" hidden><span id="version-current" class="version-current"></span><a id="to-stable" href="/">稳定版</a><a id="to-preview" href="/preview/">预览版 · 模拟演示</a></nav></div><p id="status" class="status" role="status">正在连接…</p></header>
+<main><header class="app-header"><div class="titlebar"><h1>主 Agent</h1><nav id="version-switch" class="version-switch" hidden><span id="version-current" class="version-current"></span><a id="to-stable" href="/">稳定版</a><a id="to-preview" href="/preview/">预览版</a></nav></div><p id="status" class="status" role="status">正在连接…</p></header>
 <section id="login-panel" class="login-panel" hidden><h2 id="login-title">登录</h2><form id="login"><label id="setup-credential-panel" hidden>初始化凭据<input id="setup-credential" type="password" aria-label="初始化凭据" autocomplete="off" maxlength="200"></label><input id="password" type="password" aria-label="密码" autocomplete="current-password" minlength="8" maxlength="256" required><button id="login-button">登录</button></form><p id="login-notice"></p></section>
 <section id="private-panel" class="private-panel" hidden>
 <details id="settings" class="settings"><summary>设置</summary><div class="settings-body"><h2>主人上下文</h2><p>你明确维护的稳定背景，不是自动记忆。保存后仅影响未来回合。</p><textarea id="owner" aria-label="主人上下文" maxlength="12000"></textarea><button id="save-owner" type="button">明确保存主人上下文</button><p id="owner-status" role="status"></p><p>当前支持持续聊天。还不能创建任务、自动记忆或执行外部动作。</p><button id="logout" type="button">退出登录</button></div></details>
@@ -514,7 +547,7 @@ function updateSend(){sendButton.disabled=!loaded||sending||!input.value.trim();
 function replyFailure(message){return typeof message==='string'&&message.trim()?message.replaceAll('重试失败回合','重试回复'):'回复暂时失败，消息已保留。点击「重试回复」继续。'}
 function renderState(){
   status.textContent=loading?'正在加载聊天…':!loaded?'聊天加载失败':connectionLost?'连接中断，正在重连…':liveDisconnected?'实时连接重连中…':replyState==='blocked'?'回复失败':replyState==='processing'?'正在回复…':'在线';
-  error.textContent=replyState==='blocked'?(replyError||'回复暂时失败，消息已保留。'):'';
+  error.textContent=replyState==='blocked'?(replyError||'回复暂时失败，消息已保留。'):(typeof extraErrorText==='function'?extraErrorText():'');
   recoverButton.hidden=replyState!=='blocked';recoverButton.disabled=recovering;
   emptyState.hidden=seen.size>0;emptyState.textContent=loading?'正在加载聊天…':loaded?'从一句话开始聊天吧。':'聊天未能加载，请重试。';updateSend();
 }
@@ -581,7 +614,10 @@ function add(message){
   if(follow)goLatest();else{unread++;showLatest()}
 }
 async function request(url,options){
-  const generation=viewGeneration;const response=await fetch(channelUrl(url),{...options,credentials:'same-origin'});
+  const generation=viewGeneration;
+  // 应用层 deadline：请求超时按“接收状态未知”处理，进入可重试确认流程，而不是无限 pending。
+  const timeout=typeof AbortSignal==='function'&&typeof AbortSignal.timeout==='function'?AbortSignal.timeout(30000):undefined;
+  const response=await fetch(channelUrl(url),{...options,credentials:'same-origin',...(timeout?{signal:timeout}:{})});
   if(generation!==viewGeneration)throw new Error('会话已切换');
   if(response.status===401){showLogin();loginError.textContent='请重新登录。';throw new Error('请重新登录。')}
   // The status already confirms acceptance even if the response body is lost.
@@ -670,8 +706,15 @@ recoverButton.addEventListener('click',async()=>{
 });
 function setupVersionSwitch(){
   const nav=document.querySelector('#version-switch');nav.hidden=!appConfig.previewEnabled;
-  document.querySelector('#version-current').textContent=appConfig.channel==='preview'?'当前：预览版 · 模拟演示':'当前：稳定版';
-  const guard=event=>{if(sending){event.preventDefault();status.textContent='发送尚未确认，请完成或超时后再切换。';return}if((input.value.trim()||failedSends.length||owner.value!==savedOwnerContent)&&!confirm('切换将丢弃未提交内容。'))event.preventDefault()};
+  document.querySelector('#version-current').textContent=appConfig.channel==='preview'?'当前：'+appConfig.previewLabel:'当前：稳定版';
+  document.querySelector('#to-preview').textContent=appConfig.previewLabel;
+  // extraSwitchBlock/extraSwitchDirty 由预览页注入：覆盖回答草稿、其他会话草稿与待确认控制提交。
+  const guard=event=>{
+    const blocked=sending?'发送尚未确认，请完成或超时后再切换。':(typeof extraSwitchBlock==='function'?extraSwitchBlock():undefined);
+    if(blocked){event.preventDefault();status.textContent=blocked;return}
+    const dirty=input.value.trim()||failedSends.length||owner.value!==savedOwnerContent||(typeof extraSwitchDirty==='function'&&extraSwitchDirty());
+    if(dirty&&!confirm('切换将丢弃未提交内容。'))event.preventDefault()
+  };
   document.querySelector('#to-stable').addEventListener('click',guard);document.querySelector('#to-preview').addEventListener('click',guard);
 }
 setupVersionSwitch();
@@ -684,6 +727,7 @@ export interface MainWebPageConfig {
   authApiBase: '/api'
   releaseId: string
   previewEnabled: boolean
+  previewLabel: string
 }
 
 const defaultMainWebPageConfig: MainWebPageConfig = {
@@ -692,6 +736,7 @@ const defaultMainWebPageConfig: MainWebPageConfig = {
   authApiBase: '/api',
   releaseId: mainWebStableReleaseId,
   previewEnabled: false,
+  previewLabel: '预览版 · 模拟演示',
 }
 
 function serializedPageConfig(config: MainWebPageConfig): string {
@@ -699,7 +744,10 @@ function serializedPageConfig(config: MainWebPageConfig): string {
 }
 
 export function createMainWebPage(overrides: Partial<MainWebPageConfig> = {}): string {
-  const config = { ...defaultMainWebPageConfig, ...overrides }
+  const config = { ...defaultMainWebPageConfig }
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value !== undefined) (config as unknown as Record<string, unknown>)[key] = value
+  }
   return mainWebPageTemplate.replace('__MAIN_WEB_CONFIG__', serializedPageConfig(config))
 }
 

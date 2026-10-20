@@ -1,10 +1,26 @@
 import { ScopedProtocolError, ScopedTimeoutError, type ScopedModel, type WireMessage } from '../../agent/scoped-protocol.js'
-import { scopedTurn, safeFailedTurn, type ScopedState, type ScopedTool } from '../../agent/scoped-turn.js'
+import { defaultScopedTurnTexts, scopedTurn, type ScopedState, type ScopedTool } from '../../agent/scoped-turn.js'
 import { CoordinationStore, FAKE_GROUP, type FrontTurn } from './store.js'
 import { FakeBackgroundScheduler, type FakeExecutor } from './fake.js'
 
 export function addressedMain(conversation: string, content: string): boolean {
   return conversation === 'main' || content.startsWith('@main ') || content.startsWith('@主 Agent ')
+}
+export interface CoordinationHostLabels {
+  policy: string
+  deliverPrefix: string
+  cancelNote: string
+  recordedNote: string
+  clarifyNote: string
+  failedNote: string
+}
+export const defaultCoordinationHostLabels: CoordinationHostLabels = {
+  policy: '仅模拟联调，不能声称真实项目执行。仅明确工作委托使用 delegate；含糊需求用普通文本澄清，不创建任务。answer 只回答绑定待决问题，cancel 只取消指定任务。',
+  deliverPrefix: '模拟/联调回传：',
+  cancelNote: '模拟取消请求已记录：',
+  recordedNote: defaultScopedTurnTexts.recorded,
+  clarifyNote: defaultScopedTurnTexts.clarify,
+  failedNote: defaultScopedTurnTexts.failed,
 }
 export class CoordinationHost {
   private readonly busy = new Set<string>()
@@ -17,7 +33,9 @@ export class CoordinationHost {
   private nextScope = 0
   checkpoint = '模拟/联调主 Agent；仅受限合成任务，不能声称真实检查。含糊需求先澄清。'
   constructor(readonly store: CoordinationStore, private readonly mainModel: ScopedModel, private readonly domainModel: ScopedModel,
-    private readonly executor: FakeExecutor & { stop?(id: string): void }, private readonly changed: () => void = () => {}) {
+    private readonly executor: FakeExecutor & { stop?(id: string): void }, private readonly changed: () => void = () => {},
+    private readonly labels: CoordinationHostLabels = defaultCoordinationHostLabels, private readonly turnTimeoutMs?: number,
+    private readonly protocolCorrection = false) {
     this.background = new FakeBackgroundScheduler(store, executor, changed)
   }
   start(): void {
@@ -32,7 +50,7 @@ export class CoordinationHost {
     const turn = { conversation: c, event: { id: eventId } } as FrontTurn
     const prior = this.store.protocol<ScopedState>(turn)
     if (prior?.final) return prior.final
-    return this.store.commitProtocol(turn, () => this.store.cancel(FAKE_GROUP, id), result => ({ messages: [], rounds: 0, ids: [], final: '模拟取消请求已记录：' + result.status }))
+    return this.store.commitProtocol(turn, () => this.store.cancel(FAKE_GROUP, id), result => ({ messages: [], rounds: 0, ids: [], final: this.labels.cancelNote + result.status }))
   }
   private tools(turn: FrontTurn): Record<string, ScopedTool> {
     return {
@@ -49,17 +67,19 @@ export class CoordinationHost {
     let author = c === 'main' ? 'main-agent' : 'fake-work-agent'
     const controller = new AbortController(); this.controllers.add(controller)
     try {
-      const deliver = () => { for (const o of this.store.pendingOutbox(c)) if (this.store.deliver(c, o.id, '模拟/联调回传：' + o.body)) { progressed = true; return true }; return false }
+      const deliver = () => { for (const o of this.store.pendingOutbox(c)) if (this.store.deliver(c, o.id, this.labels.deliverPrefix + o.body)) { progressed = true; return true }; return false }
       if (this.store.userTurnCount(c) >= 3 && deliver()) return true
       turn = this.store.beginChat(c)
       if (!turn) return deliver()
       this.busy.add(c); this.changed()
       const main = addressedMain(c, turn.context.at(-1)?.content ?? '')
       author = main ? 'main-agent' : 'fake-work-agent'
-      const policy = '仅模拟联调，不能声称真实项目执行。仅明确工作委托使用 delegate；含糊需求用普通文本澄清，不创建任务。answer 只回答绑定待决问题，cancel 只取消指定任务。'
+      const policy = this.labels.policy
       const initial: WireMessage[] = [{ role: 'system', content: (main ? (c === 'main' ? this.checkpoint : '群内主 Agent，仅使用本群上下文。') : '工作项目 Agent，仅使用本群上下文；可通过受限协调工具委派合成工作。') + '\n' + policy }, ...turn.context.map(m => ({ role: m.role, content: JSON.stringify({ author: m.author, text: m.content }) }))]
       const current = turn
-      const reply = await scopedTurn({ model: main ? this.mainModel : this.domainModel, initial, tools: this.tools(turn), signal: controller.signal,
+      const reply = await scopedTurn({ model: main ? this.mainModel : this.domainModel, initial, tools: this.tools(turn), signal: controller.signal, timeoutMs: this.turnTimeoutMs,
+        texts: { recorded: this.labels.recordedNote, clarify: this.labels.clarifyNote, failed: this.labels.failedNote },
+        protocolCorrection: this.protocolCorrection,
         load: () => this.store.protocol<ScopedState>(current), save: s => this.store.saveProtocol(current, s),
         commit: work => this.store.commitProtocol(current, work, s => s),
       })
@@ -74,7 +94,7 @@ export class CoordinationHost {
           // durable result intact; retry only the reply, never the action.
           this.store.releaseChat(turn); if (!this.stopped) this.blocked.add(c)
         } else if (!this.stopped && (error instanceof ScopedProtocolError || !transient || (state?.rounds ?? 0) >= 3)) {
-          const failed: ScopedState = state?.failure ? state : { ...(state ?? { messages: [], rounds: 0, ids: [] }), final: safeFailedTurn, failure: { kind: 'provider', reason: 'Provider request failed or attempts exhausted' } }
+          const failed: ScopedState = state?.failure ? state : { ...(state ?? { messages: [], rounds: 0, ids: [] }), final: this.labels.failedNote, failure: { kind: 'provider', reason: 'Provider request failed or attempts exhausted' } }
           this.store.commitProtocol(turn, () => this.store.finishChat(turn!, failed.final!, author), () => failed)
         } else { this.store.releaseChat(turn); if (!this.stopped) this.blocked.add(c) }
       }

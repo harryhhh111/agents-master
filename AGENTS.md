@@ -53,3 +53,6 @@
 - 2026-10-19 实测：本机 `/tmp` 存在 `.git` 探测标记，`owner-context` 会拒绝在 `/tmp` 下创建
   数据目录（旧版协调 demo 入口因此在本机无法用默认 tmp 目录启动，非回归）；演示/测试请用
   `--preview-parent /dev/shm`（或同级无 .git 的私有目录），测试内对 `/tmp/.git` 探测做 mock。
+- 2026-10-19 本轮桌面会话实测：`codex` 已为 0.163.0，Kimi 2.2.0、Claude Code 2.1.195；
+  `.env` 中 DeepSeek key 已配置（未输出内容），配置模型为 `deepseek-flash`。本会话受限沙箱内
+  访问 `api.deepseek.com` 报 DNS 解析失败，仅记录该会话网络边界，不推翻此前宿主网络可达结论。

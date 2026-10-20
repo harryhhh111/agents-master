@@ -4,6 +4,7 @@ import path from 'node:path'
 import { it, expect } from 'vitest'
 import { MainWebAuth } from '../src/main/web-auth.js'
 import {
+  coordinationPreviewReleaseId,
   MainWebEventBus,
   createMainWebServer,
   listenMainWebServer,
@@ -114,7 +115,9 @@ it('同站一次登录访问稳定版与预览版,页面 API 前缀与业务数�
     expect((await request(entry, '/api/versions', { authenticated: false })).status).toBe(401)
     const versions = await request(entry, '/api/versions')
     expect(versions.status).toBe(200)
-    expect(versions.text).toContain('test-preview-release')
+    // worker 在线时以它实际上报的发布标识为准，入口配置值不再出现
+    expect(versions.text).toContain(coordinationPreviewReleaseId)
+    expect(versions.text).not.toContain('test-preview-release')
     expect(versions.text).toContain('"available":true')
 
     const stablePage = await request(entry, '/')
@@ -213,6 +216,8 @@ it('worker 停止后稳定版继续可用,预览页面和 API 明确 503 而不�
     const versions = await request(entry, '/api/versions')
     expect(versions.status).toBe(200)
     expect(versions.text).toContain('"available":false')
+    // worker 不可用时回退到入口配置的发布标识
+    expect(versions.text).toContain('test-preview-release')
   } finally {
     await entry?.close()
     await worker?.close()
@@ -243,6 +248,42 @@ it('代理不向 worker 转发 cookie、Authorization 或客户端内部身份�
   } finally {
     await entry?.close()
     await new Promise<void>(resolve => echo.close(() => resolve()))
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+it('real 模式 worker 的能力标识经 healthz 透传到 versions 与两侧页面', async () => {
+  const root = parent()
+  let worker: PreviewWorker | undefined
+  let entry: RunningEntry | undefined
+  try {
+    const socketPath = path.join(root, 'run', 'preview.sock')
+    worker = await startPreviewWorker({
+      dataDirectory: path.join(root, 'preview'),
+      socketPath,
+      model: { mode: 'real', realModel: { complete: async () => ({ content: 'injected real reply' }) }, modelName: 'test-real-model' },
+    })
+    entry = await startEntry(root, socketPath)
+
+    const versions = await request(entry, '/api/versions')
+    expect(versions.status).toBe(200)
+    expect(versions.text).toContain('"synthetic":false')
+    expect(versions.text).toContain('预览版 · 真实模型（受限工具）')
+
+    const stablePage = await request(entry, '/')
+    expect(stablePage.text).toContain('预览版 · 真实模型（受限工具）')
+    expect(stablePage.text).not.toContain('预览版 · 模拟演示')
+
+    const anonymousPreview = await request(entry, '/preview/', { authenticated: false })
+    expect(anonymousPreview.status).toBe(200)
+    expect(anonymousPreview.text).toContain('预览版 · 真实模型（受限工具）')
+
+    const previewPage = await request(entry, '/preview/')
+    expect(previewPage.text).toContain('真实模型 · 受限工具（无真实项目执行）')
+    expect(previewPage.text).not.toContain('模拟 / 联调')
+  } finally {
+    await entry?.close()
+    await worker?.close()
     rmSync(root, { recursive: true, force: true })
   }
 })

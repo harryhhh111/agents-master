@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { SQLiteMainInboxStore } from '../src/main/inbox.js'
 import { scopedTurn, type ScopedState, type ScopedTool } from '../src/agent/scoped-turn.js'
-import type { ScopedModel, ToolCall } from '../src/agent/scoped-protocol.js'
+import type { ModelReply, ScopedModel, ToolCall } from '../src/agent/scoped-protocol.js'
 import { CoordinationModel } from '../src/frontbrain/coordination-model.js'
 
 const call = (id: string, name = 'delegate', args: unknown = { objective: 'synthetic', completionCriteria: ['sample'] }): ToolCall => ({ id, type: 'function', function: { name, arguments: JSON.stringify(args) } })
@@ -64,6 +64,80 @@ describe('bounded durable model protocol', () => {
       return {choices:[{message:{content:'synthetic'}}]}
     }}}},'injected')
     expect((await model.complete([],[],controller.signal)).content).toBe('synthetic')
+  })
+  it('adapter timeout defaults to 15s and honors an explicit override', async () => {
+    const seen: number[] = []
+    const client = {chat:{completions:{create:async(_params: unknown,options: { timeout: number })=>{ seen.push(options.timeout); return {choices:[{message:{content:'ok'}}]} }}}}
+    const controller = new AbortController()
+    await new CoordinationModel(client,'injected').complete([],[],controller.signal)
+    await new CoordinationModel(client,'injected',45_000).complete([],[],controller.signal)
+    expect(seen).toEqual([15_000,45_000])
+  })
+  it('protocol correction: one bounded retry before any tool execution, never a replay', async () => {
+    const tools: Record<string, ScopedTool> = {
+      echo: { fields: {}, execute: () => ({ echoed: true }) },
+      finish: { fields: { body: 'text' }, terminal: true, execute: a => ({ done: a.body }) },
+    }
+    // 坏输出→修正后成功：finish 只执行一次，消息里留有修正反馈
+    {
+      let state: ScopedState | undefined, calls = 0, executed = 0
+      const model: ScopedModel = { complete: async () => ++calls === 1
+        ? { content: null, tool_calls: [call('bad', 'finish', { wrong: 'args' })] }
+        : { content: null, tool_calls: [call('good', 'finish', { body: 'corrected' })] } }
+      const final = await scopedTurn({ model, initial: [], tools: { finish: { ...tools.finish, execute: a => { executed++; return tools.finish.execute(a) } } },
+        protocolCorrection: true, load: () => state, save: s => { state = s }, commit: work => { state = work(); return state } })
+      expect(final).toContain('corrected')
+      expect(executed).toBe(1)
+      expect(state!.rounds).toBe(2)
+      expect(state!.failure).toBeUndefined()
+      expect(state!.corrections).toBe(1)
+      expect(state!.rejected).toEqual([{ content: null, tool_calls: [call('bad', 'finish', { wrong: 'args' })] }])
+      expect(state!.pending).toBeUndefined()
+      expect(state!.messages.some(m => m.role === 'user' && (m.content ?? '').includes('未通过协议校验'))).toBe(true)
+    }
+    // 重启恢复：修正机会随状态持久化，恢复后不得再次获得
+    {
+      let state: ScopedState | undefined, calls = 0
+      const bad = (): ModelReply => ({ content: null, tool_calls: [call('bad', 'finish', { wrong: 'args' })] })
+      const hanging: ScopedModel = { complete: async () => { calls++; return calls === 1 ? bad() : new Promise(() => {}) } }
+      await expect(scopedTurn({ model: hanging, initial: [], tools, protocolCorrection: true, timeoutMs: 20,
+        load: () => state, save: s => { state = s }, commit: work => { state = work(); return state } })).rejects.toThrow()
+      expect(state!.corrections).toBe(1)
+      expect(state!.rejected).toEqual([bad()])
+      // “重启”：同一持久状态 + 新模型实例再次给出坏输出，不能再获修正
+      await expect(scopedTurn({ model: { complete: async () => bad() }, initial: [], tools, protocolCorrection: true,
+        load: () => state, save: s => { state = s }, commit: work => { state = work(); return state } })).rejects.toThrow()
+      expect(state!.corrections).toBe(1)
+      expect(state!.failure?.kind).toBe('protocol')
+    }
+    // 修正后仍坏：判负且从未执行工具
+    {
+      let state: ScopedState | undefined, executed = 0
+      const model: ScopedModel = { complete: async () => ({ content: null, tool_calls: [call('bad', 'finish', { wrong: 'args' })] }) }
+      await expect(scopedTurn({ model, initial: [], tools: { finish: { ...tools.finish, execute: a => { executed++; return tools.finish.execute(a) } } },
+        protocolCorrection: true, load: () => state, save: s => { state = s }, commit: work => { state = work(); return state } })).rejects.toThrow()
+      expect(executed).toBe(0)
+      expect(state!.failure?.kind).toBe('protocol')
+    }
+    // 已执行过工具后坏输出：不给修正机会（不冒重放风险）
+    {
+      let state: ScopedState | undefined, calls = 0
+      const model: ScopedModel = { complete: async () => ++calls === 1
+        ? { content: null, tool_calls: [call('e1', 'echo', {})] }
+        : { content: null, tool_calls: [call('bad', 'finish', { wrong: 'args' })] } }
+      await expect(scopedTurn({ model, initial: [], tools, protocolCorrection: true,
+        load: () => state, save: s => { state = s }, commit: work => { state = work(); return state } })).rejects.toThrow()
+      expect(state!.ids).toEqual(['e1'])
+      expect(state!.failure?.kind).toBe('protocol')
+    }
+    // 默认不启用修正：立即判负
+    {
+      let state: ScopedState | undefined
+      const model: ScopedModel = { complete: async () => ({ content: null, tool_calls: [call('bad', 'finish', { wrong: 'args' })] }) }
+      await expect(scopedTurn({ model, initial: [], tools,
+        load: () => state, save: s => { state = s }, commit: work => { state = work(); return state } })).rejects.toThrow()
+      expect(state!.rounds).toBe(1)
+    }
   })
   it('preview refuses legacy/v1 opens and ordinary v2 access', () => {
     const dir=mkdtempSync(path.join(tmpdir(),'preview-schema-')),db=path.join(dir,'db')

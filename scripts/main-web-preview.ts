@@ -17,7 +17,8 @@ export interface PreviewChannelStatus {
   available: boolean
   releaseId: string
   capabilities: string[]
-  synthetic: true
+  synthetic: boolean
+  previewLabel?: string
 }
 
 export interface MainWebPreviewChannel {
@@ -64,6 +65,12 @@ function responseHeaders(upstream: http.IncomingMessage): Record<string, string 
     headers[name] = value
   }
   return headers
+}
+
+const previewCapabilities = ['synthetic-coordination-chat', 'synthetic-delegation', 'synthetic-question-answer']
+
+function previewStatusFallback(options: { releaseId: string }): PreviewChannelStatus {
+  return { enabled: true, available: false, releaseId: options.releaseId, capabilities: previewCapabilities, synthetic: true }
 }
 
 /** Authenticated, narrow reverse proxy from the stable entry to the private preview worker socket. */
@@ -158,12 +165,37 @@ export function createMainWebPreviewChannel(options: { socketPath: string; relea
     },
     status() {
       return new Promise(resolve => {
+        let settled = false
+        const finish = (status: PreviewChannelStatus) => {
+          if (settled) return
+          settled = true
+          clearTimeout(deadline)
+          resolve(status)
+        }
         const request = http.get({ socketPath: options.socketPath, path: '/healthz', agent: false, timeout: 500 }, response => {
-          response.resume()
-          response.once('end', () => resolve({ enabled: true, available: response.statusCode === 200, releaseId: options.releaseId, capabilities: ['synthetic-coordination-chat', 'synthetic-delegation', 'synthetic-question-answer'], synthetic: true }))
+          let body = ''
+          response.setEncoding('utf8')
+          response.on('data', chunk => { if (body.length < 8_192) body += chunk })
+          response.once('error', () => finish(previewStatusFallback(options)))
+          response.once('end', () => {
+            // 以 worker 实际上报的发布标识为准，入口配置只作不可用时的回退。
+            let releaseId = options.releaseId
+            let synthetic = true
+            let previewLabel: string | undefined
+            try {
+              const parsed = JSON.parse(body) as { releaseId?: unknown; synthetic?: unknown; previewLabel?: unknown }
+              if (typeof parsed.releaseId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(parsed.releaseId)) releaseId = parsed.releaseId
+              if (typeof parsed.synthetic === 'boolean') synthetic = parsed.synthetic
+              if (typeof parsed.previewLabel === 'string' && parsed.previewLabel.length <= 80 && !/[<>\u0000-\u001f]/.test(parsed.previewLabel)) previewLabel = parsed.previewLabel
+            } catch { /* 健康响应不可解析时保留回退标识 */ }
+            finish({ enabled: true, available: response.statusCode === 200, releaseId, capabilities: previewCapabilities, synthetic, previewLabel })
+          })
         })
+        // 总时限：healthz 持续流式输出会不断重置 socket 空闲超时，必须有整体 deadline。
+        const deadline = setTimeout(() => request.destroy(new Error('preview health deadline')), 1_000)
+        deadline.unref()
         request.once('timeout', () => request.destroy(new Error('preview health timeout')))
-        request.once('error', () => resolve({ enabled: true, available: false, releaseId: options.releaseId, capabilities: ['synthetic-coordination-chat', 'synthetic-delegation', 'synthetic-question-answer'], synthetic: true }))
+        request.once('error', () => finish(previewStatusFallback(options)))
       })
     },
     close() {

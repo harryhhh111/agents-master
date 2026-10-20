@@ -6,14 +6,14 @@ export interface CoordinationClient {
 }
 /** Executable configured-client adapter; tests inject a client and never probe providers. */
 export class CoordinationModel implements ScopedModel {
-  constructor(private readonly client: CoordinationClient, private readonly model: string) {}
+  constructor(private readonly client: CoordinationClient, private readonly model: string, private readonly timeoutMs = 15000) {}
   async complete(messages: readonly WireMessage[], tools: readonly ToolDefinition[], signal: AbortSignal): Promise<ModelReply> {
-    const result = await this.client.chat.completions.create({ model: this.model, messages, tools, stream: false, max_tokens: 1200, thinking: { type: 'disabled' } }, { signal, timeout: 15000, maxRetries: 0 })
+    const result = await this.client.chat.completions.create({ model: this.model, messages, tools, stream: false, max_tokens: 1200, thinking: { type: 'disabled' } }, { signal, timeout: this.timeoutMs, maxRetries: 0 })
     const message = result.choices[0]?.message
     if (!message) throw new Error('Missing model choice')
     return message
   }
 }
-export function createCoordinationModel(config: Config): ScopedModel {
-  return new CoordinationModel(createLlmClient(config) as unknown as CoordinationClient, config.llm.model)
+export function createCoordinationModel(config: Config, options?: { timeoutMs?: number }): ScopedModel {
+  return new CoordinationModel(createLlmClient(config) as unknown as CoordinationClient, config.llm.model, options?.timeoutMs ?? 15000)
 }

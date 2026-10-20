@@ -1,0 +1,21 @@
+[Unit]
+Description=Personal Agent private Web chat (immutable release)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=vinci
+Group=vinci
+WorkingDirectory=/home/vinci/.local/share/agents-master/releases/main-web/current
+Environment=HOME=/home/vinci
+Environment=PATH=/home/vinci/.nvm/versions/node/v22.22.2/bin:/usr/local/bin:/usr/bin:/bin
+Environment=DOTENV_CONFIG_PATH=/home/vinci/.config/agents-master/env
+ExecStart=/home/vinci/.nvm/versions/node/v22.22.2/bin/node /home/vinci/.local/share/agents-master/releases/main-web/current/node_modules/tsx/dist/cli.mjs scripts/main-web.ts --port 31415 --data-dir /home/vinci/.local/share/agents-master/main-chat
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

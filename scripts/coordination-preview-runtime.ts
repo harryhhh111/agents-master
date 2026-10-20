@@ -5,8 +5,9 @@ import path from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { SQLiteMainInboxStore } from '../src/main/inbox.js'
 import { initializeOwnerContext, readOwnerContext, ownerContextCheckpoint, saveOwnerContext } from '../src/main/owner-context.js'
-import { CoordinationHost } from '../src/main/coordination/model-host.js'
-import { ScopedDomainExecutor } from '../src/agent/scoped-domain.js'
+import { CoordinationHost, defaultCoordinationHostLabels, type CoordinationHostLabels } from '../src/main/coordination/model-host.js'
+import { defaultCoordinationStoreLabels, type CoordinationStoreLabels } from '../src/main/coordination/store.js'
+import { defaultDomainSystemPrompt, ScopedDomainExecutor } from '../src/agent/scoped-domain.js'
 import type { ScopedModel } from '../src/agent/scoped-protocol.js'
 import type { FakeExecutor } from '../src/main/coordination/fake.js'
 import { MainWebEventBus, json, readJson, validateMainWebMessage } from './main-web.js'
@@ -14,13 +15,31 @@ import { MainWebEventBus, json, readJson, validateMainWebMessage } from './main-
 export const previewMarkerFilename = 'PREVIEW-v2'
 export const previewMarkerContent = 'synthetic-only-v2\n'
 export type PreviewDirectoryMode = 'preview-fresh' | 'preview-open'
+/** synthetic: 合成剧本模型；real-model: 真实模型对话，执行工具仍为受限合成。仅切换文案，不动内部 id。 */
+export type PreviewWording = 'synthetic' | 'real-model'
 
-export function previewCheckpoint(ownerContext: string): string {
-  return [
-    '协调预览检查点：仅模拟/联调。可以使用受限目录、状态、delegate、answer、cancel 工具协调合成工作。含糊需求先澄清；不得声称真实项目执行，不开放 shell、文件或真实后端。',
-    ownerContextCheckpoint(ownerContext),
-  ].join('\n\n')
+export function previewCheckpoint(ownerContext: string, wording: PreviewWording = 'synthetic'): string {
+  const lead = wording === 'real-model'
+    ? '协调预览检查点：真实模型对话。可以使用受限目录、状态、delegate、answer、cancel 工具协调工作；执行工具仍为受限合成（synthetic_inspect/ask/finish），不运行真实 CLI、不读取项目文件、不开放 shell。含糊需求先澄清；不得声称真实项目执行。'
+    : '协调预览检查点：仅模拟/联调。可以使用受限目录、状态、delegate、answer、cancel 工具协调合成工作。含糊需求先澄清；不得声称真实项目执行，不开放 shell、文件或真实后端。'
+  return [lead, ownerContextCheckpoint(ownerContext)].join('\n\n')
 }
+
+const realModelHostLabels: CoordinationHostLabels = {
+  policy: '模型对话为真实，执行工具仍为受限合成，不能声称真实项目执行。仅明确工作委托使用 delegate；含糊需求用普通文本澄清，不创建任务。answer 只回答绑定待决问题，cancel 只取消指定任务。',
+  deliverPrefix: '回传：',
+  cancelNote: '取消请求已记录：',
+  recordedNote: '已记录受限操作。',
+  clarifyNote: '请补充具体需求。',
+  failedNote: '本轮未能完成，未接受新的操作。请重新说明需求。',
+}
+const realModelStoreLabels: CoordinationStoreLabels = {
+  dispatchPrefix: '委派：',
+  acceptedPrefix: '已受理：',
+  controlNote: '操作已记录：',
+  receiptPrefix: kind => ((({ waiting_input: '等待回答：', completed: '已完成：', failed: '失败：', cancelled: '已取消：', interrupted: '已中断：' }) as Record<string, string>)[kind] ?? `${kind}: `),
+}
+const realModelDomainSystemPrompt = '工作项目 Agent。模型对话为真实；工具仍为受限合成，检查合成样本，需要信息时 ask，完成时 finish。不得声称真实执行。'
 
 /** 重开已有目录:必须是通过兼容标记创建的私有目录,否则拒绝且不改动任何内容。 */
 export function openPreviewDirectory(directory: string): PreviewDirectoryMode {
@@ -46,8 +65,11 @@ export function createCoordinationRuntime(options: {
   model: ScopedModel
   domainModel?: ScopedModel
   executor?: FakeExecutor & { stop?(id: string): void }
+  wording?: PreviewWording
 }) {
   const { directory } = options
+  const wording: PreviewWording = options.wording ?? 'synthetic'
+  const synthetic = wording === 'synthetic'
   let openedStore: SQLiteMainInboxStore | undefined
   try {
     const store = new SQLiteMainInboxStore(path.join(directory, 'preview.sqlite'), { coordination: { mode: options.mode } })
@@ -57,10 +79,20 @@ export function createCoordinationRuntime(options: {
     const buses = new Map(['main', 'fake-work'].map(c => [c, new MainWebEventBus()]))
     const emitted = new Set<string>()
     for (const c of buses.keys()) for (const m of store.coordination.history(c)) emitted.add(m.id)
-    const host = new CoordinationHost(store.coordination, options.model, options.domainModel ?? options.model, options.executor ?? new ScopedDomainExecutor(options.domainModel ?? options.model), () => {
+    const hostLabels: CoordinationHostLabels = synthetic ? defaultCoordinationHostLabels : realModelHostLabels
+    store.coordination.labels = synthetic ? { ...defaultCoordinationStoreLabels } : { ...realModelStoreLabels }
+    // 真实模型单回合延迟明显高于合成模型：前台与领域回合总时限放宽到 45s，合成模式保持默认。
+    const turnTimeoutMs = synthetic ? undefined : 45_000
+    // 真实模型偶发协议瑕疵：校验失败且未执行任何工具时允许修正一次；合成模式保持立即判负。
+    const protocolCorrection = !synthetic
+    const host = new CoordinationHost(store.coordination, options.model, options.domainModel ?? options.model,
+      options.executor ?? new ScopedDomainExecutor(options.domainModel ?? options.model, synthetic
+        ? defaultDomainSystemPrompt
+        : { systemPrompt: realModelDomainSystemPrompt, turnTimeoutMs, noResultNote: '领域回合未提交结果', failureNote: '领域模型回合失败或超时；未执行真实项目', protocolCorrection }),
+      () => {
       for (const [c, bus] of buses) for (const m of store.coordination.history(c)) if (!emitted.has(m.id)) { emitted.add(m.id); bus.publish({ type: m.author === 'user' ? 'submitted' : 'reply', message: { ...m, createdAt: m.created_at } }) }
-    })
-    host.checkpoint = previewCheckpoint(readOwnerContext(directory))
+    }, hostLabels, turnTimeoutMs, protocolCorrection)
+    host.checkpoint = previewCheckpoint(readOwnerContext(directory), wording)
     host.start()
     const closeConnections = () => { for (const bus of buses.values()) bus.close() }
     return {
@@ -71,7 +103,7 @@ export function createCoordinationRuntime(options: {
       closeConnections,
       async handle(request: IncomingMessage, response: ServerResponse, authorized: () => boolean): Promise<boolean> {
         const url = new URL(request.url!, 'http://localhost'), route = url.pathname, method = request.method
-        if (route === '/api/conversations' && method === 'GET') { json(response, 200, { conversations: [{ id: 'main', pinned: true }, { id: 'fake-work', synthetic: true }] }); return true }
+        if (route === '/api/conversations' && method === 'GET') { json(response, 200, { conversations: [{ id: 'main', pinned: true }, { id: 'fake-work', synthetic }] }); return true }
         if (route === '/api/owner-context') {
           if (method === 'GET') { json(response, 200, { content: readOwnerContext(directory) }); return true }
           if (method === 'PUT') {
@@ -79,7 +111,7 @@ export function createCoordinationRuntime(options: {
               const body = await readJson(request)
               if (Object.keys(body).join() !== 'content' || typeof body.content !== 'string') throw new Error('Unexpected fields')
               saveOwnerContext(directory, body.content)
-              host.checkpoint = previewCheckpoint(readOwnerContext(directory))
+              host.checkpoint = previewCheckpoint(readOwnerContext(directory), wording)
               json(response, 200, { saved: true })
             } catch { json(response, 400, { error: '主人上下文未接受：内容为空、过大或请求无效。' }) }
             return true
@@ -91,7 +123,7 @@ export function createCoordinationRuntime(options: {
         if (!bus) { json(response, 400, { error: '未知会话。' }); return true }
         try {
           if (method === 'GET' && route === '/api/history') { const s = bus.snapshot(() => store.coordination.history(c).map(m => ({ ...m, createdAt: m.created_at }))); json(response, 200, { messages: s.value, cursor: s.cursor }); return true }
-          if (method === 'GET' && route === '/api/status') { json(response, 200, { state: host.status(c), message: host.status(c) === 'blocked' ? '模拟模型回合失败，请显式重试。' : undefined, synthetic: true, assignments: store.coordination.assignments('fake-work').map(a => ({ id: a.id, status: a.status, version: a.version })), questions: store.coordination.questions('fake-work') }); return true }
+          if (method === 'GET' && route === '/api/status') { json(response, 200, { state: host.status(c), message: host.status(c) === 'blocked' ? (synthetic ? '模拟模型回合失败，请显式重试。' : '模型回合失败，请显式重试。') : undefined, synthetic, assignments: store.coordination.assignments('fake-work').map(a => ({ id: a.id, status: a.status, version: a.version })), questions: store.coordination.questions('fake-work') }); return true }
           if (method === 'GET' && route === '/api/events') {
             response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' }); response.write(': connected\n\n')
             const raw = request.headers['last-event-id'] ?? url.searchParams.get('cursor')
@@ -109,10 +141,10 @@ export function createCoordinationRuntime(options: {
             if (route === '/api/messages') host.submit(c, body.idempotencyKey, body.content)
             else if (route === '/api/control' && (body.kind === 'answer' || body.kind === 'cancel') && typeof body.id === 'string') { store.coordination.control(c, body.idempotencyKey, body.content, body.kind, body.id); host.pump() }
             else throw new Error('Invalid action')
-            json(response, 202, { accepted: true, synthetic: true }); return true
+            json(response, 202, { accepted: true, synthetic }); return true
           }
           json(response, 405, { error: '方法不可用。' }); return true
-        } catch { json(response, 400, { error: '模拟操作未接受：参数、来源或问题状态无效。' }); return true }
+        } catch { json(response, 400, { error: synthetic ? '模拟操作未接受：参数、来源或问题状态无效。' : '操作未接受：参数、来源或问题状态无效。' }); return true }
       },
       async close() { closeConnections(); await host.close(); store.close() },
     }

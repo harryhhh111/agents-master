@@ -685,6 +685,17 @@ describe('main web', () => {
     expect(await listenMainWebServer(fake as unknown as Server, 31415)).toBe(31415)
     expect(fake.listen).toHaveBeenCalledWith(31415, '127.0.0.1')
   })
+  it('预览未启用时 /preview/ 返回带返回稳定版入口的 404 页面', async () => {
+    for (const url of ['/preview', '/preview/']) {
+      const response = await call(url)
+      expect(response.status).toBe(404)
+      expect(response.headers['content-type']).toContain('text/html')
+      expect(response.text).toContain('预览版未启用')
+      expect(response.text).toContain('返回稳定版')
+      expect(response.text).toContain('href="/"')
+      expect(response.text).not.toContain('Private reply')
+    }
+  })
   it('requires setup capability, rejects old bearer tokens, authenticates private APIs', async () => {
     for (const url of ['/api/history', '/api/owner-context', '/api/events?access_token=old', '/api/unknown']) {
       expect((await call(url, 'GET', undefined, { 'x-agents-main-web-token': 'old' })).status).toBe(401)

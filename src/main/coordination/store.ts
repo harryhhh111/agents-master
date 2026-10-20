@@ -24,6 +24,20 @@ export type AcceptedDecision = { assignmentId: string; dispatchMessageId: string
 export type FakeReceipt = { kind: 'completed' | 'failed' | 'waiting_input'; body: string }
 export type FrontTurn = { conversation: string; event: AdmittedEvent; context: readonly ScopedMessage[] }
 
+export interface CoordinationStoreLabels {
+  dispatchPrefix: string
+  acceptedPrefix: string
+  controlNote: string
+  /** 工作群回执消息前缀；按回执种类给出，便于真实模式用中文状态词。 */
+  receiptPrefix: (kind: string) => string
+}
+export const defaultCoordinationStoreLabels: CoordinationStoreLabels = {
+  dispatchPrefix: 'FAKE dispatch: ',
+  acceptedPrefix: 'FAKE accepted: ',
+  controlNote: '模拟/联调操作已记录：',
+  receiptPrefix: kind => `FAKE ${kind}: `,
+}
+
 function text(value: unknown): asserts value is string {
   if (typeof value !== 'string' || !value.trim()) throw new Error('Nonempty text required')
 }
@@ -34,6 +48,9 @@ function text(value: unknown): asserts value is string {
 export class CoordinationStore {
   constructor(private readonly db: DatabaseSync, private readonly clock: () => string,
     private readonly fault: (point: string) => void = () => {}) {}
+
+  /** 用户可见文案；与 host.checkpoint 一样由组装方按模式覆盖，默认合成标识。 */
+  labels: CoordinationStoreLabels = { ...defaultCoordinationStoreLabels }
 
   private now(): string { return iso(this.clock()) }
   private one<T>(sql: string, ...args: SQLInputValue[]): T | undefined { return this.db.prepare(sql).get(...args) as T | undefined }
@@ -61,7 +78,7 @@ export class CoordinationStore {
       const prior = this.protocol<{ binding: string }>(turn)
       if (prior) { if (prior.binding !== binding) throw new Error('Control conflict'); return }
       const result = kind === 'answer' ? this.answer(FAKE_GROUP, id, conversation, input.event.id) : this.cancel(FAKE_GROUP, id)
-      this.saveProtocol(turn, { binding, messages: [], rounds: 0, ids: [], final: '模拟/联调操作已记录：' + result.status })
+      this.saveProtocol(turn, { binding, messages: [], rounds: 0, ids: [], final: this.labels.controlNote + result.status })
     })
   }
   private conversation(id: string): void {
@@ -144,8 +161,8 @@ export class CoordinationStore {
         VALUES (?,?,?,'main',?,?,?,'{}','queued',1,1,?,?)`)
         .run(id, eventId, FAKE_GROUP, binding.project_key, binding.agent_id, normalized, context, this.now())
       this.fault('accept.assignment')
-      const dispatch = this.message(FAKE_GROUP, `FAKE dispatch: ${decision.objective}`, 'main-agent', 'dispatch', id)
-      const accepted = this.message('main', `FAKE accepted: ${decision.objective}`, 'runtime', 'receipt', id)
+      const dispatch = this.message(FAKE_GROUP, this.labels.dispatchPrefix + decision.objective, 'main-agent', 'dispatch', id)
+      const accepted = this.message('main', this.labels.acceptedPrefix + decision.objective, 'runtime', 'receipt', id)
       const result = { assignmentId: id, dispatchMessageId: dispatch.id, acceptedMessageId: accepted.id }
       this.db.prepare('UPDATE coordination_assignments SET accepted=? WHERE id=?').run(JSON.stringify(result), id)
       this.fault('accept.messages')
@@ -197,7 +214,7 @@ export class CoordinationStore {
     return this.db.prepare("UPDATE coordination_runs SET status='running' WHERE id=? AND conversation_id=? AND status='starting'").run(runId, conversation).changes === 1
   }
   private queueReceipt(a: Assignment, kind: FakeReceipt['kind'] | 'cancelled' | 'interrupted', body: string, runId: string | null): void {
-    this.message(a.conversation_id, `FAKE ${kind}: ${body}`, 'fake-work-agent', 'receipt', a.id, runId)
+    this.message(a.conversation_id, this.labels.receiptPrefix(kind) + body, 'fake-work-agent', 'receipt', a.id, runId)
     this.db.prepare(`INSERT INTO coordination_outbox (id,assignment_id,run_id,version,conversation_id,kind,body,status,created_at)
       VALUES (?,?,?,?,?,?,?,'pending',?)`).run(randomUUID(), a.id, runId, a.version, a.return_conversation, kind, body, this.now())
   }

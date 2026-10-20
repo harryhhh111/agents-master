@@ -16,7 +16,8 @@ vi.mock('node:fs', async original => {
   } }
 })
 import { createCoordinationRuntime, createFreshPreviewDirectory, previewMarkerContent, previewMarkerFilename } from '../scripts/coordination-preview-runtime.js'
-import { acquirePreviewInstanceLock, previewWorkerLockFilename, startPreviewWorker } from '../scripts/preview-worker.js'
+import { acquirePreviewInstanceLock, parsePreviewWorkerArgs, previewPreviewLabelReal, previewWorkerLockFilename, startPreviewWorker } from '../scripts/preview-worker.js'
+import { demoModel } from '../scripts/main-web-coordination-demo.js'
 
 const base = () => mkdtempSync('/tmp/preview-worker-test-')
 const socketRequest = (socketPath: string, route: string, method = 'GET', body?: unknown) => new Promise<{ status: number; body: string }>((resolve, reject) => {
@@ -44,10 +45,10 @@ const runtimeRequest = async (handle: (req: IncomingMessage, res: ServerResponse
   return response
 }
 
-const spawnWorker = (dataDirectory: string, socketPath: string) => {
-  const child = spawn(process.execPath, ['--import', 'tsx', 'scripts/preview-worker.ts', '--data-dir', dataDirectory, '--socket', socketPath], {
+const spawnWorker = (dataDirectory: string, socketPath: string, extraArgs: string[] = []) => {
+  const child = spawn(process.execPath, ['--import', 'tsx', 'scripts/preview-worker.ts', '--data-dir', dataDirectory, '--socket', socketPath, ...extraArgs], {
     cwd: process.cwd(),
-    env: { ...process.env, DOTENV_CONFIG_PATH: '/dev/null' },
+    env: { ...process.env, DEEPSEEK_API_KEY: '', DOTENV_CONFIG_PATH: '/dev/null' },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   let output = ''
@@ -159,7 +160,7 @@ it('目录边界:无标记的已有目录与符号链接目录都被拒绝,内�
   rmSync(parent, { recursive: true, force: true })
 })
 
-it('真实跨进程:重复启动与活跃 socket 接管被拒,停止或崩溃后同目录恢复历史', async () => {
+it('真实跨进程:重复启动与活跃 socket 接管被拒,停止或崩溃后同目录恢复历史', { timeout: 30_000 }, async () => {
   const parent = mkdtempSync('/dev/shm/preview-worker-process-')
   const data = path.join(parent, 'data'), socketPath = path.join(parent, 'run', 'preview.sock')
   const children: ReturnType<typeof spawnWorker>[] = []
@@ -217,4 +218,67 @@ it('demo 目录规则:兼容标记缺失的新建目录按 fresh 创建,重开�
   expect(createFreshPreviewDirectory(fresh)).toBe('preview-fresh')
   expect(readFileSync(path.join(fresh, previewMarkerFilename), 'utf8')).toBe(previewMarkerContent)
   rmSync(parent, { recursive: true, force: true })
+})
+
+it('--model 参数:缺省 demo、显式 real 接受、非法值拒绝', () => {
+  expect(parsePreviewWorkerArgs(['--data-dir', '/d', '--socket', '/s'])).toEqual({ dataDirectory: '/d', socketPath: '/s', modelMode: 'demo' })
+  expect(parsePreviewWorkerArgs(['--data-dir', '/d', '--socket', '/s', '--model', 'real']).modelMode).toBe('real')
+  expect(parsePreviewWorkerArgs(['--data-dir', '/d', '--socket', '/s', '--model', 'demo']).modelMode).toBe('demo')
+  expect(() => parsePreviewWorkerArgs(['--data-dir', '/d', '--socket', '/s', '--model', 'live'])).toThrow(/--model/)
+  expect(() => parsePreviewWorkerArgs(['--data-dir', '/d'])).toThrow(/--data-dir/)
+})
+
+it('real 模式:注入真实模型实例,healthz 与 API 标识切换,检查点声明受限工具', async () => {
+  const parent = base()
+  const worker = await startPreviewWorker({
+    dataDirectory: path.join(parent, 'data'),
+    socketPath: path.join(parent, 'run', 'preview.sock'),
+    model: { mode: 'real', realModel: demoModel(), modelName: 'test-real-model' },
+  })
+  try {
+    const health = await socketRequest(worker.socketPath, '/healthz')
+    expect(health.status).toBe(200)
+    expect(health.body).toContain('"synthetic":false')
+    expect(health.body).toContain('"model":"test-real-model"')
+    expect(health.body).toContain(previewPreviewLabelReal)
+    const conversations = await socketRequest(worker.socketPath, '/api/conversations')
+    expect(conversations.body).toContain('"synthetic":false')
+    expect(worker.runtime.host.checkpoint).toContain('真实模型对话')
+    expect(worker.runtime.host.checkpoint).toContain('受限合成')
+    const page = await socketRequest(worker.socketPath, '/preview/')
+    expect(page.body).toContain('真实模型 · 受限工具（无真实项目执行）')
+    expect(page.body).not.toContain('模拟 / 联调')
+    // 闭环不受文案切换影响：注入模型走 delegate→ask 合成流程
+    await socketRequest(worker.socketPath, '/api/messages?conversation=main', 'POST', { content: 'real wording loop', idempotencyKey: 'real-wording-1' })
+    let replied = false
+    for (let i = 0; i < 300; i += 1) {
+      const workStatus = await socketRequest(worker.socketPath, '/api/status?conversation=fake-work')
+      if (workStatus.body.includes('请选择合成样本')) { replied = true; break }
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    expect(replied).toBe(true)
+    const workHistory = await socketRequest(worker.socketPath, '/api/history?conversation=fake-work')
+    expect(workHistory.body).toContain('等待回答：')
+    expect(workHistory.body).not.toContain('FAKE waiting_input')
+    expect(workHistory.body).toContain('委派：')
+    const mainHistory = await socketRequest(worker.socketPath, '/api/history?conversation=main')
+    expect(mainHistory.body).toContain('已受理：')
+    expect(mainHistory.body).not.toContain('FAKE accepted')
+    expect(mainHistory.body).not.toContain('模拟/联调')
+  } finally {
+    await worker.close()
+    rmSync(parent, { recursive: true, force: true })
+  }
+})
+
+it('real 模式缺凭据直接启动失败,不静默降级 demo', { timeout: 30_000 }, async () => {
+  const parent = mkdtempSync('/dev/shm/preview-worker-real-')
+  const worker = spawnWorker(path.join(parent, 'data'), path.join(parent, 'run', 'preview.sock'), ['--model', 'real'])
+  try {
+    expect((await waitForExit(worker.child)).code).toBe(1)
+    expect(worker.output()).toContain('DEEPSEEK_API_KEY')
+  } finally {
+    if (worker.child.exitCode === null && worker.child.signalCode === null) worker.child.kill('SIGKILL')
+    rmSync(parent, { recursive: true, force: true })
+  }
 })

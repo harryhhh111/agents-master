@@ -1,6 +1,7 @@
-/** Extend the existing login/composer/IME/retry/scroll UI only for explicit preview. */
-export function coordinationPage(base: string): string {
-  return base
+/** Extend the existing login/composer/IME/retry/scroll UI only for explicit preview.
+ *  wording='real-model' 时把"模拟"字样替换为真实模型标识；执行工具仍为受限合成。 */
+export function coordinationPage(base: string, wording: 'synthetic' | 'real-model' = 'synthetic'): string {
+  const page = base
     .replace('<h1>主 Agent</h1>', '<h1>模拟 / 联调 · 无真实项目执行</h1>')
     .replace('<details id="settings"', '<nav><button id="conversation-main">主 Agent · 置顶</button><button id="conversation-work">工作项目群 · 模拟</button><span id="scope-label">主 Agent</span></nav><details><summary>模拟任务与待答问题</summary><div id="coordination-cards" style="max-height:25vh;overflow:auto"></div></details><details id="settings"')
     .replace("const setupStorageKey=", "let conversation='main',cardSnapshot='';const drafts=new Map();\nconst setupStorageKey=")
@@ -11,7 +12,7 @@ export function coordinationPage(base: string): string {
     .replace("role.textContent=message.role==='assistant'?'主 Agent':'你'", "role.textContent=({'user':'你','main-agent':'主 Agent','fake-work-agent':'工作项目 Agent · 模拟','runtime':'系统 · 模拟'})[message.author]||'系统'")
     .replace("if(seen.has(message.id))return;", "if(message.conversation_id!==conversation||seen.has(message.id))return;")
     .replace("const current=await request('/api/status');if(!active(generation))return;", "const current=await request('/api/status');if(!active(generation))return;renderCards(current);")
-    .replace("viewGeneration++;stopPolling();", "viewGeneration++;drafts.clear();answerDrafts.clear();answerFocus.clear();controlKeys.clear();cardSnapshot='';document.querySelector('#coordination-cards').replaceChildren();stopPolling();")
+    .replace("viewGeneration++;stopPolling();", "viewGeneration++;drafts.clear();answerDrafts.clear();answerFocus.clear();controlKeys.clear();uncertainControls.clear();rejectedControls.clear();cardSnapshot='';document.querySelector('#coordination-cards').replaceChildren();stopPolling();")
     .replace('initialize();\n</script>', `
 function switchConversation(next){
   if(next===conversation)return;
@@ -25,11 +26,34 @@ function switchConversation(next){
 document.querySelector('#conversation-main').onclick=()=>switchConversation('main');
 document.querySelector('#conversation-work').onclick=()=>switchConversation('fake-work');
 ${coordinationCardsScript}
-const controlKeys=new Map();
-async function control(kind,id,content,button){if(!content.trim())return;const generation=viewGeneration;const signature=JSON.stringify([conversation,kind,id,content]);if(!controlKeys.has(signature))controlKeys.set(signature,crypto.randomUUID());button.disabled=true;
-try{await request('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind,id,content,idempotencyKey:controlKeys.get(signature)})});if(active(generation)){const state=await request('/api/status');if(active(generation))renderCards(state)}}catch(e){if(active(generation))error.textContent=e.message}finally{if(active(generation))button.disabled=false}}
+const controlKeys=new Map();let pendingControls=0;const uncertainControls=new Set();const rejectedControls=new Map();
+// 切换守卫扩展钩子（稳定版页面不存在这两个函数，基础守卫用 typeof 探测）：
+// 待确认的控制提交硬阻止切换；回答草稿、其他会话草稿与未确认/被拒控制提交纳入“丢弃未提交内容”确认。
+function extraSwitchBlock(){return pendingControls>0?'提交尚未确认，请完成或超时后再切换。':undefined}
+function extraSwitchDirty(){if(uncertainControls.size||rejectedControls.size)return true;for(const text of answerDrafts.values()){if(text.trim())return true}for(const draft of drafts.values()){if(draft.text.trim()||draft.failed.length)return true}return false}
+// 控制提交超时/5xx 后保持“接收状态未知”提示；被明确拒绝时保留原因。两者都不被轮询清空。
+function extraErrorText(){
+  if(uncertainControls.size)return '有提交尚未确认是否送达：可再次点击重试，相同提交不会重复执行。'
+  const rejected=rejectedControls.values().next().value
+  return rejected?'提交未被接受：'+rejected:''
+}
+async function control(kind,id,content,button){if(!content.trim())return;const generation=viewGeneration;const signature=JSON.stringify([conversation,kind,id,content]);if(!controlKeys.has(signature))controlKeys.set(signature,crypto.randomUUID());button.disabled=true;pendingControls++;
+try{await request('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind,id,content,idempotencyKey:controlKeys.get(signature)})});if(active(generation)){uncertainControls.delete(signature);rejectedControls.delete(signature);const state=await request('/api/status');if(active(generation))renderCards(state)}}
+catch(e){if(active(generation)){if(!e.status||e.status>=500)uncertainControls.add(signature);else rejectedControls.set(signature,e.message||'请求被拒绝。');renderState()}}
+finally{pendingControls--;if(active(generation)){button.disabled=false;renderState()}}}
 initialize();
 </script>`)
+  if (wording === 'synthetic') return page
+  return page
+    .replace('模拟 / 联调 · 无真实项目执行', '真实模型 · 受限工具（无真实项目执行）')
+    .replace('工作项目群 · 模拟', '工作项目群')
+    .replace('工作项目 Agent · 模拟', '工作项目 Agent')
+    .replace('系统 · 模拟', '系统')
+    .replace('模拟任务与待答问题', '任务与待答问题')
+    .replaceAll('模拟任务 ', '任务 ')
+    .replaceAll('模拟问题 · ', '问题 · ')
+    .replace('回答模拟问题', '回答问题')
+    .replace('请求取消模拟任务', '请求取消任务')
 }
 
 /** Shared by generated UI and DOM regression fixtures; contains no private data. */

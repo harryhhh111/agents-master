@@ -1,21 +1,35 @@
 import { boundedRounds, deadline, pairedToolResult, strictArgs, validateCalls, ScopedProtocolError, type ModelReply, type ScopedModel, type ToolCall, type WireMessage, tool } from './scoped-protocol.js'
 export const safeFailedTurn = '模拟/联调：本轮未能完成，未接受新的操作。请重新说明需求。'
-export type ScopedState = { messages: WireMessage[]; rounds: number; ids: string[]; pending?: ModelReply; final?: string; failure?: { kind: 'protocol' | 'provider'; reason: string } }
+export type ScopedTurnTexts = { recorded: string; clarify: string; failed: string }
+export const defaultScopedTurnTexts: ScopedTurnTexts = {
+  recorded: '模拟/联调：已记录受限操作。',
+  clarify: '模拟/联调：请补充具体需求。',
+  failed: safeFailedTurn,
+}
+export type ScopedState = { messages: WireMessage[]; rounds: number; ids: string[]; pending?: ModelReply; final?: string; failure?: { kind: 'protocol' | 'provider'; reason: string }
+  /** 本回合已用的协议修正次数与每次被拒的原始输出；持久化以保证重启后不重复给修正机会、不丢证据。 */
+  corrections?: number; rejected?: ModelReply[] }
 export type ScopedTool = { fields: Record<string, 'text' | 'texts'>; execute(args: Record<string, unknown>): unknown; terminal?: boolean }
+/** 模型可见的修正反馈；协议校验失败发生在任何工具执行之前，给一次修正机会不等于重放操作。 */
+export const scopedCorrectionPrompt = '上一次输出未通过协议校验，未执行任何操作。请严格按工具定义修正后重新输出。原因：'
 /** Bounded scoped runner sharing only AgentCore's iteration/pairing primitives.
  * This is not a persisted adaptation of the full legacy AgentCore loop.
  * No legacy default tool context exists. */
 export async function scopedTurn(options: {
   model: ScopedModel; initial: WireMessage[]; tools: Record<string, ScopedTool>; signal?: AbortSignal; timeoutMs?: number;
+  texts?: Partial<ScopedTurnTexts>;
+  /** 真实模型模式：输出校验失败且本回合尚未执行任何工具时，允许模型修正一次。 */
+  protocolCorrection?: boolean;
   load(): ScopedState | undefined; save(state: ScopedState): void;
   commit(work: () => ScopedState): ScopedState;
 }): Promise<string> {
+  const texts: ScopedTurnTexts = { ...defaultScopedTurnTexts, ...options.texts }
   return deadline(async signal => {
     let state = options.load() ?? { messages: options.initial, rounds: 0, ids: [] }
     options.save(state)
     if (state.final) return state.final
     const reject = (reason: string): never => {
-      state = { ...state, failure: { kind: 'protocol', reason }, final: safeFailedTurn }
+      state = { ...state, failure: { kind: 'protocol', reason }, final: texts.failed }
       options.save(state)
       throw new ScopedProtocolError(reason)
     }
@@ -40,10 +54,21 @@ export async function scopedTurn(options: {
         if (reply.content !== null && (typeof reply.content !== 'string' || reply.content.length > 12000)) throw new Error('Invalid model content')
         parsed = calls.map(c => strictArgs(c, options.tools[c.function.name]!.fields))
         if (calls.filter(c => options.tools[c.function.name]!.terminal).length > 1) throw new Error('Multiple terminal actions forbidden')
-      } catch (error) { reject(error instanceof Error ? error.message : 'Invalid protocol') }
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : 'Invalid protocol'
+        // 校验失败发生在执行之前；仅当本回合尚未执行任何工具时给一次修正机会。
+        // 修正次数与被拒原始输出都写入持久状态：重启后不得再次获得修正机会，证据不丢。
+        if (options.protocolCorrection && (state.corrections ?? 0) === 0 && state.ids.length === 0) {
+          state = { ...state, pending: undefined, corrections: 1, rejected: [...(state.rejected ?? []), reply!],
+            messages: [...state.messages, { role: 'user' as const, content: scopedCorrectionPrompt + reason }] }
+          options.save(state)
+          continue
+        }
+        reject(reason)
+      }
       // A terminal action ends this foreground turn; no subsequent model poll.
       try { state = options.commit(() => {
-        const next: ScopedState = { messages: [...state.messages, { role: 'assistant', content: reply!.content, ...(calls.length ? { tool_calls: calls } : {}) }], rounds: state.rounds, ids: [...state.ids] }
+        const next: ScopedState = { messages: [...state.messages, { role: 'assistant', content: reply!.content, ...(calls.length ? { tool_calls: calls } : {}) }], rounds: state.rounds, ids: [...state.ids], ...(state.corrections !== undefined ? { corrections: state.corrections } : {}), ...(state.rejected !== undefined ? { rejected: state.rejected } : {}) }
         let terminal: unknown
         calls.forEach((c: ToolCall, i) => {
           const result = options.tools[c.function.name]!.execute(parsed[i]!)
@@ -51,8 +76,8 @@ export async function scopedTurn(options: {
           next.ids.push(c.id)
           if (options.tools[c.function.name]!.terminal) terminal = result
         })
-        if (terminal !== undefined) next.final = '模拟/联调：已记录受限操作。' + JSON.stringify(terminal)
-        else if (!calls.length) next.final = reply.content?.trim() || '模拟/联调：请补充具体需求。'
+        if (terminal !== undefined) next.final = texts.recorded + JSON.stringify(terminal)
+        else if (!calls.length) next.final = reply.content?.trim() || texts.clarify
         return next
       }) } catch { reject('Tool action rejected; transaction rolled back') }
       if (state.final) return state.final
