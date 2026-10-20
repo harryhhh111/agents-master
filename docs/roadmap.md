@@ -224,7 +224,9 @@ Chromium 登录切换与实际 assistant 回复均通过。尚有工作群 FAKE 
 新增 `protocolCorrection`（默认关，real 模式开）——校验失败且本回合未执行任何工具时允许
 模型修正一次，已执行工具后的坏输出仍立即判负，新增 4 组定向测试。复核第二轮定点遗漏
 （修正次数未持久化、被拒输出被覆盖）已修：两者并入 `ScopedState` 持久化并含重启恢复测试。
-收尾后 typecheck、359/359 全量测试与真实 DeepSeek 委派闭环复验通过。仍未 commit、未部署。
+收尾后 typecheck、359/359 全量测试与真实 DeepSeek 委派闭环复验通过。**2026-10-20 已上线**：
+commit `ab42e00`，双通道 release `web-real-20261020-ab42e00` 同步部署（先 worker 后入口），
+worker healthz 上报 `synthetic:false`/`deepseek-flash`，稳定页与预览页均展示真实模型标识。
 Codex 收尾复核：独立 typecheck、359/359 通过，接受原三项处置；协议修正的计数仍为局部
 变量，故障注入复现重启后同一回合获得两次修正，且被拒原始输出未保留。
 三轮总预算与禁止重复执行仍有效；只需将计数和被拒输出保存到现有回合状态并补恢复验证，
