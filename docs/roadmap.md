@@ -235,7 +235,7 @@ worker healthz 上报 `synthetic:false`/`deepseek-flash`，稳定页与预览页
 本次以运行服务、current、release.json 和 worker healthz 的一致结果为准。
 本机 HTTPS 探测仍有 TLS 握手失败，不能据本地 HTTP 正常宣称用户侧访问已验证。
 
-### 切片 2（降门槛版）：预览真实 CLI 执行（2026-10-21 第三轮返工完成，待复核）
+### 切片 2（降门槛版）：预览真实 CLI 执行（2026-10-21 已上线）
 
 用户明确把隔离门槛降为四条：项目白名单（config.projects）、非破坏默认（workspace-write /
 默认权限，禁 push 与越界删除）、全程留痕、预算与超时（单次 CLI 10 分钟、可取消）。
@@ -265,7 +265,11 @@ Codex 第四轮独立 typecheck + 380/380 全绿，上轮四个复现均通过�
 confirmExit 提前判整组已退出，实测返回 stopped 后子进程仍写文件。
 当日第五轮定点返工：handle 新增 groupAlive 进程组探针，父进程落定后继续确认整组清空、
 残留则补 SIGKILL 整组，仍无法确认则按未确认保持占用。typecheck + 382/382 全绿，
-新增父退子存与组无法清空两个用例。**未 commit、未部署**，待第五轮复核。
+新增父退子存与组无法清空两个用例。**已上线（2026-10-21）**：commit `8c1b546`，双通道
+release `web-cli-20261021-8c1b546`（main-web + preview-worker 同步）。线上验证：healthz
+`execution:"cli"`、v2→v3 迁移自动完成（0600 备份）、未登录预览页 real-cli 文案、
+真实委派「sandbox 创建 SLICE2-LIVE.md」跑通（产物内容核实为 `live deploy ok`，工作群回执
+「委派：/已完成：」）。遗留：线上预览库有一条迁移前的合成 waiting_input 任务，属预期保留。
 
 ### Runtime 接线约束
 
