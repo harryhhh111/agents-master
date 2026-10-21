@@ -8,7 +8,7 @@ import { coordinationPage } from '../src/main/coordination/web-page.js'
 import type { ScopedModel } from '../src/agent/scoped-protocol.js'
 import type { FakeExecutor } from '../src/main/coordination/fake.js'
 import { createCoordinationRuntime, createFreshPreviewDirectory, openPreviewDirectory, previewCheckpoint } from './coordination-preview-runtime.js'
-import { createMainWebServer, handleMainWebRequest, type MainWebServerOptions, mainWebPage, MainWebEventBus, listenMainWebServer } from './main-web.js'
+import { createMainWebServer, handleMainWebRequest, type MainWebServerOptions, MainWebEventBus, listenMainWebServer } from './main-web.js'
 
 export { previewCheckpoint } from './coordination-preview-runtime.js'
 
@@ -19,7 +19,7 @@ export function createCoordinationPreview(options: { model: ScopedModel; domainM
   const mode = options.reopen ? openPreviewDirectory(directory) : createFreshPreviewDirectory(directory)
   const runtime = createCoordinationRuntime({ directory, mode, model: options.model, domainModel: options.domainModel, executor: options.executor })
   const auth = new MainWebAuth(directory), events = new MainWebEventBus()
-  const serverOptions: MainWebServerOptions = { preview: { page: coordinationPage(mainWebPage), close: runtime.closeConnections, handle: runtime.handle }, auth, events, dataDirectory: directory, readHistory: () => [], host: {
+  const serverOptions: MainWebServerOptions = { preview: { page: coordinationPage(), close: runtime.closeConnections, handle: runtime.handle }, auth, events, dataDirectory: directory, readHistory: () => [], host: {
     start: () => 0, submit: () => { throw new Error('Scoped route required') }, recover: () => 0, getStatus: () => runtime.host.status('main'),
     // The shared owner PUT already saved the file. Ignore its legacy no-tools
     // composition and rebuild this preview's capabilities from durable text.

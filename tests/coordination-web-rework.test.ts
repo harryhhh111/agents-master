@@ -126,28 +126,51 @@ it('background interrupted run is unknown after reopen, never replayed; previous
   } finally {await app.close();rmSync(dir,{recursive:true})}
 })
 
-it('answer DOM nodes, drafts and focus survive unchanged/changed polls and conversation switches',()=>{
+it('cards anchor into the message flow, orphaned unfinished cards pin to the todo area, and answer drafts/focus survive polls and switches',()=>{
   let active: Element | undefined
   class Element {
-    children:Element[]=[];dataset:Record<string,string>={};value='';textContent='';parent?:Element;selectionStart=0;selectionEnd=0;oninput?:()=>void
-    append(...nodes:Element[]){for(const n of nodes){n.parent=this;this.children.push(n)}}
-    replaceChildren(){this.children=[];active=undefined}
-    remove(){if(this.parent)this.parent.children=this.parent.children.filter(n=>n!==this);if(active===this)active=undefined}
-    focus(){active=this} setSelectionRange(a:number,b:number){this.selectionStart=a;this.selectionEnd=b} setAttribute(){}
+    children:Element[]=[];dataset:Record<string,string>={};value='';textContent='';parentNode?:Element;selectionStart=0;selectionEnd=0;oninput?:()=>void;onclick?:()=>void
+    className='';hidden=false;disabled=false;style:Record<string,string>={};title='';status='';field?:Element;button?:Element;bodyEl?:Element;metaEl?:Element;titleEl?:Element
+    append(...nodes:Element[]){for(const n of nodes){n.remove();n.parentNode=this;this.children.push(n)}}
+    replaceChildren(){for(const n of this.children)n.parentNode=undefined;this.children=[];if(active&&this.contains(active))active=undefined}
+    contains(n:Element):boolean{return this.children.includes(n)||this.children.some(c=>c.contains(n))}
+    remove(){if(this.parentNode)this.parentNode.children=this.parentNode.children.filter(n=>n!==this);this.parentNode=undefined;if(active===this)active=undefined}
+    focus(){active=this} setSelectionRange(a:number,b:number){this.selectionStart=a;this.selectionEnd=b} setAttribute(){} scrollIntoView(){}
   }
-  const root=new Element(),document={get activeElement(){return active},createElement:()=>new Element(),querySelector:()=>root}
+  const flow=new Element(),todo=new Element(),jump=new Element()
+  const document={get activeElement(){return active},createElement:()=>new Element(),querySelector:(sel:string)=>({'#messages':flow,'#todo-area':todo,'#todo-jump':jump}[sel])}
   const context=createContext({document,control:()=>{}})
-  runInContext("let conversation='main',cardSnapshot='';"+coordinationCardsScript,context)
-  const render=(status='running')=>runInContext(`renderCards({assignments:[{id:'a',status:'${status}'}],questions:[{id:'q',body:'question',status:'pending'}]})`,context)
-  render();let field=root.children[1]!.children[1]!
+  runInContext("let conversation='fake-work';"+coordinationCardsScript,context)
+  const render=(status='running')=>runInContext(`renderCards({assignments:[{id:'a',status:'${status}'}],questions:[{id:'q',assignment_id:'a',run_id:'r1',body:'question',status:'pending'}]})`,context)
+  // No anchor messages loaded yet: both unfinished cards pin to the todo area.
+  render()
+  expect(todo.children).toHaveLength(2);expect(todo.hidden).toBe(false)
+  expect(runInContext("cardNodes.get('a:a').titleEl.textContent",context)).toBe('模拟任务 a')
+  expect(jump.textContent).toBe('待办 2');expect(jump.hidden).toBe(false)
+  let field=runInContext("cardNodes.get('q:q').field",context) as Element
   field.value='正在输入的回答';field.oninput!();field.focus();field.setSelectionRange(2,4)
-  render();render();expect(root.children[1]!.children[1]).toBe(field)
+  render();render();expect(runInContext("cardNodes.get('q:q').field",context)).toBe(field)
   render('waiting_input');expect(active).toBe(field);expect(field.value).toBe('正在输入的回答');expect(field.selectionStart).toBe(2)
-  runInContext("rememberAnswerFocus();conversation='fake-work';cardSnapshot='';document.querySelector('#coordination-cards').replaceChildren()",context);render()
-  expect(root.children[1]!.children[1]!.value).toBe('')
-  runInContext("conversation='main';cardSnapshot='';document.querySelector('#coordination-cards').replaceChildren()",context);render()
-  field=root.children[1]!.children[1]!
+  // Anchors arrive later (SSE/history): cards move into the flow next to their trigger messages.
+  runInContext(`(()=>{const flow=document.querySelector('#messages');
+    const dispatch=document.createElement('div');dispatch.dataset.presentation='dispatch';dispatch.dataset.assignmentId='a';dispatch.dataset.objective='样本 A';flow.append(dispatch);
+    const receipt=document.createElement('div');receipt.dataset.presentation='receipt';receipt.dataset.assignmentId='a';receipt.dataset.runId='r1';flow.append(receipt);
+    placeCards()})()`,context)
+  expect(todo.children).toHaveLength(0);expect(todo.hidden).toBe(true)
+  expect(flow.children[0]!.children.map(c=>c.dataset.cardKey)).toEqual(['a:a'])
+  expect(flow.children[1]!.children.map(c=>c.dataset.cardKey)).toEqual(['q:q'])
+  render('queued');expect(runInContext("cardNodes.get('a:a').titleEl.textContent",context)).toBe('模拟任务 样本 A')
+  // Conversation switch clears the view; returning restores card, draft and focus.
+  runInContext("rememberAnswerFocus();conversation='main';renderCards({})",context)
+  expect(runInContext('cardNodes.size',context)).toBe(0);expect(todo.children).toHaveLength(0);expect(flow.children[0]!.children).toHaveLength(0)
+  runInContext("conversation='fake-work'",context);render('waiting_input')
+  field=runInContext("cardNodes.get('q:q').field",context) as Element
   expect(field.value).toBe('正在输入的回答');expect(active).toBe(field);expect(field.selectionStart).toBe(2)
+  expect(flow.children[1]!.children.map(c=>c.dataset.cardKey)).toEqual(['q:q'])
+  // Answered question leaves the todo accounting and drops its draft.
+  runInContext("renderCards({assignments:[{id:'a',status:'completed'}],questions:[{id:'q',assignment_id:'a',run_id:'r1',body:'question',status:'answered'}]})",context)
+  expect(runInContext("cardNodes.get('q:q').field",context)).toBe(null)
+  expect(jump.textContent).toBe('待办 0');expect(jump.hidden).toBe(true)
 })
 
 it('accepted tool survives reply-commit failure; explicit retry never changes decision or repeats model',async()=>{

@@ -331,13 +331,12 @@ export async function handleMainWebRequest(
     if (!options.auth.authorized(session)) {
       // 直达预览的登录页也展示 worker 实际发布标识；status() 有总时限，worker 不可用时回退配置值。
       const previewStatus = await options.previewChannel.status()
-      return html(response, coordinationPage(createMainWebPage({
-        channel: 'preview',
+      return html(response, coordinationPage({
         businessApiBase: '/preview/api',
         releaseId: previewStatus.releaseId,
-        previewEnabled: true,
         previewLabel: previewStatus.previewLabel,
-      }), previewStatus.synthetic ? 'synthetic' : previewStatus.execution === 'cli' ? 'real-cli' : 'real-model'))
+        stableLink: true,
+      }, previewStatus.synthetic ? 'synthetic' : previewStatus.execution === 'cli' ? 'real-cli' : 'real-model'))
     }
     if (await options.previewChannel.handle(request, response, () => options.auth.authorized(session))) return
   }

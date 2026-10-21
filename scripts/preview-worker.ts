@@ -11,7 +11,7 @@ import { createCoordinationRuntime, createFreshPreviewDirectory, openPreviewDire
 import type { CliBackendFactory } from '../src/agent/cli-domain-executor.js'
 import { demoModel } from './main-web-coordination-demo.js'
 import { coordinationPage } from '../src/main/coordination/web-page.js'
-import { coordinationPreviewReleaseId, createMainWebPage, json, readPackagedReleaseId } from './main-web.js'
+import { coordinationPreviewReleaseId, json, readPackagedReleaseId } from './main-web.js'
 import type { ScopedModel } from '../src/agent/scoped-protocol.js'
 
 export const previewWorkerLockFilename = '.preview-worker.lock.sqlite'
@@ -120,13 +120,12 @@ export async function startPreviewWorker(options: { dataDirectory: string; socke
     chmodSync(socketDir, 0o700)
     const releaseId = readPackagedReleaseId(process.cwd(), coordinationPreviewReleaseId)
     const previewLabel = previewLabelFor(execution, modelOption.mode)
-    const page = coordinationPage(createMainWebPage({
-      channel: 'preview',
+    const page = coordinationPage({
       businessApiBase: '/preview/api',
       releaseId,
-      previewEnabled: true,
       previewLabel,
-    }), execution === 'cli' ? 'real-cli' : wording)
+      stableLink: true,
+    }, execution === 'cli' ? 'real-cli' : wording)
     const server = http.createServer((request, response) => {
       if (request.url === '/healthz') {
         if (request.method !== 'GET') json(response, 405, { error: '方法不可用。' })

@@ -101,6 +101,6 @@ it('one fair foreground queue serializes main and @main-in-group while backgroun
 it('browser smoke uses locator assertions without expression eval or CSP changes',()=>{
   const smoke=readFileSync(new URL('../scripts/smoke-coordination-web.ts',import.meta.url),'utf8')
   expect(smoke).not.toContain('wait_for_function(')
-  expect(smoke).toContain("expect(page.locator('#coordination-cards')).to_contain_text('completed'")
+  expect(smoke).toContain("expect(page.locator('.task-card').first).to_contain_text('已完成'")
   expect(smoke).toContain("expect(page.locator('#messages')).to_contain_text('模拟/联调回传'")
 })
