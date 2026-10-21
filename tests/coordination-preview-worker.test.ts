@@ -1,8 +1,9 @@
 import { it, expect, vi } from 'vitest'
 import { spawn } from 'node:child_process'
 import http from 'node:http'
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { Readable } from 'node:stream'
 import { EventEmitter } from 'node:events'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -15,7 +16,8 @@ vi.mock('node:fs', async original => {
     return fs.lstatSync(...args)
   } }
 })
-import { createCoordinationRuntime, createFreshPreviewDirectory, previewMarkerContent, previewMarkerFilename } from '../scripts/coordination-preview-runtime.js'
+import { createCoordinationRuntime, createFreshPreviewDirectory, legacyPreviewMarkerContentV2, previewMarkerContent, previewMarkerFilename } from '../scripts/coordination-preview-runtime.js'
+import { createV2PreviewSchemaForMigrationTest } from '../src/main/schema.js'
 import { acquirePreviewInstanceLock, parsePreviewWorkerArgs, previewPreviewLabelReal, previewWorkerLockFilename, startPreviewWorker } from '../scripts/preview-worker.js'
 import { demoModel } from '../scripts/main-web-coordination-demo.js'
 
@@ -221,9 +223,11 @@ it('demo 目录规则:兼容标记缺失的新建目录按 fresh 创建,重开�
 })
 
 it('--model 参数:缺省 demo、显式 real 接受、非法值拒绝', () => {
-  expect(parsePreviewWorkerArgs(['--data-dir', '/d', '--socket', '/s'])).toEqual({ dataDirectory: '/d', socketPath: '/s', modelMode: 'demo' })
+  expect(parsePreviewWorkerArgs(['--data-dir', '/d', '--socket', '/s'])).toEqual({ dataDirectory: '/d', socketPath: '/s', modelMode: 'demo', execution: 'synthetic' })
   expect(parsePreviewWorkerArgs(['--data-dir', '/d', '--socket', '/s', '--model', 'real']).modelMode).toBe('real')
   expect(parsePreviewWorkerArgs(['--data-dir', '/d', '--socket', '/s', '--model', 'demo']).modelMode).toBe('demo')
+  expect(parsePreviewWorkerArgs(['--data-dir', '/d', '--socket', '/s', '--model', 'real', '--executor', 'cli']).execution).toBe('cli')
+  expect(() => parsePreviewWorkerArgs(['--data-dir', '/d', '--socket', '/s', '--executor', 'cli'])).toThrow(/--model real/)
   expect(() => parsePreviewWorkerArgs(['--data-dir', '/d', '--socket', '/s', '--model', 'live'])).toThrow(/--model/)
   expect(() => parsePreviewWorkerArgs(['--data-dir', '/d'])).toThrow(/--data-dir/)
 })
@@ -281,4 +285,32 @@ it('real 模式缺凭据直接启动失败,不静默降级 demo', { timeout: 30_
     if (worker.child.exitCode === null && worker.child.signalCode === null) worker.child.kill('SIGKILL')
     rmSync(parent, { recursive: true, force: true })
   }
+})
+
+it('v2 目录自动备份迁移到 v3：标记重写、历史保留、之后正常重开', async () => {
+  const parent = base()
+  const directory = path.join(parent, 'data')
+  mkdirSync(directory, { mode: 0o700 })
+  writeFileSync(path.join(directory, previewMarkerFilename), legacyPreviewMarkerContentV2, { mode: 0o600 })
+  const fixtureDb = new DatabaseSync(path.join(directory, 'preview.sqlite'))
+  fixtureDb.function('coordination_writer', () => 1)
+  createV2PreviewSchemaForMigrationTest(fixtureDb)
+  fixtureDb.prepare(`INSERT INTO main_conversation_messages (id,role,content,created_at,append_order,conversation_id,author,presentation)
+    VALUES ('m-v2','user','v2 时代的历史','2026-10-20T00:00:00.000Z',1,'main','user','input')`).run()
+  fixtureDb.close()
+
+  const worker = await startPreviewWorker({ dataDirectory: directory, socketPath: path.join(parent, 'run', 'preview.sock') })
+  try {
+    expect(readFileSync(path.join(directory, previewMarkerFilename), 'utf8')).toBe(previewMarkerContent)
+    expect((await socketRequest(worker.socketPath, '/api/history?conversation=main')).body).toContain('v2 时代的历史')
+    const backups = readdirSync(directory).filter(f => f.startsWith('preview-backup-v2to3-'))
+    expect(backups).toHaveLength(1)
+    expect((lstatSync(path.join(directory, backups[0]!)).mode & 0o777)).toBe(0o600)
+  } finally {
+    await worker.close()
+  }
+  // 迁移后重开走 preview-open 路径
+  const reopened = await startPreviewWorker({ dataDirectory: directory, socketPath: path.join(parent, 'run2', 'preview.sock') })
+  await reopened.close()
+  rmSync(parent, { recursive: true, force: true })
 })

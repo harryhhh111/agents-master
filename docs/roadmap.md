@@ -1,6 +1,6 @@
 # agents-master 路线图
 
-> 最近更新：2026-10-20。
+> 最近更新：2026-10-21。
 >
 > 本项目已从“驱动两个 Coding CLI 的传话工具”演进为用户自定义的通用个人 Agent。旧能力不是
 > 被废弃，而是成为第一个持久子 Agent——“工作项目 Agent”的可复用执行能力；它不再定义整个
@@ -210,7 +210,7 @@ N1–N7、M1–M3 全部关闭。四轮复验上轮两个符号链接误放行�
 真实问答与委派→待答→回答→completed 闭环（curl）通过；真实 Chromium 验证标识透传、
 登录切换与真实非罐头回复通过（以上为实现者报告）；浏览器版完整闭环曾出现严格协议判负，
 不能仅以模型随机性排除接入问题，重试策略见下方复核建议。证据见 `.agent-artifacts/`。
-**未 commit、未部署**：service 模板已切换 real + 凭据文件，现网仍为合成 worker。
+以上为首次复核时的实现状态；已于 2026-10-21 完成双通道部署，当前状态见本节末尾。
 
 Codex 独立复核补充：typecheck、358/358、真实模型闲聊不委派及委派→追问→回答→completed、
 Chromium 登录切换与实际 assistant 回复均通过。尚有工作群 FAKE 回执文案遗漏和原浏览器
@@ -224,13 +224,48 @@ Chromium 登录切换与实际 assistant 回复均通过。尚有工作群 FAKE 
 新增 `protocolCorrection`（默认关，real 模式开）——校验失败且本回合未执行任何工具时允许
 模型修正一次，已执行工具后的坏输出仍立即判负，新增 4 组定向测试。复核第二轮定点遗漏
 （修正次数未持久化、被拒输出被覆盖）已修：两者并入 `ScopedState` 持久化并含重启恢复测试。
-收尾后 typecheck、359/359 全量测试与真实 DeepSeek 委派闭环复验通过。**2026-10-20 已上线**：
+收尾后 typecheck、359/359 全量测试与真实 DeepSeek 委派闭环复验通过。**2026-10-21 已上线**：
 commit `ab42e00`，双通道 release `web-real-20261020-ab42e00` 同步部署（先 worker 后入口），
 worker healthz 上报 `synthetic:false`/`deepseek-flash`，稳定页与预览页均展示真实模型标识。
-Codex 收尾复核：独立 typecheck、359/359 通过，接受原三项处置；协议修正的计数仍为局部
-变量，故障注入复现重启后同一回合获得两次修正，且被拒原始输出未保留。
-三轮总预算与禁止重复执行仍有效；只需将计数和被拒输出保存到现有回合状态并补恢复验证，
-详见上述复核记录末节。
+2026-10-21 Codex 现网核实：worker 于北京时间 00:14:09、入口于 00:14:30 启动，
+均 active/running；两通道 current 与 release.json 均为上述版本，两个页面返回 200 且带
+真实模型标识。协议修正次数及被拒输出已随 ScopedState 保存，提交后仍保留；
+相关 14 项离线测试独立通过，线上对应源码与工作树一致，上次两个遗漏关闭。
+尚未接入真实 CLI、项目文件读取或修改能力。旧 deployment-last.json 仍记前次发布，
+本次以运行服务、current、release.json 和 worker healthz 的一致结果为准。
+本机 HTTPS 探测仍有 TLS 握手失败，不能据本地 HTTP 正常宣称用户侧访问已验证。
+
+### 切片 2（降门槛版）：预览真实 CLI 执行（2026-10-21 第三轮返工完成，待复核）
+
+用户明确把隔离门槛降为四条：项目白名单（config.projects）、非破坏默认（workspace-write /
+默认权限，禁 push 与越界删除）、全程留痕、预算与超时（单次 CLI 10 分钟、可取消）。
+已实现 `--executor cli`：delegate_cli 工具（白名单校验纵深两道）、CliDomainExecutor
+两段式（runDetached → 模型判读）、schema v2→v3 迁移（executor='CLI'，自动备份）、
+envExclude（并修正 execa 10 `extendEnv` 语义导致的环境泄漏）、commit 拒绝的有界修正、
+工具描述注入允许取值。typecheck + 372/372 全绿；真实端到端：委派 sandbox 创建文件，
+CLI 实际执行 27.5s，产物核实，浏览器标识与卡片通过。证据见 `.agent-artifacts/`。
+Codex 独立复核（[切片 2 独立复核](handoff-analysis/cli-slice2-review-2026-10-21.md)）
+发现 3 项 P1 + 2 项 P2，当日定点返工完毕：
+
+- 迁移：重建 runs 表期间临时关闭外键（含 run/question/receipt/outbox 引用链的 v2 库可迁移）。
+- 回答：问答与被回答 run 的既有回执绑进续作 context，CLI prompt 与判读摘要均带续作上下文，
+  不再丢弃回答、不用相同 prompt 盲重放。
+- 取消：abort/超时后等待进程确认退出（宽限 + SIGKILL 升级），确认前不释放同项目占用。
+- 留痕：backend/pid/sessionId/产物路径启动即绑定 run.context，退出信息随 receipt/取消持久化。
+- 部署口径更正：须 main-web 与 preview-worker **双通道同步**更新（新 capability 解析在稳定入口）。
+
+返工后 typecheck + 378/378 全绿（新增迁移引用链、回答传递、真实子进程取消确认等 6 项测试）。
+**未 commit、未部署**。Codex 第二轮复核确认迁移、回答传递、正常留痕与双通道口径通过，
+又发现四个分支问题；当日第四轮定点返工完毕：取消未确认退出保持项目占用（run 不终结，
+重启由 recover 恢复）、取消信号覆盖整个进程组（CLI 派生的工作子进程不再残留）、
+判读失败出口保留完整执行留痕（判读前补绑 sessionId/退出码）、续作 priorResult 按
+模型可见白名单筛选（stderr 路径不透出，存储仍留完整记录）。
+Codex 第四轮独立 typecheck + 380/380 全绿，上轮四个复现均通过。
+仅余取消的一个分支：父进程先正常退出、普通子进程忽略 SIGTERM 时，
+confirmExit 提前判整组已退出，实测返回 stopped 后子进程仍写文件。
+当日第五轮定点返工：handle 新增 groupAlive 进程组探针，父进程落定后继续确认整组清空、
+残留则补 SIGKILL 整组，仍无法确认则按未确认保持占用。typecheck + 382/382 全绿，
+新增父退子存与组无法清空两个用例。**未 commit、未部署**，待第五轮复核。
 
 ### Runtime 接线约束
 

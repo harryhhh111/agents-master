@@ -78,6 +78,7 @@ export class KimiBackend implements AgentBackend {
       args,
       cwd: options.cwd,
       env: options.env,
+      envExclude: options.envExclude,
       timeoutMs: options.timeoutMs,
     }
   }
@@ -110,6 +111,7 @@ export class KimiBackend implements AgentBackend {
       artifactStderrPath,
       done: handle.done.then(result => this.toResult(result)),
       cancel: signal => handle.cancel(signal),
+      groupAlive: () => handle.groupAlive(),
     }
   }
 }

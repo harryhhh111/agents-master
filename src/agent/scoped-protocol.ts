@@ -44,6 +44,6 @@ export function strictArgs(call: ToolCall, fields: Record<string, 'text' | 'text
   }
   return args
 }
-export function tool(name: string, fields: Record<string, 'text' | 'texts'>): ToolDefinition {
-  return { type: 'function', function: { name, description: 'Simulation only: ' + name, parameters: { type: 'object', additionalProperties: false, required: Object.keys(fields), properties: Object.fromEntries(Object.entries(fields).map(([key, type]) => [key, type === 'text' ? { type: 'string', maxLength: 4000 } : { type: 'array', items: { type: 'string' }, maxItems: 10 }])) } } }
+export function tool(name: string, fields: Record<string, 'text' | 'texts'>, description?: string): ToolDefinition {
+  return { type: 'function', function: { name, description: description ?? name, parameters: { type: 'object', additionalProperties: false, required: Object.keys(fields), properties: Object.fromEntries(Object.entries(fields).map(([key, type]) => [key, type === 'text' ? { type: 'string', maxLength: 4000 } : { type: 'array', items: { type: 'string' }, maxItems: 10 }])) } } }
 }

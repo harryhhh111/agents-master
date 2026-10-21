@@ -35,7 +35,7 @@ export class CoordinationHost {
   constructor(readonly store: CoordinationStore, private readonly mainModel: ScopedModel, private readonly domainModel: ScopedModel,
     private readonly executor: FakeExecutor & { stop?(id: string): void }, private readonly changed: () => void = () => {},
     private readonly labels: CoordinationHostLabels = defaultCoordinationHostLabels, private readonly turnTimeoutMs?: number,
-    private readonly protocolCorrection = false) {
+    private readonly protocolCorrection = false, private readonly cliProjects?: readonly string[]) {
     this.background = new FakeBackgroundScheduler(store, executor, changed)
   }
   start(): void {
@@ -57,6 +57,12 @@ export class CoordinationHost {
       directory: { fields: {}, execute: () => ({ conversation: FAKE_GROUP, project: 'FAKE-project', scope: 'synthetic' }) },
       status: { fields: {}, execute: () => ({ assignments: this.store.assignments(FAKE_GROUP).map(a => ({ id: a.id, status: a.status })), questions: this.store.questions(FAKE_GROUP) }) },
       delegate: { fields: { objective: 'text', completionCriteria: 'texts' }, terminal: true, execute: a => this.store.accept(turn.conversation, turn.event.id, { action: 'fake-check', objective: String(a.objective), scope: ['synthetic'], completionCriteria: a.completionCriteria as string[] }) },
+      // 真实 CLI 委派仅在组装方注入白名单时存在；store 侧再校验一次（纵深防御）。
+      ...(this.cliProjects ? {
+        delegate_cli: { fields: { project: 'text', backend: 'text', objective: 'text', completionCriteria: 'texts' }, terminal: true,
+          description: `真实 CLI 委派。project 仅限白名单：${this.cliProjects.join('、')}；backend 仅限：${this.store.allowedBackends.join('、')}。`,
+          execute: (a: Record<string, unknown>) => this.store.accept(turn.conversation, turn.event.id, { action: 'cli-task', objective: String(a.objective), scope: ['project'], project: String(a.project), backend: String(a.backend), completionCriteria: a.completionCriteria as string[] }) },
+      } : {}),
       answer: { fields: { questionId: 'text' }, terminal: true, execute: a => this.store.answer(FAKE_GROUP, String(a.questionId), turn.conversation, turn.event.id) },
       cancel: { fields: { assignmentId: 'text' }, terminal: true, execute: a => this.store.cancel(FAKE_GROUP, String(a.assignmentId)) },
     }
@@ -74,7 +80,7 @@ export class CoordinationHost {
       this.busy.add(c); this.changed()
       const main = addressedMain(c, turn.context.at(-1)?.content ?? '')
       author = main ? 'main-agent' : 'fake-work-agent'
-      const policy = this.labels.policy
+      const policy = this.labels.policy + (this.cliProjects?.length ? `\ndelegate_cli 的 project 仅限白名单：${this.cliProjects.join('、')}；backend 仅限：${this.store.allowedBackends.join('、')}。` : '')
       const initial: WireMessage[] = [{ role: 'system', content: (main ? (c === 'main' ? this.checkpoint : '群内主 Agent，仅使用本群上下文。') : '工作项目 Agent，仅使用本群上下文；可通过受限协调工具委派合成工作。') + '\n' + policy }, ...turn.context.map(m => ({ role: m.role, content: JSON.stringify({ author: m.author, text: m.content }) }))]
       const current = turn
       const reply = await scopedTurn({ model: main ? this.mainModel : this.domainModel, initial, tools: this.tools(turn), signal: controller.signal, timeoutMs: this.turnTimeoutMs,

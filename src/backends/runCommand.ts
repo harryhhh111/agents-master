@@ -101,6 +101,8 @@ export interface CommandOptions {
   args?: string[]
   cwd: string
   env?: Record<string, string>
+  /** 合并进程环境后要删除的键（最小权限：不向子进程透传无关凭据）。 */
+  envExclude?: string[]
   timeoutMs?: number
   input?: string
   artifactStdoutPath?: string
@@ -137,6 +139,8 @@ export interface DetachedCommandHandle {
    */
   done: Promise<CommandResult>
   cancel(signal?: NodeJS.Signals | number): void
+  /** 进程组（含 CLI 派生的工作子进程）是否仍有存活成员；detached 组长=pid。 */
+  groupAlive(): boolean
 }
 
 /** detach 模式未指定 artifact 路径时的默认落点：cwd 下的 .agent-artifacts/。 */
@@ -157,8 +161,10 @@ export function defaultArtifactPaths(
 }
 
 // process.env 的值类型含 undefined；execa 的 env 选项接受 undefined（表示删除该变量）。
-function mergedEnv(env?: Record<string, string>): Record<string, string | undefined> {
-  return env ? { ...process.env, ...env } : { ...process.env }
+function mergedEnv(env?: Record<string, string>, envExclude?: string[]): Record<string, string | undefined> {
+  const merged = env ? { ...process.env, ...env } : { ...process.env }
+  for (const key of envExclude ?? []) delete merged[key]
+  return merged
 }
 
 export async function runCommand(options: CommandOptions): Promise<CommandResult> {
@@ -168,6 +174,7 @@ export async function runCommand(options: CommandOptions): Promise<CommandResult
     args = [],
     cwd,
     env,
+    envExclude,
     timeoutMs,
     input,
     artifactStdoutPath,
@@ -182,10 +189,11 @@ export async function runCommand(options: CommandOptions): Promise<CommandResult
 
   const result = await execa(cmd, args, {
     cwd,
-    env: mergedEnv(env),
+    env: mergedEnv(env, envExclude),
     input,
     timeout: timeoutMs,
     reject: false,
+    extendEnv: false,
   })
 
   if (result.timedOut) {
@@ -220,6 +228,7 @@ export function spawnDetachedCommand(options: CommandOptions): DetachedCommandHa
     args = [],
     cwd,
     env,
+    envExclude,
     timeoutMs,
     input,
     artifactStdoutPath,
@@ -241,11 +250,14 @@ export function spawnDetachedCommand(options: CommandOptions): DetachedCommandHa
 
   const subprocess = execa(cmd, args, {
     cwd,
-    env: mergedEnv(env),
+    env: mergedEnv(env, envExclude),
     input,
     timeout: timeoutMs,
     reject: false,
+    extendEnv: false,
     buffer: false,
+    // detached：子进程自立进程组（组长=自身 pid），取消才能信号整组、覆盖 CLI 派生的工作子进程。
+    detached: true,
   })
 
   const stderrStream = fs.createWriteStream(artifactStderrPath, { flags: 'a', mode: 0o600 })
@@ -319,7 +331,21 @@ export function spawnDetachedCommand(options: CommandOptions): DetachedCommandHa
     artifactStderrPath,
     done,
     cancel: (signal = 'SIGTERM') => {
-      subprocess.kill(signal)
+      // 优先信号整个进程组（detached 组长=pid），覆盖 CLI 再派生的工作子进程；
+      // 组已消亡或平台不支持负 pid 时回退直接子进程。
+      try {
+        process.kill(-subprocess.pid!, signal)
+      } catch {
+        try { subprocess.kill(signal) } catch { /* 进程已退出 */ }
+      }
+    },
+    groupAlive: () => {
+      try {
+        process.kill(-subprocess.pid!, 0)
+        return true
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'EPERM'
+      }
     },
   }
 }

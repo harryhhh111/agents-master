@@ -4,6 +4,7 @@ import { DatabaseSync } from 'node:sqlite'
 export type CoordinationSchemaOptions =
   | { mode: 'preview-fresh' }
   | { mode: 'preview-open' }
+  | { mode: 'preview-migrate'; backupPath: string }
   | { mode: 'fresh' }
   | { mode: 'open' }
   | { mode: 'migrate'; syntheticSingleMain: true; backupPath: string; fault?: () => void }
@@ -86,8 +87,9 @@ function validateLegacy(db: DatabaseSync): void {
 }
 
 function schemaFingerprint(db: DatabaseSync): string {
+  // 标识符的可选双引号（如 ALTER RENAME 后 sqlite_master 保存的形式）不影响 schema 等价性。
   return JSON.stringify(db.prepare("SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all()
-    .map(row => ({ type: row.type, name: row.name, sql: String(row.sql).replace(/\s+/g, '').toLowerCase() })))
+    .map(row => ({ type: row.type, name: row.name, sql: String(row.sql).replace(/"/g, '').replace(/\s+/g, '').toLowerCase() })))
 }
 
 /** Refuse unknown DDL/constraints/indexes/triggers, not merely unknown columns. */
@@ -106,7 +108,7 @@ export function iso(value: string): string {
   return value
 }
 
-function upgrade(db: DatabaseSync): void {
+function upgrade(db: DatabaseSync, executorCheck = `CHECK(executor IN ('FAKE','CLI'))`): void {
   db.exec(`
     CREATE TABLE coordination_conversations (
       id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('main','domain')),
@@ -132,7 +134,7 @@ function upgrade(db: DatabaseSync): void {
     CREATE TABLE coordination_runs (
       seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, assignment_id TEXT NOT NULL REFERENCES coordination_assignments(id),
       conversation_id TEXT NOT NULL REFERENCES coordination_conversations(id), project_key TEXT NOT NULL,
-      version INTEGER NOT NULL, input_version INTEGER NOT NULL, executor TEXT NOT NULL CHECK(executor='FAKE'), context TEXT NOT NULL,
+      version INTEGER NOT NULL, input_version INTEGER NOT NULL, executor TEXT NOT NULL ${executorCheck}, context TEXT NOT NULL,
       status TEXT NOT NULL CHECK(status IN ('starting','running','succeeded','failed','cancel_requested','cancelled','unknown')),
       started_at TEXT NOT NULL, ended_at TEXT, result TEXT
     ) STRICT;
@@ -187,11 +189,59 @@ function upgrade(db: DatabaseSync): void {
   }
 }
 
-function previewSchema(db: DatabaseSync): void {
+function previewSchema(db: DatabaseSync, userVersion = 3): void {
   db.exec(`CREATE TABLE coordination_protocol (
     event_id TEXT PRIMARY KEY REFERENCES inbox_events(id), conversation_id TEXT NOT NULL REFERENCES coordination_conversations(id),
     state TEXT NOT NULL
-  ) STRICT; PRAGMA user_version=2;`)
+  ) STRICT; PRAGMA user_version=${userVersion};`)
+}
+
+/** 仅供迁移测试构造 v2 夹具：与线上 v2 预览库同形（旧 executor CHECK + user_version=2）。 */
+export function createV2PreviewSchemaForMigrationTest(db: DatabaseSync): void {
+  legacySchema(db)
+  upgrade(db, `CHECK(executor='FAKE')`)
+  previewSchema(db, 2)
+}
+
+/** v2→v3：重建 coordination_runs 以放宽 executor CHECK（'FAKE' → 'FAKE'|'CLI'）。
+ *  先用旧 DDL 指纹校验来路，VACUUM INTO 备份后再重建；调用方负责停写。 */
+function migratePreviewV2toV3(db: DatabaseSync, backupPath: string): void {
+  const expected = new DatabaseSync(':memory:')
+  try {
+    legacySchema(expected)
+    upgrade(expected, `CHECK(executor='FAKE')`)
+    previewSchema(expected, 2)
+    if (schemaFingerprint(db) !== schemaFingerprint(expected)) throw new Error('Unknown or incomplete v2 preview schema')
+  } finally { expected.close() }
+  if (db.prepare('PRAGMA integrity_check').get()?.integrity_check !== 'ok' || db.prepare('PRAGMA foreign_key_check').all().length) throw new Error('Preview integrity failure')
+  db.exec('PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;')
+  db.prepare('VACUUM INTO ?').run(backupPath)
+  chmodSync(backupPath, 0o600)
+  // questions/receipts/outbox 引用 runs：node:sqlite 默认开启外键，重建父表期间
+  // 必须临时关闭（PRAGMA 在事务内无效，须在 BEGIN 前设置），提交后恢复并复核引用。
+  db.exec('PRAGMA foreign_keys=OFF')
+  try {
+    transaction(db, () => {
+      db.exec(`
+        CREATE TABLE coordination_runs_v3 (
+          seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, assignment_id TEXT NOT NULL REFERENCES coordination_assignments(id),
+          conversation_id TEXT NOT NULL REFERENCES coordination_conversations(id), project_key TEXT NOT NULL,
+          version INTEGER NOT NULL, input_version INTEGER NOT NULL, executor TEXT NOT NULL CHECK(executor IN ('FAKE','CLI')), context TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('starting','running','succeeded','failed','cancel_requested','cancelled','unknown')),
+          started_at TEXT NOT NULL, ended_at TEXT, result TEXT
+        ) STRICT;
+        INSERT INTO coordination_runs_v3 SELECT * FROM coordination_runs;
+        DROP TABLE coordination_runs;
+        ALTER TABLE coordination_runs_v3 RENAME TO coordination_runs;
+        CREATE UNIQUE INDEX coordination_one_active_project ON coordination_runs(project_key)
+          WHERE status IN ('starting','running','cancel_requested');
+        PRAGMA user_version=3;
+      `)
+    })
+  } finally {
+    db.exec('PRAGMA foreign_keys=ON')
+  }
+  if (db.prepare('PRAGMA foreign_key_check').all().length) throw new Error('Preview migration broke foreign keys')
 }
 
 export function initializeMainSchema(db: DatabaseSync, options?: CoordinationSchemaOptions): boolean {
@@ -201,8 +251,15 @@ export function initializeMainSchema(db: DatabaseSync, options?: CoordinationSch
     transaction(db, () => { legacySchema(db); upgrade(db); previewSchema(db) })
     return true
   }
-  if (version === 2 || options?.mode === 'preview-open') {
-    if (version !== 2 || options?.mode !== 'preview-open') throw new Error('Explicit preview-open required for version 2')
+  if (options?.mode === 'preview-migrate') {
+    if (version !== 2) throw new Error('Preview migration requires schema version 2')
+    migratePreviewV2toV3(db, options.backupPath)
+    validateKnownSchema(db, true, true)
+    return true
+  }
+  if (version === 2 && options?.mode === 'preview-open') throw new Error('Preview v2 requires explicit migration (backup first)')
+  if (version === 3 || options?.mode === 'preview-open') {
+    if (version !== 3 || options?.mode !== 'preview-open') throw new Error('Explicit preview-open required for version 3')
     validateKnownSchema(db, true, true)
     if (db.prepare('PRAGMA integrity_check').get()?.integrity_check !== 'ok' || db.prepare('PRAGMA foreign_key_check').all().length) throw new Error('Preview integrity failure')
     return true

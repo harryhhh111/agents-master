@@ -14,14 +14,21 @@ export type Assignment = {
 }
 export type Run = {
   id: string; assignment_id: string; conversation_id: string; project_key: string; version: number;
-  input_version: number; context: string; status: string; executor: 'FAKE'; result: string | null
+  input_version: number; context: string; status: string; executor: 'FAKE' | 'CLI'; result: string | null
 }
 export type Question = { id: string; assignment_id: string; run_id: string; version: number; body: string; status: string; answer_event: string | null; answer: string | null; answer_result: string | null }
 export type Outbox = { id: string; assignment_id: string; run_id: string | null; version: number; conversation_id: string; kind: string; body: string; status: string; message_id: string | null }
 export type AdmittedEvent = { id: string; conversation_id: string; user_message_id: string; status: string; payload: string }
 export type FakeDecision = { action: 'fake-check'; objective: string; scope: ['synthetic']; completionCriteria: string[] }
+export type CliDecision = { action: 'cli-task'; objective: string; scope: ['project']; project: string; backend?: string; completionCriteria: string[] }
+export type CoordinationDecision = FakeDecision | CliDecision
 export type AcceptedDecision = { assignmentId: string; dispatchMessageId: string; acceptedMessageId: string }
-export type FakeReceipt = { kind: 'completed' | 'failed' | 'waiting_input'; body: string }
+export type FakeReceipt = { kind: 'completed' | 'failed' | 'waiting_input'; body: string; execution?: CliExecutionRecord }
+/** CLI 真实执行留痕：随 receipt 持久化进 run.result / receipts payload。stderr 路径仅供内部诊断，不进模型输入。 */
+export type CliExecutionRecord = {
+  backend: string; pid: number; sessionId: string | null; exitCode: number; durationMs: number;
+  artifactStdoutPath: string; artifactStderrPath: string; cancelConfirmed?: boolean
+}
 export type FrontTurn = { conversation: string; event: AdmittedEvent; context: readonly ScopedMessage[] }
 
 export interface CoordinationStoreLabels {
@@ -51,6 +58,10 @@ export class CoordinationStore {
 
   /** 用户可见文案；与 host.checkpoint 一样由组装方按模式覆盖，默认合成标识。 */
   labels: CoordinationStoreLabels = { ...defaultCoordinationStoreLabels }
+  /** cli-task 的项目白名单（null 或空 = 拒绝一切真实 CLI 任务）。由组装方从 config.projects 注入。 */
+  allowedProjects: string[] | null = null
+  /** cli-task 允许的 backend 名单。 */
+  allowedBackends: string[] = ['kimi', 'codex', 'claude']
 
   private now(): string { return iso(this.clock()) }
   private one<T>(sql: string, ...args: SQLInputValue[]): T | undefined { return this.db.prepare(sql).get(...args) as T | undefined }
@@ -136,13 +147,19 @@ export class CoordinationStore {
     if (!event || !message) throw new Error('Trusted admitted source required')
     return { event, message }
   }
-  accept(sourceConversation: string, eventId: string, decision: FakeDecision): AcceptedDecision {
+  accept(sourceConversation: string, eventId: string, decision: CoordinationDecision): AcceptedDecision {
     // A tiny host allowlist, not natural-language routing or proof of intent.
-    if (decision.action !== 'fake-check' || JSON.stringify(decision.scope) !== '["synthetic"]'
-      || !Array.isArray(decision.completionCriteria) || !decision.completionCriteria.length
-      || Object.keys(decision).sort().join(',') !== 'action,completionCriteria,objective,scope') throw new Error('Only synthetic fake-check is allowed')
+    const keys = Object.keys(decision).sort().join(',')
+    if (decision.action === 'fake-check') {
+      if (JSON.stringify(decision.scope) !== '["synthetic"]' || keys !== 'action,completionCriteria,objective,scope') throw new Error('Only synthetic fake-check is allowed')
+    } else if (decision.action === 'cli-task') {
+      if (JSON.stringify(decision.scope) !== '["project"]' || (keys !== 'action,completionCriteria,objective,project,scope' && keys !== 'action,backend,completionCriteria,objective,project,scope')) throw new Error('Invalid cli-task decision shape')
+      if (!this.allowedProjects?.includes(decision.project)) throw new Error('Project not in whitelist')
+      if (decision.backend !== undefined && !this.allowedBackends.includes(decision.backend)) throw new Error('Backend not allowed')
+    } else throw new Error('Only synthetic fake-check is allowed')
+    if (!Array.isArray(decision.completionCriteria) || !decision.completionCriteria.length) throw new Error('completionCriteria required')
     text(decision.objective); decision.completionCriteria.forEach(text)
-    const normalized = JSON.stringify({ action: decision.action, objective: decision.objective, scope: decision.scope, completionCriteria: decision.completionCriteria })
+    const normalized = JSON.stringify(decision)
     return this.tx(() => {
       const { event } = this.source(sourceConversation, eventId)
       const prior = this.one<Assignment>('SELECT * FROM coordination_assignments WHERE source_event=?', eventId)
@@ -154,12 +171,14 @@ export class CoordinationStore {
       const binding = this.one<{ agent_id: string; project_key: string; background: string }>('SELECT * FROM coordination_conversations WHERE id=?', FAKE_GROUP)!
       const id = randomUUID()
       // Freeze only group history + explicitly bound synthetic background.
+      // cli-task 的 project_key 是真实白名单项目名，唯一索引保证同项目串行。
+      const projectKey = decision.action === 'cli-task' ? decision.project : binding.project_key
       const messages = this.history(FAKE_GROUP)
       const context = JSON.stringify({ anchor: messages.at(-1)?.id ?? null, inputVersion: 1, background: binding.background, messages, decision })
       this.db.prepare(`INSERT INTO coordination_assignments
         (id,source_event,conversation_id,return_conversation,project_key,agent_id,decision,accepted,status,version,input_version,context,created_at)
         VALUES (?,?,?,'main',?,?,?,'{}','queued',1,1,?,?)`)
-        .run(id, eventId, FAKE_GROUP, binding.project_key, binding.agent_id, normalized, context, this.now())
+        .run(id, eventId, FAKE_GROUP, projectKey, binding.agent_id, normalized, context, this.now())
       this.fault('accept.assignment')
       const dispatch = this.message(FAKE_GROUP, this.labels.dispatchPrefix + decision.objective, 'main-agent', 'dispatch', id)
       const accepted = this.message('main', this.labels.acceptedPrefix + decision.objective, 'runtime', 'receipt', id)
@@ -203,9 +222,10 @@ export class CoordinationStore {
         ORDER BY a.seq LIMIT 1`, conversation)
       if (!a) return undefined
       const id = randomUUID()
+      const executor = (JSON.parse(a.decision) as CoordinationDecision).action === 'cli-task' ? 'CLI' : 'FAKE'
       this.db.prepare("UPDATE coordination_assignments SET status='running' WHERE id=?").run(a.id)
       this.db.prepare(`INSERT INTO coordination_runs (id,assignment_id,conversation_id,project_key,version,input_version,executor,context,status,started_at)
-        VALUES (?,?,?,?,?,?,'FAKE',?,'starting',?)`).run(id, a.id, conversation, a.project_key, a.version, a.input_version, a.context, this.now())
+        VALUES (?,?,?,?,?,?,?,?,'starting',?)`).run(id, a.id, conversation, a.project_key, a.version, a.input_version, executor, a.context, this.now())
       this.fault('claim.run')
       return this.run(conversation, id)
     })
@@ -218,10 +238,16 @@ export class CoordinationStore {
     this.db.prepare(`INSERT INTO coordination_outbox (id,assignment_id,run_id,version,conversation_id,kind,body,status,created_at)
       VALUES (?,?,?,?,?,?,?,'pending',?)`).run(randomUUID(), a.id, runId, a.version, a.return_conversation, kind, body, this.now())
   }
+  /** 执行启动即把 backend/pid/产物路径绑定到运行记录（结束时 receipt 再补退出信息）；终态 run 不再改写。 */
+  bindExecution(conversation: string, runId: string, execution: Record<string, unknown>): void {
+    this.db.prepare(`UPDATE coordination_runs SET context=json_set(context,'$.execution',json(?))
+      WHERE id=? AND conversation_id=? AND status IN ('starting','running','cancel_requested')`)
+      .run(JSON.stringify(execution), runId, conversation)
+  }
   receipt(conversation: string, runId: string, receipt: FakeReceipt): { accepted: boolean } {
     if (!['completed','failed','waiting_input'].includes(receipt.kind)) throw new Error('Invalid fake receipt')
     text(receipt.body)
-    const payload = JSON.stringify({ kind: receipt.kind, body: receipt.body })
+    const payload = JSON.stringify({ kind: receipt.kind, body: receipt.body, ...(receipt.execution ? { execution: receipt.execution } : {}) })
     return this.tx(() => {
       const run = this.run(conversation, runId)
       const prior = this.one<{ payload: string; accepted: number }>('SELECT * FROM coordination_receipts WHERE run_id=?', runId)
@@ -255,9 +281,12 @@ export class CoordinationStore {
       this.db.prepare("UPDATE coordination_questions SET status='answered',answer_event=?,answer=? WHERE id=?").run(sourceEvent, message.content, q.id)
       // Keep the original frozen checkpoint and durable question/run evidence;
       // a resume adds only the bound answer, never newly arrived history.
+      // 绑定被回答 run 的既有结果摘要，续作执行器据此“在已有进展上继续”，而非盲重放原目标。
+      const priorRun = this.one<Run>('SELECT * FROM coordination_runs WHERE id=?', q.run_id)
+      const priorResult = priorRun?.result ? JSON.parse(priorRun.result) as unknown : null
       const context = JSON.parse(a.context) as Record<string, unknown>
       const answers = Array.isArray(context.answers) ? context.answers : []
-      const next = JSON.stringify({ ...context, inputVersion: a.input_version + 1, answers: [...answers, { questionId, runId: q.run_id, question: q.body, sourceEvent, answer: message.content }] })
+      const next = JSON.stringify({ ...context, inputVersion: a.input_version + 1, answers: [...answers, { questionId, runId: q.run_id, question: q.body, sourceEvent, answer: message.content, priorResult }] })
       this.db.prepare("UPDATE coordination_assignments SET status='queued',version=version+1,input_version=input_version+1,context=? WHERE id=?").run(next, a.id)
       const result = JSON.parse(JSON.stringify(this.assignment(conversation, a.id))) as Assignment
       this.db.prepare('UPDATE coordination_questions SET answer_result=? WHERE id=?').run(JSON.stringify(result), q.id)
@@ -277,15 +306,30 @@ export class CoordinationStore {
       return this.assignment(conversation, a.id)
     })
   }
-  confirmStopped(conversation: string, runId: string): void {
+  confirmStopped(conversation: string, runId: string, execution?: CliExecutionRecord): void {
     this.tx(() => {
       const run = this.run(conversation, runId)
       if (run.status === 'cancelled') return
       const a = this.assignment(conversation, run.assignment_id)
       if (run.status !== 'cancel_requested' || a.status !== 'cancel_requested') throw new Error('No pending stop request')
-      this.db.prepare("UPDATE coordination_runs SET status='cancelled',ended_at=? WHERE id=?").run(this.now(), runId)
+      this.db.prepare("UPDATE coordination_runs SET status='cancelled',ended_at=?,result=COALESCE(?,result) WHERE id=?")
+        .run(this.now(), execution ? JSON.stringify({ kind: 'cancelled', execution }) : null, runId)
       this.db.prepare("UPDATE coordination_assignments SET status='cancelled' WHERE id=?").run(a.id)
       this.queueReceipt(a, 'cancelled', 'FAKE executor explicitly confirmed stopped', runId)
+    })
+  }
+  /**
+   * 取消/超时后进程退出未确认：run 保持原活跃状态（唯一索引继续占用该项目，防止与残留执行并发），
+   * assignment 失败并告知用户。worker 重启时 recover() 按既有路径把滞留 run 恢复为 unknown/interrupted。
+   */
+  holdUncertainExit(conversation: string, runId: string, execution: CliExecutionRecord, body: string): void {
+    this.tx(() => {
+      const run = this.run(conversation, runId)
+      if (!['starting', 'running', 'cancel_requested'].includes(run.status)) return // 已终态（重复回调/重启恢复后）
+      const a = this.assignment(conversation, run.assignment_id)
+      this.db.prepare('UPDATE coordination_runs SET result=? WHERE id=?').run(JSON.stringify({ kind: 'uncertain-exit', execution }), runId)
+      this.db.prepare("UPDATE coordination_assignments SET status='failed',version=version+1 WHERE id=?").run(a.id)
+      this.queueReceipt(this.assignment(conversation, a.id), 'failed', body, runId)
     })
   }
   /** Offline restart reconciliation. Never invoke while a live worker owns this scope. */

@@ -10,7 +10,7 @@ Group=vinci
 WorkingDirectory=/home/vinci/.local/share/agents-master/releases/preview-worker/current
 # 强制最小环境允许列表：env -i 只保留下列变量，不继承任何启动前已有环境。
 # DOTENV_CONFIG_PATH 指向 0600 凭据文件（仅 DEEPSEEK_API_KEY 等模型凭据），不写入本文件明文。
-ExecStart=/usr/bin/env -i HOME=/home/vinci PATH=/home/vinci/.nvm/versions/node/v22.22.2/bin:/usr/local/bin:/usr/bin:/bin DOTENV_CONFIG_PATH=/home/vinci/.config/agents-master/env /home/vinci/.nvm/versions/node/v22.22.2/bin/node /home/vinci/.local/share/agents-master/releases/preview-worker/current/node_modules/tsx/dist/cli.mjs scripts/preview-worker.ts --data-dir /home/vinci/.local/share/agents-master/main-chat-preview --socket /home/vinci/.local/share/agents-master/run/preview.sock --model real
+ExecStart=/usr/bin/env -i HOME=/home/vinci PATH=/home/vinci/.nvm/versions/node/v22.22.2/bin:/home/vinci/.local/bin:/home/vinci/.kimi-code/bin:/usr/local/bin:/usr/bin:/bin DOTENV_CONFIG_PATH=/home/vinci/.config/agents-master/env /home/vinci/.nvm/versions/node/v22.22.2/bin/node /home/vinci/.local/share/agents-master/releases/preview-worker/current/node_modules/tsx/dist/cli.mjs scripts/preview-worker.ts --data-dir /home/vinci/.local/share/agents-master/main-chat-preview --socket /home/vinci/.local/share/agents-master/run/preview.sock --model real --executor cli
 Restart=always
 RestartSec=5
 TimeoutStopSec=60

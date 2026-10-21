@@ -1,6 +1,6 @@
 /** Extend the existing login/composer/IME/retry/scroll UI only for explicit preview.
- *  wording='real-model' 时把"模拟"字样替换为真实模型标识；执行工具仍为受限合成。 */
-export function coordinationPage(base: string, wording: 'synthetic' | 'real-model' = 'synthetic'): string {
+ *  wording='real-model'/'real-cli' 时把"模拟"字样替换为真实能力标识；real-cli 再加真实执行说明。 */
+export function coordinationPage(base: string, wording: 'synthetic' | 'real-model' | 'real-cli' = 'synthetic'): string {
   const page = base
     .replace('<h1>主 Agent</h1>', '<h1>模拟 / 联调 · 无真实项目执行</h1>')
     .replace('<details id="settings"', '<nav><button id="conversation-main">主 Agent · 置顶</button><button id="conversation-work">工作项目群 · 模拟</button><span id="scope-label">主 Agent</span></nav><details><summary>模拟任务与待答问题</summary><div id="coordination-cards" style="max-height:25vh;overflow:auto"></div></details><details id="settings"')
@@ -44,7 +44,7 @@ finally{pendingControls--;if(active(generation)){button.disabled=false;renderSta
 initialize();
 </script>`)
   if (wording === 'synthetic') return page
-  return page
+  const real = page
     .replace('模拟 / 联调 · 无真实项目执行', '真实模型 · 受限工具（无真实项目执行）')
     .replace('工作项目群 · 模拟', '工作项目群')
     .replace('工作项目 Agent · 模拟', '工作项目 Agent')
@@ -54,6 +54,8 @@ initialize();
     .replaceAll('模拟问题 · ', '问题 · ')
     .replace('回答模拟问题', '回答问题')
     .replace('请求取消模拟任务', '请求取消任务')
+  if (wording === 'real-model') return real
+  return real.replace('真实模型 · 受限工具（无真实项目执行）', '真实模型 · 真实执行（限白名单项目）')
 }
 
 /** Shared by generated UI and DOM regression fixtures; contains no private data. */

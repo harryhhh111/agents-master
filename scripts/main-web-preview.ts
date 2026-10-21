@@ -18,6 +18,7 @@ export interface PreviewChannelStatus {
   releaseId: string
   capabilities: string[]
   synthetic: boolean
+  execution?: string
   previewLabel?: string
 }
 
@@ -182,13 +183,17 @@ export function createMainWebPreviewChannel(options: { socketPath: string; relea
             let releaseId = options.releaseId
             let synthetic = true
             let previewLabel: string | undefined
+            let execution: string | undefined
             try {
-              const parsed = JSON.parse(body) as { releaseId?: unknown; synthetic?: unknown; previewLabel?: unknown }
+              const parsed = JSON.parse(body) as { releaseId?: unknown; synthetic?: unknown; previewLabel?: unknown; execution?: unknown }
               if (typeof parsed.releaseId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(parsed.releaseId)) releaseId = parsed.releaseId
               if (typeof parsed.synthetic === 'boolean') synthetic = parsed.synthetic
               if (typeof parsed.previewLabel === 'string' && parsed.previewLabel.length <= 80 && !/[<>\u0000-\u001f]/.test(parsed.previewLabel)) previewLabel = parsed.previewLabel
+              if (parsed.execution === 'synthetic' || parsed.execution === 'cli') execution = parsed.execution
             } catch { /* 健康响应不可解析时保留回退标识 */ }
-            finish({ enabled: true, available: response.statusCode === 200, releaseId, capabilities: previewCapabilities, synthetic, previewLabel })
+            finish({ enabled: true, available: response.statusCode === 200, releaseId,
+              capabilities: execution === 'cli' ? [...previewCapabilities, 'cli-execution'] : previewCapabilities,
+              synthetic, execution, previewLabel })
           })
         })
         // 总时限：healthz 持续流式输出会不断重置 socket 空闲超时，必须有整体 deadline。

@@ -176,6 +176,10 @@ it('release service 模板固定到 release current,不依赖可变 Git 工作�
   // 真实模型模式：凭据只经 DOTENV_CONFIG_PATH 私有文件供给，缺省 demo 才用 /dev/null。
   expect(worker).toContain('--model real')
   expect(worker).toContain('DOTENV_CONFIG_PATH=/home/vinci/.config/agents-master/env')
+  // 真实 CLI 执行：白名单项目委派由 worker 内 executor 完成，PATH 需含三个 CLI 的 bin 目录。
+  expect(worker).toContain('--executor cli')
+  expect(worker).toContain('/home/vinci/.local/bin')
+  expect(worker).toContain('/home/vinci/.kimi-code/bin')
   expect(worker).toContain('/usr/bin/env -i HOME=/home/vinci PATH=')
   expect(worker).not.toContain('\nEnvironment=')
   expect(worker).not.toContain('--port')

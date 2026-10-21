@@ -1,8 +1,8 @@
-import { CoordinationStore, type FakeReceipt, type Run, type ScopedMessage } from './store.js'
+import { CoordinationStore, type CliExecutionRecord, type FakeReceipt, type Run, type ScopedMessage } from './store.js'
 
 export interface FakeExecutor {
-  readonly identity: 'FAKE'
-  execute(run: Readonly<Run>): Promise<FakeReceipt | { kind: 'stopped' }>
+  readonly identity: 'FAKE' | 'CLI'
+  execute(run: Readonly<Run>): Promise<FakeReceipt | { kind: 'stopped'; execution?: CliExecutionRecord }>
 }
 
 /** Only explicit test/demo controls finish work; no text routing or real IO. */
@@ -28,7 +28,7 @@ export class FakeBackgroundScheduler {
   private readonly pending = new Map<string, Promise<void>>()
   readonly errors: unknown[] = []
   constructor(private readonly store: CoordinationStore, private readonly executor: FakeExecutor, private readonly changed: () => void = () => {}) {
-    if (executor.identity !== 'FAKE') throw new Error('This slice only permits FAKE execution')
+    if (!['FAKE', 'CLI'].includes(executor.identity)) throw new Error('This slice only permits declared coordination executors')
   }
   startNext(conversation: string): Run | undefined {
     if (this.closed) return undefined
@@ -40,7 +40,13 @@ export class FakeBackgroundScheduler {
     const done = Promise.resolve().then(() => this.executor.execute(Object.freeze({ ...run, status: 'running' })))
       .then(receipt => {
         if (this.closed) return
-        if (receipt.kind === 'stopped') this.store.confirmStopped(conversation, run.id)
+        // 退出未确认：不终结 run（保持项目占用），assignment 失败，重启时 recover 恢复。
+        if (receipt.execution?.cancelConfirmed === false) {
+          this.store.holdUncertainExit(conversation, run.id, receipt.execution, receipt.kind === 'stopped'
+            ? '取消未能确认进程退出：已保留项目占用防止与残留执行并发，worker 重启后按未知结局恢复'
+            : '执行超时且进程退出未确认：已保留项目占用防止与残留执行并发，worker 重启后按未知结局恢复')
+        }
+        else if (receipt.kind === 'stopped') this.store.confirmStopped(conversation, run.id, receipt.execution)
         else this.store.receipt(conversation, run.id, receipt)
       }, error => { if (!this.closed) this.store.receipt(conversation, run.id, { kind: 'failed', body: `FAKE executor error: ${String(error)}` }) })
       .catch(error => { this.errors.push(error) })

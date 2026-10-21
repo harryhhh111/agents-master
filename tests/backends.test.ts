@@ -483,3 +483,34 @@ describe('ClaudeBackend execution', () => {
     }
   })
 })
+
+describe('envExclude', () => {
+  const command = (script: string) => ({
+    cmd: '/bin/sh',
+    args: ['-c', `${script}; sleep 0.05`],
+  })
+  it('detached 子进程不继承被排除的环境变量', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'env-exclude-'))
+    process.env.CKRUNNER_TEST_EXCLUDE_ME = 'secret-marker'
+    try {
+      const excluded = spawnDetachedCommand({
+        ...command('printf %s "${CKRUNNER_TEST_EXCLUDE_ME:-absent}"'),
+        cwd: dir,
+        envExclude: ['CKRUNNER_TEST_EXCLUDE_ME'],
+        artifactStdoutPath: path.join(dir, 'excluded.out'),
+        artifactStderrPath: path.join(dir, 'excluded.err'),
+      })
+      expect((await excluded.done).stdout).toBe('absent')
+      const kept = spawnDetachedCommand({
+        ...command('printf %s "${CKRUNNER_TEST_EXCLUDE_ME:-absent}"'),
+        cwd: dir,
+        artifactStdoutPath: path.join(dir, 'kept.out'),
+        artifactStderrPath: path.join(dir, 'kept.err'),
+      })
+      expect((await kept.done).stdout).toBe('secret-marker')
+    } finally {
+      delete process.env.CKRUNNER_TEST_EXCLUDE_ME
+      await fs.rm(dir, { recursive: true, force: true })
+    }
+  })
+})

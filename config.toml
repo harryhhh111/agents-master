@@ -11,9 +11,15 @@ model = "deepseek-flash"
 level = "supervised"
 
 # 项目注册表：path 是两个 CLI 共享的工作区
+# 预览 worker 的真实 CLI 执行（--executor cli）也以此名单为白名单，不在名单的项目直接拒绝
 [[projects]]
 name = "stock_data"
 path = "/home/vinci/projects/stock_data"
+
+# 合成验收沙箱：仅供预览 CLI 执行的端到端验证，不含真实数据
+[[projects]]
+name = "sandbox"
+path = "/home/vinci/projects/agents-sandbox"
 
 # 驱动 codex 时的沙箱模式（安全相关默认值，改这里要过用户）
 [backends.codex]

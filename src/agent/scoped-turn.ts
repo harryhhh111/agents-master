@@ -9,7 +9,7 @@ export const defaultScopedTurnTexts: ScopedTurnTexts = {
 export type ScopedState = { messages: WireMessage[]; rounds: number; ids: string[]; pending?: ModelReply; final?: string; failure?: { kind: 'protocol' | 'provider'; reason: string }
   /** 本回合已用的协议修正次数与每次被拒的原始输出；持久化以保证重启后不重复给修正机会、不丢证据。 */
   corrections?: number; rejected?: ModelReply[] }
-export type ScopedTool = { fields: Record<string, 'text' | 'texts'>; execute(args: Record<string, unknown>): unknown; terminal?: boolean }
+export type ScopedTool = { fields: Record<string, 'text' | 'texts'>; execute(args: Record<string, unknown>): unknown; terminal?: boolean; /** 模型可见的工具说明（含允许取值）；缺省为工具名。 */ description?: string }
 /** 模型可见的修正反馈；协议校验失败发生在任何工具执行之前，给一次修正机会不等于重放操作。 */
 export const scopedCorrectionPrompt = '上一次输出未通过协议校验，未执行任何操作。请严格按工具定义修正后重新输出。原因：'
 /** Bounded scoped runner sharing only AgentCore's iteration/pairing primitives.
@@ -40,7 +40,7 @@ export async function scopedTurn(options: {
         if (state.rounds >= 3) reject('Round budget exceeded')
         // Persist attempts before calling so restarts cannot reset budgets.
         state.rounds++; options.save(state)
-        const reply = await options.model.complete(state.messages, names.map(n => tool(n, options.tools[n]!.fields)), signal)
+        const reply = await options.model.complete(state.messages, names.map(n => tool(n, options.tools[n]!.fields, options.tools[n]!.description)), signal)
         if (signal.aborted) throw new Error('Aborted')
         state.pending = reply; options.save(state)
       }
@@ -79,7 +79,17 @@ export async function scopedTurn(options: {
         if (terminal !== undefined) next.final = texts.recorded + JSON.stringify(terminal)
         else if (!calls.length) next.final = reply.content?.trim() || texts.clarify
         return next
-      }) } catch { reject('Tool action rejected; transaction rolled back') }
+      }) } catch (error) {
+        // commit 事务回滚保证未写入任何操作；与校验失败同等对待：未执行过工具的回合给一次修正。
+        const reason = error instanceof Error ? error.message : 'Tool action rejected'
+        if (options.protocolCorrection && (state.corrections ?? 0) === 0 && state.ids.length === 0) {
+          state = { ...state, pending: undefined, corrections: 1, rejected: [...(state.rejected ?? []), reply!],
+            messages: [...state.messages, { role: 'user' as const, content: scopedCorrectionPrompt + reason }] }
+          options.save(state)
+          continue
+        }
+        reject('Tool action rejected; transaction rolled back')
+      }
       if (state.final) return state.final
     }
     return reject('Round budget exceeded')

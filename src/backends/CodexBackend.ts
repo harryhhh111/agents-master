@@ -171,6 +171,7 @@ export class CodexBackend implements AgentBackend {
         args,
         cwd,
         env: buildAgentEnv(options.env),
+        envExclude: options.envExclude,
         timeoutMs,
         input: prompt,
       },
@@ -227,6 +228,7 @@ export class CodexBackend implements AgentBackend {
       artifactStderrPath,
       done: handle.done.then(result => this.toResult(result, outputLastMessageFile)),
       cancel: signal => handle.cancel(signal),
+      groupAlive: () => handle.groupAlive(),
     }
   }
 }

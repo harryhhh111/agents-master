@@ -8,21 +8,36 @@ import { initializeOwnerContext, readOwnerContext, ownerContextCheckpoint, saveO
 import { CoordinationHost, defaultCoordinationHostLabels, type CoordinationHostLabels } from '../src/main/coordination/model-host.js'
 import { defaultCoordinationStoreLabels, type CoordinationStoreLabels } from '../src/main/coordination/store.js'
 import { defaultDomainSystemPrompt, ScopedDomainExecutor } from '../src/agent/scoped-domain.js'
+import { CliDomainExecutor, RoutedDomainExecutor, type CliBackendFactory } from '../src/agent/cli-domain-executor.js'
 import type { ScopedModel } from '../src/agent/scoped-protocol.js'
 import type { FakeExecutor } from '../src/main/coordination/fake.js'
 import { MainWebEventBus, json, readJson, validateMainWebMessage } from './main-web.js'
 
 export const previewMarkerFilename = 'PREVIEW-v2'
-export const previewMarkerContent = 'synthetic-only-v2\n'
-export type PreviewDirectoryMode = 'preview-fresh' | 'preview-open'
+export const previewMarkerContent = 'coordination-preview-v3\n'
+export const legacyPreviewMarkerContentV2 = 'synthetic-only-v2\n'
+export type PreviewDirectoryMode = 'preview-fresh' | 'preview-open' | 'preview-migrate'
 /** synthetic: 合成剧本模型；real-model: 真实模型对话，执行工具仍为受限合成。仅切换文案，不动内部 id。 */
 export type PreviewWording = 'synthetic' | 'real-model'
+/** synthetic: 合成执行器；cli: 白名单项目的真实 CLI 执行（要求 wording=real-model）。 */
+export type PreviewExecution = 'synthetic' | 'cli'
 
-export function previewCheckpoint(ownerContext: string, wording: PreviewWording = 'synthetic'): string {
-  const lead = wording === 'real-model'
-    ? '协调预览检查点：真实模型对话。可以使用受限目录、状态、delegate、answer、cancel 工具协调工作；执行工具仍为受限合成（synthetic_inspect/ask/finish），不运行真实 CLI、不读取项目文件、不开放 shell。含糊需求先澄清；不得声称真实项目执行。'
-    : '协调预览检查点：仅模拟/联调。可以使用受限目录、状态、delegate、answer、cancel 工具协调合成工作。含糊需求先澄清；不得声称真实项目执行，不开放 shell、文件或真实后端。'
+export function previewCheckpoint(ownerContext: string, wording: PreviewWording = 'synthetic', execution: PreviewExecution = 'synthetic'): string {
+  const lead = execution === 'cli'
+    ? '协调预览检查点：真实模型对话与真实 CLI 执行（仅限白名单项目）。使用受限目录、状态、delegate、delegate_cli、answer、cancel 工具。CLI 任务有预算与超时，产物落项目 .agent-artifacts/；不 push、不删工作区外文件、不碰凭据。含糊需求先澄清；不得声称白名单外的执行能力。'
+    : wording === 'real-model'
+      ? '协调预览检查点：真实模型对话。可以使用受限目录、状态、delegate、answer、cancel 工具协调工作；执行工具仍为受限合成（synthetic_inspect/ask/finish），不运行真实 CLI、不读取项目文件、不开放 shell。含糊需求先澄清；不得声称真实项目执行。'
+      : '协调预览检查点：仅模拟/联调。可以使用受限目录、状态、delegate、answer、cancel 工具协调合成工作。含糊需求先澄清；不得声称真实项目执行，不开放 shell、文件或真实后端。'
   return [lead, ownerContextCheckpoint(ownerContext)].join('\n\n')
+}
+
+const realCliHostLabels: CoordinationHostLabels = {
+  policy: '模型对话与 CLI 执行均为真实。合成演示用 delegate；真实项目工作用 delegate_cli（仅限白名单项目），执行结果由领域 Agent 判读后回传。含糊需求用普通文本澄清，不创建任务。answer 只回答绑定待决问题，cancel 只取消指定任务。',
+  deliverPrefix: '回传：',
+  cancelNote: '取消请求已记录：',
+  recordedNote: '已记录受限操作。',
+  clarifyNote: '请补充具体需求。',
+  failedNote: '本轮未能完成，未接受新的操作。请重新说明需求。',
 }
 
 const realModelHostLabels: CoordinationHostLabels = {
@@ -41,14 +56,16 @@ const realModelStoreLabels: CoordinationStoreLabels = {
 }
 const realModelDomainSystemPrompt = '工作项目 Agent。模型对话为真实；工具仍为受限合成，检查合成样本，需要信息时 ask，完成时 finish。不得声称真实执行。'
 
-/** 重开已有目录:必须是通过兼容标记创建的私有目录,否则拒绝且不改动任何内容。 */
+/** 重开已有目录:必须是带兼容标记的私有目录,否则拒绝且不改动任何内容。
+ *  v2 标记进入迁移模式（先备份再重建 runs 表），v3 直接打开。 */
 export function openPreviewDirectory(directory: string): PreviewDirectoryMode {
   const stat = lstatSync(directory)
-  if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) || stat.uid !== process.getuid?.() ||
-      readFileSync(path.join(directory, previewMarkerFilename), 'utf8') !== previewMarkerContent) {
-    throw new Error('Only private v2 preview directories may reopen')
-  }
-  return 'preview-open'
+  const marker = stat.isDirectory() && !stat.isSymbolicLink() && !(stat.mode & 0o077) && stat.uid === process.getuid?.()
+    ? readFileSync(path.join(directory, previewMarkerFilename), 'utf8')
+    : undefined
+  if (marker === previewMarkerContent) return 'preview-open'
+  if (marker === legacyPreviewMarkerContentV2) return 'preview-migrate'
+  throw new Error('Only private v2 preview directories may reopen')
 }
 
 /** 显式创建新目录并打标记。仅用于确定不存在的目录(调用方负责区分)。 */
@@ -66,33 +83,54 @@ export function createCoordinationRuntime(options: {
   domainModel?: ScopedModel
   executor?: FakeExecutor & { stop?(id: string): void }
   wording?: PreviewWording
+  /** cli 执行：真实 CLI backend 工厂与项目白名单（name → 绝对路径）。要求 wording='real-model'。 */
+  execution?: PreviewExecution
+  cli?: { backends: CliBackendFactory; projects: Record<string, string> }
 }) {
   const { directory } = options
   const wording: PreviewWording = options.wording ?? 'synthetic'
+  const execution: PreviewExecution = options.execution ?? 'synthetic'
+  if (execution === 'cli' && (wording !== 'real-model' || !options.cli)) throw new Error('CLI execution requires real-model wording and cli backends/projects')
   const synthetic = wording === 'synthetic'
   let openedStore: SQLiteMainInboxStore | undefined
   try {
-    const store = new SQLiteMainInboxStore(path.join(directory, 'preview.sqlite'), { coordination: { mode: options.mode } })
+    // v2 → v3：executor CHECK 放宽需重建 runs 表；先 VACUUM INTO 备份（0600），成功后重写标记。
+    const coordinationOptions = options.mode === 'preview-migrate'
+      ? { mode: 'preview-migrate' as const, backupPath: path.join(directory, `preview-backup-v2to3-${new Date().toISOString().replace(/[:.]/g, '-')}.sqlite`) }
+      : { mode: options.mode as 'preview-fresh' | 'preview-open' }
+    const store = new SQLiteMainInboxStore(path.join(directory, 'preview.sqlite'), { coordination: coordinationOptions })
     openedStore = store
     chmodSync(path.join(directory, 'preview.sqlite'), 0o600)
+    if (options.mode === 'preview-migrate') writeFileSync(path.join(directory, previewMarkerFilename), previewMarkerContent, { mode: 0o600 })
     initializeOwnerContext(directory)
     const buses = new Map(['main', 'fake-work'].map(c => [c, new MainWebEventBus()]))
     const emitted = new Set<string>()
     for (const c of buses.keys()) for (const m of store.coordination.history(c)) emitted.add(m.id)
-    const hostLabels: CoordinationHostLabels = synthetic ? defaultCoordinationHostLabels : realModelHostLabels
+    const hostLabels: CoordinationHostLabels = synthetic ? defaultCoordinationHostLabels : execution === 'cli' ? realCliHostLabels : realModelHostLabels
     store.coordination.labels = synthetic ? { ...defaultCoordinationStoreLabels } : { ...realModelStoreLabels }
+    if (execution === 'cli') store.coordination.allowedProjects = Object.keys(options.cli!.projects)
     // 真实模型单回合延迟明显高于合成模型：前台与领域回合总时限放宽到 45s，合成模式保持默认。
     const turnTimeoutMs = synthetic ? undefined : 45_000
     // 真实模型偶发协议瑕疵：校验失败且未执行任何工具时允许修正一次；合成模式保持立即判负。
     const protocolCorrection = !synthetic
+    const syntheticExecutor = () => new ScopedDomainExecutor(options.domainModel ?? options.model, synthetic
+      ? defaultDomainSystemPrompt
+      : { systemPrompt: realModelDomainSystemPrompt, turnTimeoutMs, noResultNote: '领域回合未提交结果', failureNote: '领域模型回合失败或超时；未执行真实项目', protocolCorrection })
+    const executor = options.executor ?? (execution === 'cli'
+      ? new RoutedDomainExecutor(syntheticExecutor(), new CliDomainExecutor({
+          model: options.domainModel ?? options.model,
+          backends: options.cli!.backends,
+          projects: options.cli!.projects,
+          turnTimeoutMs,
+          onExecutionTrace: (run, info) => store.coordination.bindExecution(run.conversation_id, run.id, { ...info }),
+        }))
+      : syntheticExecutor())
     const host = new CoordinationHost(store.coordination, options.model, options.domainModel ?? options.model,
-      options.executor ?? new ScopedDomainExecutor(options.domainModel ?? options.model, synthetic
-        ? defaultDomainSystemPrompt
-        : { systemPrompt: realModelDomainSystemPrompt, turnTimeoutMs, noResultNote: '领域回合未提交结果', failureNote: '领域模型回合失败或超时；未执行真实项目', protocolCorrection }),
+      executor,
       () => {
       for (const [c, bus] of buses) for (const m of store.coordination.history(c)) if (!emitted.has(m.id)) { emitted.add(m.id); bus.publish({ type: m.author === 'user' ? 'submitted' : 'reply', message: { ...m, createdAt: m.created_at } }) }
-    }, hostLabels, turnTimeoutMs, protocolCorrection)
-    host.checkpoint = previewCheckpoint(readOwnerContext(directory), wording)
+    }, hostLabels, turnTimeoutMs, protocolCorrection, execution === 'cli' ? Object.keys(options.cli!.projects) : undefined)
+    host.checkpoint = previewCheckpoint(readOwnerContext(directory), wording, execution)
     host.start()
     const closeConnections = () => { for (const bus of buses.values()) bus.close() }
     return {
@@ -111,7 +149,7 @@ export function createCoordinationRuntime(options: {
               const body = await readJson(request)
               if (Object.keys(body).join() !== 'content' || typeof body.content !== 'string') throw new Error('Unexpected fields')
               saveOwnerContext(directory, body.content)
-              host.checkpoint = previewCheckpoint(readOwnerContext(directory), wording)
+              host.checkpoint = previewCheckpoint(readOwnerContext(directory), wording, execution)
               json(response, 200, { saved: true })
             } catch { json(response, 400, { error: '主人上下文未接受：内容为空、过大或请求无效。' }) }
             return true
@@ -123,7 +161,7 @@ export function createCoordinationRuntime(options: {
         if (!bus) { json(response, 400, { error: '未知会话。' }); return true }
         try {
           if (method === 'GET' && route === '/api/history') { const s = bus.snapshot(() => store.coordination.history(c).map(m => ({ ...m, createdAt: m.created_at }))); json(response, 200, { messages: s.value, cursor: s.cursor }); return true }
-          if (method === 'GET' && route === '/api/status') { json(response, 200, { state: host.status(c), message: host.status(c) === 'blocked' ? (synthetic ? '模拟模型回合失败，请显式重试。' : '模型回合失败，请显式重试。') : undefined, synthetic, assignments: store.coordination.assignments('fake-work').map(a => ({ id: a.id, status: a.status, version: a.version })), questions: store.coordination.questions('fake-work') }); return true }
+          if (method === 'GET' && route === '/api/status') { json(response, 200, { state: host.status(c), message: host.status(c) === 'blocked' ? (synthetic ? '模拟模型回合失败，请显式重试。' : '模型回合失败，请显式重试。') : undefined, synthetic, execution, assignments: store.coordination.assignments('fake-work').map(a => ({ id: a.id, status: a.status, version: a.version })), questions: store.coordination.questions('fake-work') }); return true }
           if (method === 'GET' && route === '/api/events') {
             response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' }); response.write(': connected\n\n')
             const raw = request.headers['last-event-id'] ?? url.searchParams.get('cursor')

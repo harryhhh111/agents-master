@@ -148,6 +148,7 @@ export function buildClaudeCommand(
     args,
     cwd: options.cwd,
     env: options.env,
+    envExclude: options.envExclude,
     timeoutMs: options.timeoutMs,
   }
 }
@@ -207,6 +208,7 @@ export class ClaudeBackend implements AgentBackend {
       artifactStderrPath,
       done: handle.done.then(result => this.toResult(result, parser)),
       cancel: signal => handle.cancel(signal),
+      groupAlive: () => handle.groupAlive(),
     }
   }
 }

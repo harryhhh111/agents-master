@@ -337,7 +337,7 @@ export async function handleMainWebRequest(
         releaseId: previewStatus.releaseId,
         previewEnabled: true,
         previewLabel: previewStatus.previewLabel,
-      }), previewStatus.synthetic ? 'synthetic' : 'real-model'))
+      }), previewStatus.synthetic ? 'synthetic' : previewStatus.execution === 'cli' ? 'real-cli' : 'real-model'))
     }
     if (await options.previewChannel.handle(request, response, () => options.auth.authorized(session))) return
   }

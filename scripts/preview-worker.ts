@@ -7,7 +7,8 @@ import net from 'node:net'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { pathToFileURL } from 'node:url'
-import { createCoordinationRuntime, createFreshPreviewDirectory, openPreviewDirectory, type CoordinationRuntime, type PreviewDirectoryMode, type PreviewWording } from './coordination-preview-runtime.js'
+import { createCoordinationRuntime, createFreshPreviewDirectory, openPreviewDirectory, type CoordinationRuntime, type PreviewDirectoryMode, type PreviewExecution, type PreviewWording } from './coordination-preview-runtime.js'
+import type { CliBackendFactory } from '../src/agent/cli-domain-executor.js'
 import { demoModel } from './main-web-coordination-demo.js'
 import { coordinationPage } from '../src/main/coordination/web-page.js'
 import { coordinationPreviewReleaseId, createMainWebPage, json, readPackagedReleaseId } from './main-web.js'
@@ -23,6 +24,16 @@ export interface PreviewWorkerModelOption {
   realModel?: ScopedModel
   /** real 模式上报的模型名(如 config.llm.model)。 */
   modelName?: string
+  /** cli 需要真实模型 + 白名单项目与 backend 工厂。 */
+  execution?: PreviewExecution
+  cli?: { backends: CliBackendFactory; projects: Record<string, string> }
+}
+
+export const previewPreviewLabelCli = '预览版 · 真实模型与执行（白名单项目）'
+
+export function previewLabelFor(execution: PreviewExecution, mode: 'demo' | 'real'): string {
+  if (execution === 'cli') return previewPreviewLabelCli
+  return mode === 'real' ? previewPreviewLabelReal : previewPreviewLabelDemo
 }
 
 /** 在打开数据库/恢复运行之前取得数据目录的跨进程独占锁。进程退出由 OS 释放 SQLite 文件锁。 */
@@ -83,6 +94,8 @@ export async function startPreviewWorker(options: { dataDirectory: string; socke
   const directory = path.resolve(options.dataDirectory)
   const socketPath = path.resolve(options.socketPath)
   const modelOption: PreviewWorkerModelOption = options.model ?? { mode: 'demo' }
+  const execution: PreviewExecution = modelOption.execution ?? 'synthetic'
+  if (execution === 'cli' && (modelOption.mode !== 'real' || !modelOption.cli)) throw new Error('--executor cli 需要 --model real 与项目白名单。')
   const wording: PreviewWording = modelOption.mode === 'real' ? 'real-model' : 'synthetic'
   if (modelOption.mode === 'real' && !modelOption.realModel) throw new Error('real 模式必须提供真实模型实例。')
   await ensureReusableSocketPath(socketPath)
@@ -95,8 +108,8 @@ export async function startPreviewWorker(options: { dataDirectory: string; socke
     // 默认 ScopedDomainExecutor(demoModel)：identity 同为 FAKE，只运行合成工具
     // （synthetic_inspect/ask/finish），绝不触发真实 CLI 或子进程；它能完成 ask→回答→finish
     // 的合成闭环。HeldFakeExecutor 会无限挂起任务，仅限单元测试显式驱动，不能用于常驻 worker。
-    // real 模式换用真实模型实例,执行工具保持不变。
-    runtime = createCoordinationRuntime({ directory, mode, model: modelOption.mode === 'real' ? modelOption.realModel! : demoModel(), wording })
+    // real 模式换用真实模型实例,执行工具保持不变;cli 模式再叠加白名单项目的真实 CLI 执行。
+    runtime = createCoordinationRuntime({ directory, mode, model: modelOption.mode === 'real' ? modelOption.realModel! : demoModel(), wording, execution, cli: modelOption.cli })
   } catch (error) {
     lock.release()
     throw error
@@ -106,18 +119,18 @@ export async function startPreviewWorker(options: { dataDirectory: string; socke
     mkdirSync(socketDir, { recursive: true, mode: 0o700 })
     chmodSync(socketDir, 0o700)
     const releaseId = readPackagedReleaseId(process.cwd(), coordinationPreviewReleaseId)
-    const previewLabel = modelOption.mode === 'real' ? previewPreviewLabelReal : previewPreviewLabelDemo
+    const previewLabel = previewLabelFor(execution, modelOption.mode)
     const page = coordinationPage(createMainWebPage({
       channel: 'preview',
       businessApiBase: '/preview/api',
       releaseId,
       previewEnabled: true,
       previewLabel,
-    }), wording)
+    }), execution === 'cli' ? 'real-cli' : wording)
     const server = http.createServer((request, response) => {
       if (request.url === '/healthz') {
         if (request.method !== 'GET') json(response, 405, { error: '方法不可用。' })
-        else json(response, 200, { ok: true, synthetic: modelOption.mode !== 'real', model: modelOption.mode === 'real' ? modelOption.modelName : undefined, previewLabel, releaseId })
+        else json(response, 200, { ok: true, synthetic: modelOption.mode !== 'real', execution, model: modelOption.mode === 'real' ? modelOption.modelName : undefined, previewLabel, releaseId })
         return
       }
       if (request.url === '/preview/') {
@@ -165,16 +178,21 @@ export interface PreviewWorkerArgs {
   dataDirectory: string
   socketPath: string
   modelMode: 'demo' | 'real'
+  execution: PreviewExecution
 }
 export function parsePreviewWorkerArgs(args: string[]): PreviewWorkerArgs {
-  if (args.length !== 4 && args.length !== 6) throw new Error('Use --data-dir PRIVATE_V2_DIRECTORY --socket PRIVATE_SOCKET_PATH [--model demo|real]')
-  if (args[0] !== '--data-dir' || !args[1] || args[2] !== '--socket' || !args[3]) throw new Error('Use --data-dir PRIVATE_V2_DIRECTORY --socket PRIVATE_SOCKET_PATH [--model demo|real]')
+  if (args.length !== 4 && args.length !== 6 && args.length !== 8) throw new Error('Use --data-dir PRIVATE_V2_DIRECTORY --socket PRIVATE_SOCKET_PATH [--model demo|real] [--executor synthetic|cli]')
+  if (args[0] !== '--data-dir' || !args[1] || args[2] !== '--socket' || !args[3]) throw new Error('Use --data-dir PRIVATE_V2_DIRECTORY --socket PRIVATE_SOCKET_PATH [--model demo|real] [--executor synthetic|cli]')
   let modelMode: 'demo' | 'real' = 'demo'
-  if (args.length === 6) {
-    if (args[4] !== '--model' || (args[5] !== 'demo' && args[5] !== 'real')) throw new Error('--model 只接受 demo 或 real')
-    modelMode = args[5]
+  let execution: PreviewExecution = 'synthetic'
+  const rest = args.slice(4)
+  for (let i = 0; i < rest.length; i += 2) {
+    if (rest[i] === '--model' && (rest[i + 1] === 'demo' || rest[i + 1] === 'real')) modelMode = rest[i + 1] as 'demo' | 'real'
+    else if (rest[i] === '--executor' && (rest[i + 1] === 'synthetic' || rest[i + 1] === 'cli')) execution = rest[i + 1] as PreviewExecution
+    else throw new Error('--model 只接受 demo 或 real；--executor 只接受 synthetic 或 cli')
   }
-  return { dataDirectory: args[1], socketPath: args[3], modelMode }
+  if (execution === 'cli' && modelMode !== 'real') throw new Error('--executor cli 需要 --model real')
+  return { dataDirectory: args[1], socketPath: args[3], modelMode, execution }
 }
 
 export async function runPreviewWorker(args: string[]): Promise<void> {
@@ -186,10 +204,26 @@ export async function runPreviewWorker(args: string[]): Promise<void> {
     const { createCoordinationModel } = await import('../src/frontbrain/coordination-model.js')
     const config = loadConfig()
     // createLlmClient 在缺 DEEPSEEK_API_KEY 时抛出;此处不捕获,启动直接失败,不静默降级 demo。
-    model = { mode: 'real', realModel: createCoordinationModel(config, { timeoutMs: 45_000 }), modelName: config.llm.model }
+    const realModel = createCoordinationModel(config, { timeoutMs: 45_000 })
+    model = { mode: 'real', realModel, modelName: config.llm.model }
+    if (parsed.execution === 'cli') {
+      const { CodexBackend } = await import('../src/backends/CodexBackend.js')
+      const { KimiBackend } = await import('../src/backends/KimiBackend.js')
+      const { ClaudeBackend } = await import('../src/backends/ClaudeBackend.js')
+      const backends: CliBackendFactory = name => {
+        if (name === 'kimi') return new KimiBackend()
+        if (name === 'codex') return new CodexBackend({ sandboxMode: config.backends.codex.sandbox_mode })
+        if (name === 'claude') return new ClaudeBackend({ binary: config.backends.claude.binary, permissionMode: config.backends.claude.permission_mode })
+        throw new Error(`未知 backend：${name}`)
+      }
+      const projects = Object.fromEntries(config.projects.map(p => [p.name, path.resolve(p.path)]))
+      model = { ...model, execution: 'cli', cli: { backends, projects } }
+    }
   }
   const worker = await startPreviewWorker({ dataDirectory: parsed.dataDirectory, socketPath: parsed.socketPath, model })
-  const note = parsed.modelMode === 'real' ? `真实模型（受限工具）: model=${(model as { modelName?: string }).modelName}` : '模拟演示，非真实智能对话'
+  const note = parsed.modelMode === 'real'
+    ? (parsed.execution === 'cli' ? `真实模型与执行（白名单项目）: model=${(model as { modelName?: string }).modelName}` : `真实模型（受限工具）: model=${(model as { modelName?: string }).modelName}`)
+    : '模拟演示，非真实智能对话'
   console.log(`preview worker ready（${note}）: socket=${worker.socketPath} data=${worker.directory}`)
   const stop = () => { void worker.close().then(() => { process.exitCode = 0 }) }
   process.once('SIGINT', stop)

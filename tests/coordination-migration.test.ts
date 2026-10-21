@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { spawnSync } from 'node:child_process'
 import { SQLiteMainInboxStore } from '../src/main/inbox.js'
+import { createV2PreviewSchemaForMigrationTest } from '../src/main/schema.js'
 
 let directory: string
 let path: string
@@ -121,4 +122,83 @@ it('rejects damaged version-one schema rather than silently repairing on startup
   const broken = new DatabaseSync(path)
   broken.exec('DROP TABLE coordination_questions'); broken.close()
   expect(() => new SQLiteMainInboxStore(path)).toThrow(/incomplete/i)
+})
+
+it('preview v2→v3：备份 0600、数据保留、executor CHECK 放宽、旧库拒绝直接打开', () => {
+  const v2 = join(directory, 'preview-v2.sqlite')
+  const v2Backup = join(directory, 'v3-backup.sqlite')
+  const fixture = new DatabaseSync(v2)
+  fixture.function('coordination_writer', () => 1)
+  createV2PreviewSchemaForMigrationTest(fixture)
+  fixture.prepare(`INSERT INTO main_conversation_messages (id,role,content,created_at,append_order,conversation_id,author,presentation)
+    VALUES ('m1','user','v2 遗留消息','2026-10-20T00:00:00.000Z',1,'main','user','input')`).run()
+  fixture.close()
+  expect(Number(new DatabaseSync(v2).prepare('PRAGMA user_version').get()?.user_version)).toBe(2)
+
+  // 旧版本库拒绝直接 preview-open
+  expect(() => new SQLiteMainInboxStore(v2, { coordination: { mode: 'preview-open' } })).toThrow(/migration/i)
+
+  const migrated = new SQLiteMainInboxStore(v2, { coordination: { mode: 'preview-migrate', backupPath: v2Backup } })
+  expect(migrated.coordination.history('main').some(m => m.content === 'v2 遗留消息')).toBe(true)
+  migrated.close()
+  expect(statSync(v2Backup).mode & 0o777).toBe(0o600)
+  const backupDb = new DatabaseSync(v2Backup)
+  expect(Number(backupDb.prepare('PRAGMA user_version').get()?.user_version)).toBe(2)
+  backupDb.close()
+
+  // 迁移后可正常打开，且 executor CHECK 放宽到 CLI、仍然拒绝未知值
+  const opened = new SQLiteMainInboxStore(v2, { coordination: { mode: 'preview-open' } })
+  opened.close()
+  const check = new DatabaseSync(v2)
+  check.exec('PRAGMA foreign_keys=OFF')
+  check.prepare(`INSERT INTO coordination_runs (id,assignment_id,conversation_id,project_key,version,input_version,executor,context,status,started_at)
+    VALUES ('r-cli','a-x','fake-work','sandbox',1,1,'CLI','{}','starting','2026-10-20T00:00:00.000Z')`).run()
+  expect(() => check.prepare(`INSERT INTO coordination_runs (id,assignment_id,conversation_id,project_key,version,input_version,executor,context,status,started_at)
+    VALUES ('r-bad','a-x','fake-work','sandbox',1,1,'BOGUS','{}','starting','2026-10-20T00:00:00.000Z')`).run()).toThrow()
+  check.close()
+})
+
+it('preview v2→v3：含 run/question/receipt/outbox 引用链的任务历史可迁移，数据与外键完整', () => {
+  const v2 = join(directory, 'preview-v2-full.sqlite')
+  const v2Backup = join(directory, 'v3-full-backup.sqlite')
+  const fixture = new DatabaseSync(v2)
+  fixture.function('coordination_writer', () => 1)
+  createV2PreviewSchemaForMigrationTest(fixture)
+  fixture.exec(`
+    INSERT INTO main_conversation_messages (id,role,content,created_at,append_order,conversation_id,author,presentation)
+      VALUES ('mu1','user','请检查','2026-10-20T00:00:00.000Z',1,'main','user','input');
+    INSERT INTO inbox_events (id,conversation_id,idempotency_key,type,priority,payload,status,created_at,updated_at,user_message_id,append_order)
+      VALUES ('e1','main','k1','user-message','normal','{}','processed','2026-10-20T00:00:00.000Z','2026-10-20T00:00:01.000Z','mu1',1);
+    INSERT INTO coordination_assignments (id,source_event,conversation_id,return_conversation,project_key,agent_id,decision,accepted,status,version,input_version,context,created_at)
+      VALUES ('a1','e1','fake-work','main','FAKE-project','fake-work-agent','{}','{}','waiting_input',1,1,'{}','2026-10-20T00:00:02.000Z');
+    INSERT INTO coordination_runs (id,assignment_id,conversation_id,project_key,version,input_version,executor,context,status,started_at,ended_at,result)
+      VALUES ('r1','a1','fake-work','FAKE-project',1,1,'FAKE','{}','succeeded','2026-10-20T00:00:03.000Z','2026-10-20T00:00:04.000Z','{"kind":"waiting_input","body":"继续吗？"}');
+    INSERT INTO coordination_questions (id,assignment_id,run_id,version,body,status)
+      VALUES ('q1','a1','r1',1,'继续吗？','pending');
+    INSERT INTO coordination_receipts (run_id,payload,accepted,created_at)
+      VALUES ('r1','{"kind":"waiting_input","body":"继续吗？"}',1,'2026-10-20T00:00:04.000Z');
+    INSERT INTO coordination_outbox (id,assignment_id,run_id,version,conversation_id,kind,body,status,created_at)
+      VALUES ('o1','a1','r1',1,'main','waiting_input','继续吗？','pending','2026-10-20T00:00:04.000Z');
+  `)
+  fixture.close()
+
+  const migrated = new SQLiteMainInboxStore(v2, { coordination: { mode: 'preview-migrate', backupPath: v2Backup } })
+  const q = migrated.coordination.questions('fake-work')
+  expect(q).toHaveLength(1)
+  expect(q[0]!.run_id).toBe('r1')
+  expect(q[0]!.status).toBe('pending')
+  migrated.close()
+
+  const check = new DatabaseSync(v2)
+  expect(Number(check.prepare('PRAGMA user_version').get()?.user_version)).toBe(3)
+  expect(check.prepare('PRAGMA foreign_key_check').all()).toHaveLength(0)
+  expect(check.prepare('SELECT * FROM coordination_receipts WHERE run_id=?').all('r1')).toHaveLength(1)
+  expect(check.prepare('SELECT * FROM coordination_outbox WHERE run_id=?').all('r1')).toHaveLength(1)
+  check.close()
+
+  const backupDb = new DatabaseSync(v2Backup)
+  expect(Number(backupDb.prepare('PRAGMA user_version').get()?.user_version)).toBe(2)
+  expect(backupDb.prepare('SELECT * FROM coordination_questions').all()).toHaveLength(1)
+  backupDb.close()
+  expect(statSync(v2Backup).mode & 0o777).toBe(0o600)
 })
