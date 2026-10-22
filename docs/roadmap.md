@@ -284,6 +284,11 @@ Chromium 验收设计稿 §7 全链路与全部复核分支。commit `8fd928a`�
 左栏 200–400px 可拖拽（localStorage 记忆）。
 遗留小项：非当前会话徽标靠 3s 轮询（非实时）；任务卡目标摘要取自已加载委派消息；
 「已记录受限操作」气泡仍直接展示 JSON（既有后端文案，待单独收口）。
+同日晚上下文格式修复（commit `bfc9ef1` 信封剥壳 + `973f932` lorca 式渲染，release
+`web-lorca-context-20261022-973f932` 已上线）：真实模型曾模仿喂入的 {author,text} JSON
+信封回复；现按[二轮调研](open-agent-reference-study-2026-10-22.md)第四节改为 lorca 式——
+自己历史为 assistant 原文、他人消息 user 角色携带 `[名字]: ` 前缀、行首 `[` 转义防伪造，
+剥壳保留作存量兜底。typecheck + 394/394；线上 healthz 与真实对话验证通过。
 
 ### Runtime 接线约束
 
