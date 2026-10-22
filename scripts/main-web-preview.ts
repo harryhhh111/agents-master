@@ -10,6 +10,7 @@ const previewApiRoutes = new Set([
   '/api/recover',
   '/api/owner-context',
   '/api/clear',
+  '/api/memories',
 ])
 const hopByHopHeaders = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade'])
 

@@ -16,6 +16,7 @@ import { createCoordinationPreview } from '../scripts/main-web-coordination.js'
 import { listenMainWebServer } from '../scripts/main-web.js'
 import { demoModel } from '../scripts/main-web-coordination-demo.js'
 import { CoordinationHost, renderContextMessage, unwrapAuthorEnvelope } from '../src/main/coordination/model-host.js'
+import type { ScopedModel } from '../src/agent/scoped-protocol.js'
 import { SQLiteMainInboxStore } from '../src/main/inbox.js'
 import { HeldFakeExecutor } from '../src/main/coordination/fake.js'
 
@@ -194,5 +195,55 @@ it('清空对话路由：需登录、清空后历史为空、幂等键可重用'
     await until(()=>app.store.coordination.history('main').length>=1)
     const page=await (await request('/')).text()
     expect(page).toContain('clear-main');expect(page).toContain('清空工作项目群')
+  } finally {await app.close();rmSync(directory,{recursive:true})}
+})
+
+it('suggest_memory 工具把提议送入接收器且回合正常完成', async () => {
+  const owner = new SQLiteMainInboxStore(':memory:',{coordination:{mode:'preview-fresh'}}),s=owner.coordination
+  const suggestions: Array<{fact:string,source:string}> = []
+  let calls=0
+  const host=new CoordinationHost(s,{complete:async()=>{calls++;if(calls===1)return {content:null,tool_calls:[{id:'sm',type:'function',function:{name:'suggest_memory',arguments:'{"fact":"主人旅居昆明"}'}}]};return {content:'好的'}}},demoModel(),new HeldFakeExecutor(),undefined,undefined,undefined,undefined,undefined,(fact:string,source:string)=>{suggestions.push({fact,source});return {id:'m1'}})
+  try {
+    host.start();host.submit('main','mem-1','我2026年5月底在昆明租了房子')
+    await until(()=>s.history('main').some(m=>m.presentation==='chat'))
+    expect(suggestions.length).toBe(1)
+    expect(suggestions[0]!.fact).toBe('主人旅居昆明')
+    expect(typeof suggestions[0]!.source).toBe('string')
+    expect(s.history('main').find(m=>m.presentation==='chat')!.content).toBe('好的')
+  } finally { await host.close();owner.close() }
+})
+
+it('记忆路由：提议进状态、确认后进检查点、删除后移出、未知记录 400', async () => {
+  const suggestingModel: ScopedModel = { complete: async (messages, tools) =>
+    tools.some(t=>t.function.name==='suggest_memory') && !messages.some(m=>m.role==='tool')
+      ? { content:null, tool_calls:[{id:'sm',type:'function',function:{name:'suggest_memory',arguments:'{"fact":"主人旅居昆明"}'}}] }
+      : { content:'好的' } }
+  const app=createCoordinationPreview({model:suggestingModel});const directory=app.directory
+  const base='http://127.0.0.1:31416';let cookie=''
+  const request=async(url:string,body?:unknown)=>{
+    const req=Object.assign(Readable.from(body?[JSON.stringify(body)]:[]),{url,method:body?'POST':'GET',headers:{host:'127.0.0.1:31416',cookie,...(body?{'content-type':'application/json',origin:base}:{})}})
+    let status=0,text='';const headers=new Headers()
+    const response=Object.assign(new EventEmitter(),{setHeader:(n:string,v:string)=>headers.set(n,v),writeHead:(s:number,h:Record<string,string>)=>{status=s;for(const [k,v] of Object.entries(h))headers.set(k,v)},write:(v:string)=>{text+=v},end:(v='')=>{text+=v;response.emit('close')}})
+    await app.handle(req as unknown as IncomingMessage,response as unknown as ServerResponse)
+    return {status,headers,text:async()=>text}
+  }
+  try {
+    expect((await request('/api/memories')).status).toBe(401)
+    cookie=(await request('/api/auth/setup',{password:'synthetic-password',setupToken:app.auth.setupToken})).headers.get('set-cookie')!.split(';')[0]!
+    expect((await request('/api/messages?conversation=main',{content:'我旅居昆明',idempotencyKey:'mem-route'})).status).toBe(202)
+    await until(()=>app.store.coordination.history('main').some(m=>m.presentation==='chat'))
+    const status=JSON.parse(await (await request('/api/status?conversation=main')).text())
+    expect(status.memorySuggestions.length).toBe(1)
+    expect(status.memorySuggestions[0].fact).toBe('主人旅居昆明')
+    expect(app.host.checkpoint).not.toContain('主人旅居昆明')
+    const id=status.memorySuggestions[0].id
+    expect((await request('/api/memories',{id,action:'confirm'})).status).toBe(200)
+    expect(app.host.checkpoint).toContain('已确认的记忆')
+    expect(app.host.checkpoint).toContain('主人旅居昆明')
+    expect((await request('/api/memories',{id,action:'delete'})).status).toBe(200)
+    expect(app.host.checkpoint).not.toContain('主人旅居昆明')
+    expect((await request('/api/memories',{id:'unknown',action:'confirm'})).status).toBe(400)
+    const page=await (await request('/')).text()
+    expect(page).toContain('memory-area');expect(page).toContain('已确认的记忆')
   } finally {await app.close();rmSync(directory,{recursive:true})}
 })

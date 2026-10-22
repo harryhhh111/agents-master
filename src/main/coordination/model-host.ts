@@ -64,7 +64,8 @@ export class CoordinationHost {
   constructor(readonly store: CoordinationStore, private readonly mainModel: ScopedModel, private readonly domainModel: ScopedModel,
     private readonly executor: FakeExecutor & { stop?(id: string): void }, private readonly changed: () => void = () => {},
     private readonly labels: CoordinationHostLabels = defaultCoordinationHostLabels, private readonly turnTimeoutMs?: number,
-    private readonly protocolCorrection = false, private readonly cliProjects?: readonly string[]) {
+    private readonly protocolCorrection = false, private readonly cliProjects?: readonly string[],
+    private readonly onSuggestMemory?: (fact: string, sourceEvent: string) => unknown) {
     this.background = new FakeBackgroundScheduler(store, executor, changed)
   }
   start(): void {
@@ -94,6 +95,11 @@ export class CoordinationHost {
       } : {}),
       answer: { fields: { questionId: 'text' }, terminal: true, execute: a => this.store.answer(FAKE_GROUP, String(a.questionId), turn.conversation, turn.event.id) },
       cancel: { fields: { assignmentId: 'text' }, terminal: true, execute: a => this.store.cancel(FAKE_GROUP, String(a.assignmentId)) },
+      // 提议制记忆：仅主对话、仅组装方注入接收器时存在；非终止工具，模型提议后继续回复。
+      ...(this.onSuggestMemory && turn.conversation === 'main' ? {
+        suggest_memory: { fields: { fact: 'text' }, description: '提议记住用户在对话中明示的关于其自身的稳定事实（如居住、偏好、长期计划）。仅复述用户明确说过的内容，不做推测；每回合至多一条；普通对话、临时事项、任务相关内容不要使用。',
+          execute: a => ({ suggested: (this.onSuggestMemory!(String(a.fact), turn.event.id) as { id: string }).id }) },
+      } : {}),
     }
   }
   private async step(c: string): Promise<boolean> {

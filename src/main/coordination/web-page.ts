@@ -157,12 +157,13 @@ const coordinationPageTemplate = `<!doctype html>
 <header id="chat-header"><button id="back-to-list" type="button">‹ 会话</button><div class="chat-heading"><h2 id="chat-title">主 Agent</h2><p id="chat-subtitle">一对一 · 置顶</p></div><button id="todo-jump" type="button" hidden>待办 0</button><p id="status" class="status" role="status">正在连接…</p></header>
 <div id="control-banner" class="control-banner" role="alert" hidden></div>
 <div id="todo-area" class="todo-area" hidden></div>
+<div id="memory-area" class="todo-area" hidden></div>
 <div class="conversation"><div id="messages" class="messages" role="log" aria-label="聊天记录" aria-live="polite" tabindex="0"></div><p id="empty-state" class="empty-state">正在加载聊天…</p><button id="latest" class="latest" type="button" hidden>回到最新</button></div>
 <div class="feedback"><p id="error" class="error" role="alert"></p><button id="recover" type="button" hidden>重试回复</button><div id="send-errors" aria-live="polite"></div></div><button id="reload-chat" type="button" hidden>重新加载聊天</button>
 <div class="composer"><form id="chat" class="chat"><textarea id="message" rows="1" aria-label="消息" placeholder="聊点什么…" autocomplete="off" maxlength="8000" enterkeyhint="enter"></textarea><span id="turn-dot" class="turn-dot" hidden title="回合进行中"></span><button id="send" disabled>发送</button></form><p class="hint">Enter 发送 · Shift + Enter 换行</p></div>
 </section>
 </div>
-<div id="settings-modal" class="modal-backdrop" hidden><div class="modal" role="dialog" aria-modal="true" aria-label="设置"><div class="modal-head"><h2>设置</h2><button id="close-settings" type="button" aria-label="关闭设置">×</button></div><div class="settings-body"><h2>主人上下文</h2><p>你明确维护的稳定背景，不是自动记忆。保存后仅影响未来回合。</p><textarea id="owner" aria-label="主人上下文" maxlength="12000"></textarea><button id="save-owner" type="button">明确保存主人上下文</button><p id="owner-status" role="status"></p><p>预览通道与稳定版数据相互独立。</p><h2>清空对话</h2><p>删除该会话的全部消息记录，不可恢复；清空工作项目群会同时删除其中的任务与问题记录。对话正在处理中时不能清空。</p><button id="clear-main" type="button">清空主 Agent 对话</button> <button id="clear-group" type="button">清空工作项目群</button><p id="clear-status" role="status"></p><button id="logout" type="button">退出登录</button></div></div></div>
+<div id="settings-modal" class="modal-backdrop" hidden><div class="modal" role="dialog" aria-modal="true" aria-label="设置"><div class="modal-head"><h2>设置</h2><button id="close-settings" type="button" aria-label="关闭设置">×</button></div><div class="settings-body"><h2>主人上下文</h2><p>你明确维护的稳定背景，不是自动记忆。保存后仅影响未来回合。</p><textarea id="owner" aria-label="主人上下文" maxlength="12000"></textarea><button id="save-owner" type="button">明确保存主人上下文</button><p id="owner-status" role="status"></p><p>预览通道与稳定版数据相互独立。</p><h2>清空对话</h2><p>删除该会话的全部消息记录，不可恢复；清空工作项目群会同时删除其中的任务与问题记录。对话正在处理中时不能清空。</p><button id="clear-main" type="button">清空主 Agent 对话</button> <button id="clear-group" type="button">清空工作项目群</button><p id="clear-status" role="status"></p><h2>已确认的记忆</h2><p>模型提议、你明确确认过的关于你的事实，会进入后续对话的背景。删除后不再使用。</p><ul id="memory-list"></ul><button id="logout" type="button">退出登录</button></div></div></div>
 </main>
 <script>
 const appConfig=__COORDINATION_PAGE_CONFIG__;
@@ -183,6 +184,7 @@ const drafts=new Map();
 const conversations=[],convState=new Map();
 let loaded=false,loading=false,connectionLost=false,liveDisconnected=false,replyState='idle',replyError='',recovering=false,composing=false,compositionEndedAt=-Infinity,draftRevision=0,unread=0;
 let failedSends=[];
+let memorySuggestions=[];
 let savedOwnerContent='';
 let followingLatest=true,scrollWidth=messages.clientWidth,scrollHeight=messages.clientHeight,touchY;
 const seen=new Set();let lastMessageTime=0;
@@ -209,7 +211,7 @@ function renderState(){
   if(uncertainHere){const p=document.createElement('p');p.textContent='是否送达未知（可重试，相同提交不会重复执行）';banner.append(p)}
   for(const [sig,reason] of rejectedControls){if(signatureConversation(sig)!==conversation)continue;const p=document.createElement('p');p.textContent='已确定被拒绝：'+reason;banner.append(p)}
   banner.hidden=!banner.children.length;
-  emptyState.hidden=seen.size>0;emptyState.textContent=loading?'正在加载聊天…':loaded?'从一句话开始聊天吧。':'聊天未能加载，请重试。';updateSend();
+  emptyState.hidden=seen.size>0;emptyState.textContent=loading?'正在加载聊天…':loaded?'从一句话开始聊天吧。':'聊天未能加载，请重试。';updateSend();renderMemorySuggestions();
 }
 function renderSendErrors(){
   sendErrors.replaceChildren();
@@ -271,7 +273,7 @@ function showLogin(configured=true){
 async function pollStatus(generation){
   const revision=eventRevision;
   try{
-    const current=await request('/api/status');if(!active(generation))return;renderCards(current);
+    const current=await request('/api/status');if(!active(generation))return;renderCards(current);memorySuggestions=current.memorySuggestions||[];
     const history=await request('/api/history');if(!active(generation))return;
     history.messages.forEach(add);connectionLost=false;if(!stream)openEvents(history.cursor);
     if(revision===eventRevision){replyState=current.state;replyError=current.state==='blocked'?replyFailure(current.message):''}
@@ -476,6 +478,39 @@ async function clearConversation(id,label){
 }
 document.querySelector('#clear-main').addEventListener('click',()=>clearConversation('main','主 Agent 对话'));
 document.querySelector('#clear-group').addEventListener('click',()=>clearConversation('fake-work','工作项目群'));
+// 提议制记忆：pending 提议在主对话顶部成卡片，确认/忽略后服务端刷新检查点；已确认记忆在设置里可删。
+function renderMemorySuggestions(){
+  const area=document.querySelector('#memory-area');area.replaceChildren();
+  if(conversation!=='main'||!memorySuggestions.length){area.hidden=true;return}
+  for(const s of memorySuggestions){
+    const card=document.createElement('div');card.className='card';
+    const title=document.createElement('div');title.className='card-title';title.textContent='建议记住';
+    const body=document.createElement('div');body.className='card-body';body.textContent=s.fact;
+    const yes=document.createElement('button');yes.type='button';yes.textContent='记住';
+    yes.addEventListener('click',()=>memoryAction(s.id,'confirm',yes));
+    const no=document.createElement('button');no.type='button';no.textContent='忽略';
+    no.addEventListener('click',()=>memoryAction(s.id,'dismiss',no));
+    card.append(title,body,yes,no);area.append(card);
+  }
+  area.hidden=false;
+}
+async function memoryAction(id,action,button){
+  if(button.disabled)return;button.disabled=true;
+  try{await request('/api/memories',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,action})});memorySuggestions=memorySuggestions.filter(s=>s.id!==id);renderMemorySuggestions();void loadMemories()}
+  catch(e){button.disabled=false}
+}
+async function loadMemories(){
+  const list=document.querySelector('#memory-list');
+  try{const data=await request('/api/memories');list.replaceChildren();
+    for(const m of (data.memories||[]).filter(m=>m.status==='confirmed')){
+      const item=document.createElement('li');item.append(document.createTextNode(m.fact+' '));
+      const del=document.createElement('button');del.type='button';del.textContent='删除';
+      del.addEventListener('click',async()=>{del.disabled=true;try{await request('/api/memories',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:m.id,action:'delete'})});await loadMemories()}catch(e){del.disabled=false}});
+      item.append(del);list.append(item);
+    }
+    if(!list.children.length){const empty=document.createElement('li');empty.textContent='暂无已确认的记忆。';list.append(empty)}
+  }catch(e){}
+}
 recoverButton.addEventListener('click',async()=>{
   if(recovering||replyState!=='blocked')return;const generation=viewGeneration;recovering=true;eventRevision++;renderState();const revision=eventRevision;
   try{const body=await request('/api/recover',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(!active(generation))return;if(eventRevision===revision){replyState=body.started?'processing':'idle';replyError=''}eventRevision++}
@@ -537,7 +572,7 @@ function setupVersionSwitch(){
 }
 // 设置弹窗：按钮打开，Esc / 点遮罩 / × 关闭；退出登录守卫不变。
 const settingsModal=document.querySelector('#settings-modal');
-document.querySelector('#open-settings').addEventListener('click',()=>{settingsModal.hidden=false});
+document.querySelector('#open-settings').addEventListener('click',()=>{settingsModal.hidden=false;void loadMemories()});
 document.querySelector('#close-settings').addEventListener('click',()=>{settingsModal.hidden=true});
 settingsModal.addEventListener('click',event=>{if(event.target===settingsModal)settingsModal.hidden=true});
 window.addEventListener('keydown',event=>{if(event.key==='Escape')settingsModal.hidden=true});
