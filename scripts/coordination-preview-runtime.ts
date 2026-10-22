@@ -164,9 +164,16 @@ export function createCoordinationRuntime(options: {
           }
           json(response, 405, { error: '方法不可用。' }); return true
         }
-        if (!['/api/history','/api/status','/api/events','/api/messages','/api/control','/api/recover'].includes(route)) return false
+        if (!['/api/history','/api/status','/api/events','/api/messages','/api/control','/api/recover','/api/clear'].includes(route)) return false
         const c = url.searchParams.get('conversation') ?? 'main', bus = buses.get(c)
         if (!bus) { json(response, 400, { error: '未知会话。' }); return true }
+        if (route === '/api/clear') {
+          if (method !== 'POST') { json(response, 405, { error: '方法不可用。' }); return true }
+          if (host.status(c) !== 'idle') { json(response, 409, { error: '对话正在处理中，请等待完成后再清空。' }); return true }
+          try { store.coordination.clearConversation(c); bus.publish({ type: 'cleared' }); json(response, 200, { cleared: true }) }
+          catch { json(response, 409, { error: '对话正在处理中，请等待完成后再清空。' }) }
+          return true
+        }
         try {
           if (method === 'GET' && route === '/api/history') { const s = bus.snapshot(() => store.coordination.history(c).map(m => ({ ...m, createdAt: m.created_at }))); json(response, 200, { messages: s.value, cursor: s.cursor }); return true }
           if (method === 'GET' && route === '/api/status') { json(response, 200, { state: host.status(c), message: host.status(c) === 'blocked' ? (synthetic ? '模拟模型回合失败，请显式重试。' : '模型回合失败，请显式重试。') : undefined, synthetic, execution, assignments: store.coordination.assignments('fake-work').map(a => ({ id: a.id, status: a.status, version: a.version })), questions: store.coordination.questions('fake-work') }); return true }

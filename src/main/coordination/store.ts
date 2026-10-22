@@ -332,6 +332,41 @@ export class CoordinationStore {
       this.queueReceipt(this.assignment(conversation, a.id), 'failed', body, runId)
     })
   }
+  /**
+   * 清空对话记录（用户显式请求的"新建对话"）。拒绝条件：前台回合在途、有未处理输入、
+   * 或（仅工作群）存在活跃执行。工作群清空级联删除其任务/问题/运行/回执/回传；
+   * 主对话清空保留待投递回传（结果不丢）。外键顺序：子表先行——锁/协议/事件在消息之前，
+   * 被任务引用（source_event/answer_event）的事件行保留并将其消息指针置空，维持任务溯源。
+   */
+  clearConversation(conversation: string): void {
+    this.conversation(conversation)
+    this.tx(() => {
+      if (this.frontBusy(conversation)) throw new Error('Foreground turn in flight')
+      if (this.one("SELECT 1 FROM inbox_events WHERE conversation_id=? AND status IN ('pending','claimed')", conversation)) throw new Error('Pending input')
+      // 被任务引用的事件（可存在于任一会话：任务来源与回答可能来自主对话或群）不能删。
+      const taskBoundEvents = `SELECT source_event AS id FROM coordination_assignments
+        UNION SELECT answer_event FROM coordination_questions WHERE answer_event IS NOT NULL`
+      if (conversation === FAKE_GROUP) {
+        if (this.one("SELECT 1 FROM coordination_runs WHERE conversation_id=? AND status IN ('starting','running','cancel_requested')", conversation)) throw new Error('Active run in flight')
+        this.db.prepare('DELETE FROM coordination_receipts WHERE run_id IN (SELECT id FROM coordination_runs WHERE conversation_id=?)').run(conversation)
+        this.db.prepare('DELETE FROM coordination_questions WHERE assignment_id IN (SELECT id FROM coordination_assignments WHERE conversation_id=?)').run(conversation)
+        this.db.prepare('DELETE FROM coordination_outbox WHERE assignment_id IN (SELECT id FROM coordination_assignments WHERE conversation_id=?)').run(conversation)
+        this.db.prepare('DELETE FROM coordination_runs WHERE conversation_id=?').run(conversation)
+        this.db.prepare('DELETE FROM coordination_assignments WHERE conversation_id=?').run(conversation)
+        this.db.prepare('DELETE FROM coordination_front_locks WHERE conversation_id=?').run(conversation)
+        this.db.prepare('DELETE FROM coordination_protocol WHERE conversation_id=?').run(conversation)
+        this.db.prepare('DELETE FROM inbox_events WHERE conversation_id=?').run(conversation)
+      } else {
+        this.db.prepare("DELETE FROM coordination_outbox WHERE conversation_id=? AND status IN ('delivered','superseded')").run(conversation)
+        this.db.prepare('DELETE FROM coordination_front_locks WHERE conversation_id=?').run(conversation)
+        this.db.prepare(`DELETE FROM coordination_protocol WHERE conversation_id=? AND event_id NOT IN (${taskBoundEvents})`).run(conversation)
+        this.db.prepare(`DELETE FROM inbox_events WHERE conversation_id=? AND id NOT IN (${taskBoundEvents})`).run(conversation)
+        this.db.prepare('UPDATE inbox_events SET user_message_id=NULL WHERE conversation_id=?').run(conversation)
+      }
+      this.db.prepare('DELETE FROM main_conversation_messages WHERE conversation_id=?').run(conversation)
+      this.db.prepare('UPDATE coordination_front_state SET user_turns=0 WHERE conversation_id=?').run(conversation)
+    })
+  }
   /** Offline restart reconciliation. Never invoke while a live worker owns this scope. */
   recover(conversation: string): number {
     this.conversation(conversation)

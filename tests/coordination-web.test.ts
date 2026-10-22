@@ -130,3 +130,69 @@ it('模型收到的上下文不再含 JSON 信封：自己历史为 assistant �
     expect(initial[0]!.content).toContain('[名字]: 前缀')
   } finally { await host.close();owner.close() }
 })
+
+it('clearConversation 拒绝未处理输入与在途回合，清空后历史为空且幂等键可重用', async () => {
+  const owner = new SQLiteMainInboxStore(':memory:',{coordination:{mode:'preview-fresh'}}),s=owner.coordination
+  let release: ((v:{content:string})=>void) | undefined
+  const host=new CoordinationHost(s,{complete:async()=>new Promise(r=>{release=r})},demoModel(),new HeldFakeExecutor())
+  try {
+    s.admit('main','clear-1','未处理输入')
+    expect(()=>s.clearConversation('main')).toThrow()
+    host.start();host.pump()
+    await until(()=>host.status('main')==='processing')
+    expect(()=>s.clearConversation('main')).toThrow()
+    release!({content:'完成了'})
+    await until(()=>s.history('main').some(m=>m.presentation==='chat'))
+    s.clearConversation('main')
+    expect(s.history('main')).toEqual([])
+    const again=s.admit('main','clear-1','清空后的新内容')
+    expect(again.duplicate).toBe(false)
+  } finally { await host.close();owner.close() }
+})
+
+it('清空工作群级联删除任务、运行、问题与回传；活跃执行时拒绝', async () => {
+  const owner = new SQLiteMainInboxStore(':memory:',{coordination:{mode:'preview-fresh'}}),s=owner.coordination
+  try {
+    const { event }=s.admit('main','src-1','委托')
+    s.accept('main',event.id,{action:'fake-check',objective:'检查',scope:['synthetic'],completionCriteria:['完成']})
+    const run=s.claim('fake-work')!
+    s.started('fake-work',run.id)
+    expect(()=>s.clearConversation('fake-work')).toThrow()
+    s.receipt('fake-work',run.id,{kind:'waiting_input',body:'需要补充信息'})
+    expect(s.questions('fake-work').length).toBe(1)
+    expect(s.pendingOutbox('main').length).toBe(1)
+    s.clearConversation('fake-work')
+    expect(s.assignments('fake-work')).toEqual([])
+    expect(s.runs('fake-work')).toEqual([])
+    expect(s.questions('fake-work')).toEqual([])
+    expect(s.outbox('main')).toEqual([])
+    expect(s.history('fake-work')).toEqual([])
+  } finally { owner.close() }
+})
+
+it('清空对话路由：需登录、清空后历史为空、幂等键可重用', async () => {
+  const app=createCoordinationPreview({model:demoModel()});const directory=app.directory
+  const base='http://127.0.0.1:31416';let cookie=''
+  const request=async(url:string,body?:unknown)=>{
+    const req=Object.assign(Readable.from(body?[JSON.stringify(body)]:[]),{url,method:body?'POST':'GET',headers:{host:'127.0.0.1:31416',cookie,...(body?{'content-type':'application/json',origin:base}:{})}})
+    let status=0,text='';const headers=new Headers()
+    const response=Object.assign(new EventEmitter(),{setHeader:(n:string,v:string)=>headers.set(n,v),writeHead:(s:number,h:Record<string,string>)=>{status=s;for(const [k,v] of Object.entries(h))headers.set(k,v)},write:(v:string)=>{text+=v},end:(v='')=>{text+=v;response.emit('close')}})
+    await app.handle(req as unknown as IncomingMessage,response as unknown as ServerResponse)
+    return {status,headers,text:async()=>text}
+  }
+  try {
+    expect((await request('/api/clear?conversation=main',{})).status).toBe(401)
+    cookie=(await request('/api/auth/setup',{password:'synthetic-password',setupToken:app.auth.setupToken})).headers.get('set-cookie')!.split(';')[0]!
+    expect((await request('/api/messages?conversation=main',{content:'synthetic check',idempotencyKey:'clear-route'})).status).toBe(202)
+    await until(()=>app.store.coordination.questions('fake-work').length===1)
+    expect((await request('/api/clear?conversation=fake-work',{})).status).toBe(200)
+    expect(app.store.coordination.history('fake-work')).toEqual([])
+    expect(app.store.coordination.assignments('fake-work')).toEqual([])
+    expect((await request('/api/clear?conversation=main',{})).status).toBe(200)
+    expect(app.store.coordination.history('main')).toEqual([])
+    expect((await request('/api/messages?conversation=main',{content:'清空后同键新内容',idempotencyKey:'clear-route'})).status).toBe(202)
+    await until(()=>app.store.coordination.history('main').length>=1)
+    const page=await (await request('/')).text()
+    expect(page).toContain('clear-main');expect(page).toContain('清空工作项目群')
+  } finally {await app.close();rmSync(directory,{recursive:true})}
+})

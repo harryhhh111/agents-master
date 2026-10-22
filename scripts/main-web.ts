@@ -170,6 +170,7 @@ export type MainWebEvent =
   | { type: 'reply'; message: MainConversationMessage }
   | { type: 'error'; message: string }
   | { type: 'recovered'; count: number }
+  | { type: 'cleared' }
 
 type MainWebEventRecord = { cursor: number; event: MainWebEvent }
 

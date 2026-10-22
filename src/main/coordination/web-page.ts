@@ -162,7 +162,7 @@ const coordinationPageTemplate = `<!doctype html>
 <div class="composer"><form id="chat" class="chat"><textarea id="message" rows="1" aria-label="消息" placeholder="聊点什么…" autocomplete="off" maxlength="8000" enterkeyhint="enter"></textarea><span id="turn-dot" class="turn-dot" hidden title="回合进行中"></span><button id="send" disabled>发送</button></form><p class="hint">Enter 发送 · Shift + Enter 换行</p></div>
 </section>
 </div>
-<div id="settings-modal" class="modal-backdrop" hidden><div class="modal" role="dialog" aria-modal="true" aria-label="设置"><div class="modal-head"><h2>设置</h2><button id="close-settings" type="button" aria-label="关闭设置">×</button></div><div class="settings-body"><h2>主人上下文</h2><p>你明确维护的稳定背景，不是自动记忆。保存后仅影响未来回合。</p><textarea id="owner" aria-label="主人上下文" maxlength="12000"></textarea><button id="save-owner" type="button">明确保存主人上下文</button><p id="owner-status" role="status"></p><p>预览通道与稳定版数据相互独立。</p><button id="logout" type="button">退出登录</button></div></div></div>
+<div id="settings-modal" class="modal-backdrop" hidden><div class="modal" role="dialog" aria-modal="true" aria-label="设置"><div class="modal-head"><h2>设置</h2><button id="close-settings" type="button" aria-label="关闭设置">×</button></div><div class="settings-body"><h2>主人上下文</h2><p>你明确维护的稳定背景，不是自动记忆。保存后仅影响未来回合。</p><textarea id="owner" aria-label="主人上下文" maxlength="12000"></textarea><button id="save-owner" type="button">明确保存主人上下文</button><p id="owner-status" role="status"></p><p>预览通道与稳定版数据相互独立。</p><h2>清空对话</h2><p>删除该会话的全部消息记录，不可恢复；清空工作项目群会同时删除其中的任务与问题记录。对话正在处理中时不能清空。</p><button id="clear-main" type="button">清空主 Agent 对话</button> <button id="clear-group" type="button">清空工作项目群</button><p id="clear-status" role="status"></p><button id="logout" type="button">退出登录</button></div></div></div>
 </main>
 <script>
 const appConfig=__COORDINATION_PAGE_CONFIG__;
@@ -368,7 +368,8 @@ function openEvents(cursor){
     if(update.type==='submitted'){add(update.message);if(replyState!=='blocked')replyState='processing'}
     if(update.type==='reply'){add(update.message);replyState='idle';replyError=''}
     if(update.type==='error'){replyError=replyFailure(update.message);replyState='blocked'}
-    if(update.type==='recovered'){replyState=update.count?'processing':'idle';replyError=''}renderState();
+    if(update.type==='recovered'){replyState=update.count?'processing':'idle';replyError=''}
+    if(update.type==='cleared'){resetConversationView(conversation);return}renderState();
   });
   // Reload only the chat snapshot: a replay reset must not discard a draft or uncertain send.
   current.addEventListener('reset',async()=>{
@@ -458,6 +459,23 @@ document.querySelector('#save-owner').addEventListener('click',async()=>{
   try{await request('/api/owner-context',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:owner.value})});if(active(generation)){savedOwnerContent=owner.value;ownerStatus.textContent='已明确保存，仅未来回合会使用。'}}
   catch(e){if(active(generation))ownerStatus.textContent=e.message}finally{if(active(generation))button.disabled=false}
 });
+// 清空对话：本地视图复位与 switchConversation 同款清理；服务端广播 cleared 事件，其他打开的标签页也随之刷新。
+function resetConversationView(id){
+  convState.delete(id);
+  if(id!==conversation){renderConversations();return}
+  messages.replaceChildren();seen.clear();lastMessageTime=0;cardSnapshot='';
+  for(const card of cardNodes.values())card.remove();cardNodes.clear();cancelling.clear();
+  document.querySelector('#todo-area').replaceChildren();
+  replyState='idle';replyError='';renderConversations();void load();
+}
+async function clearConversation(id,label){
+  const clearStatus=document.querySelector('#clear-status');clearStatus.textContent='';
+  if(!window.confirm('确定清空「'+label+'」的全部消息记录吗？此操作不可恢复。'+(id==='fake-work'?'其中的任务与问题记录也会一并删除。':'')))return;
+  try{await request('/api/clear?conversation='+encodeURIComponent(id),{method:'POST'});resetConversationView(id);clearStatus.textContent='「'+label+'」已清空。'}
+  catch(e){clearStatus.textContent=e.message}
+}
+document.querySelector('#clear-main').addEventListener('click',()=>clearConversation('main','主 Agent 对话'));
+document.querySelector('#clear-group').addEventListener('click',()=>clearConversation('fake-work','工作项目群'));
 recoverButton.addEventListener('click',async()=>{
   if(recovering||replyState!=='blocked')return;const generation=viewGeneration;recovering=true;eventRevision++;renderState();const revision=eventRevision;
   try{const body=await request('/api/recover',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(!active(generation))return;if(eventRevision===revision){replyState=body.started?'processing':'idle';replyError=''}eventRevision++}
