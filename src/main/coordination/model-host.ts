@@ -7,8 +7,9 @@ export function addressedMain(conversation: string, content: string): boolean {
   return conversation === 'main' || content.startsWith('@main ') || content.startsWith('@主 Agent ')
 }
 
-/** 上下文以 {author,text} 信封喂给模型（见 step 的 initial）；真实模型偶尔模仿该格式回复。
- *  存储与展示前剥掉信封：仅当全文恰是单个 JSON 对象且只有 author/text 键、text 为字符串时。 */
+/** 早期上下文以 {author,text} 信封喂给模型，真实模型会模仿该格式回复（2026-10-22 线上事故）。
+ *  新上下文改用 lorca 式渲染（见 renderContextMessage）；此函数保留作兜底：
+ *  存储与展示前剥掉信封，仅当全文恰是单个 JSON 对象且只有 author/text 键、text 为字符串时。 */
 export function unwrapAuthorEnvelope(content: string): string {
   const trimmed = content.trim()
   if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return content
@@ -19,6 +20,21 @@ export function unwrapAuthorEnvelope(content: string): string {
   } catch { /* 非信封，按原文处理 */ }
   return content
 }
+/** 发言者显示名，与 web 页面（web-page.ts 的 name 映射）保持一致。 */
+const speakerNames: Record<string, string> = { user: '你', 'main-agent': '主 Agent', 'fake-work-agent': '工作项目 Agent' }
+export function speakerName(author: string): string { return speakerNames[author] ?? author }
+/** 上下文渲染（lorca 式，依据 docs/open-agent-reference-study-2026-10-22.md 第四节）：
+ *  自己的历史是 assistant 原文——模型没有信封模板可模仿；他人消息以 user 角色携带
+ *  `[名字]: ` 前缀；存量 JSON 信封内容先剥壳；他人内容行首 [ 转义为 ［，防止伪造归属行。 */
+export function renderContextMessage(m: { author: string; content: string }, self: string): WireMessage {
+  const text = unwrapAuthorEnvelope(m.content)
+  if (m.author === self) return { role: 'assistant', content: text }
+  const escaped = text.replace(/^(\s*)\[/gm, '$1［')
+  if (m.author === 'user') return { role: 'user', content: escaped }
+  return { role: 'user', content: `[${speakerName(m.author)}]: ${escaped}` }
+}
+/** 系统提示中声明上下文格式，配合 renderContextMessage。 */
+const contextFormatNote = '上下文中其他成员的发言以 [名字]: 前缀出现在 user 消息里；你的历史回复是 assistant 原文。回复只说正文，不要加任何前缀或 JSON 包装。'
 export interface CoordinationHostLabels {
   policy: string
   deliverPrefix: string
@@ -94,7 +110,7 @@ export class CoordinationHost {
       const main = addressedMain(c, turn.context.at(-1)?.content ?? '')
       author = main ? 'main-agent' : 'fake-work-agent'
       const policy = this.labels.policy + (this.cliProjects?.length ? `\ndelegate_cli 的 project 仅限白名单：${this.cliProjects.join('、')}；backend 仅限：${this.store.allowedBackends.join('、')}。` : '')
-      const initial: WireMessage[] = [{ role: 'system', content: (main ? (c === 'main' ? this.checkpoint : '群内主 Agent，仅使用本群上下文。') : '工作项目 Agent，仅使用本群上下文；可通过受限协调工具委派合成工作。') + '\n' + policy }, ...turn.context.map(m => ({ role: m.role, content: JSON.stringify({ author: m.author, text: m.content }) }))]
+      const initial: WireMessage[] = [{ role: 'system', content: (main ? (c === 'main' ? this.checkpoint : '群内主 Agent，仅使用本群上下文。') : '工作项目 Agent，仅使用本群上下文；可通过受限协调工具委派合成工作。') + '\n' + policy + '\n' + contextFormatNote }, ...turn.context.map(m => renderContextMessage(m, author))]
       const current = turn
       const reply = await scopedTurn({ model: main ? this.mainModel : this.domainModel, initial, tools: this.tools(turn), signal: controller.signal, timeoutMs: this.turnTimeoutMs,
         texts: { recorded: this.labels.recordedNote, clarify: this.labels.clarifyNote, failed: this.labels.failedNote },

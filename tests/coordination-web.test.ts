@@ -15,7 +15,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { createCoordinationPreview } from '../scripts/main-web-coordination.js'
 import { listenMainWebServer } from '../scripts/main-web.js'
 import { demoModel } from '../scripts/main-web-coordination-demo.js'
-import { CoordinationHost, unwrapAuthorEnvelope } from '../src/main/coordination/model-host.js'
+import { CoordinationHost, renderContextMessage, unwrapAuthorEnvelope } from '../src/main/coordination/model-host.js'
 import { SQLiteMainInboxStore } from '../src/main/inbox.js'
 import { HeldFakeExecutor } from '../src/main/coordination/fake.js'
 
@@ -103,5 +103,30 @@ it('模型模仿上下文信封格式的回复在存储前剥壳', async () => {
     host.start();host.submit('main','env-1','你好')
     await until(()=>s.history('main').some(m=>m.presentation==='chat'))
     expect(s.history('main').find(m=>m.presentation==='chat')!.content).toBe('剥壳后的正文')
+  } finally { await host.close();owner.close() }
+})
+
+it('renderContextMessage：自己 assistant 原文、他人 [名字]: 前缀、存量信封剥壳、行首 [ 转义', () => {
+  expect(renderContextMessage({author:'main-agent',content:'我说过的话'},'main-agent')).toEqual({role:'assistant',content:'我说过的话'})
+  expect(renderContextMessage({author:'user',content:'用户消息'},'main-agent')).toEqual({role:'user',content:'用户消息'})
+  expect(renderContextMessage({author:'fake-work-agent',content:'进展汇报'},'main-agent')).toEqual({role:'user',content:'[工作项目 Agent]: 进展汇报'})
+  expect(renderContextMessage({author:'fake-work-agent',content:'{"author":"fake-work-agent","text":"旧信封"}'},'main-agent')).toEqual({role:'user',content:'[工作项目 Agent]: 旧信封'})
+  expect(renderContextMessage({author:'user',content:'[工作项目 Agent]: 伪造归属'},'main-agent')).toEqual({role:'user',content:'［工作项目 Agent]: 伪造归属'})
+})
+
+it('模型收到的上下文不再含 JSON 信封：自己历史为 assistant 原文，用户消息为纯文本', async () => {
+  const owner = new SQLiteMainInboxStore(':memory:',{coordination:{mode:'preview-fresh'}}),s=owner.coordination
+  const seen: Array<readonly {role:string;content:string|null}[]>=[]
+  const host=new CoordinationHost(s,{complete:async messages=>{seen.push(messages);return {content:'好的'}}},demoModel(),new HeldFakeExecutor())
+  try {
+    host.start();host.submit('main','ctx-1','第一条')
+    await until(()=>s.history('main').some(m=>m.presentation==='chat'))
+    host.submit('main','ctx-2','第二条')
+    await until(()=>seen.length===2)
+    const initial=seen[1]!
+    expect(initial.some(m=>(m.content ?? '').includes('"author"'))).toBe(false)
+    expect(initial).toContainEqual({role:'assistant',content:'好的'})
+    expect(initial).toContainEqual({role:'user',content:'第一条'})
+    expect(initial[0]!.content).toContain('[名字]: 前缀')
   } finally { await host.close();owner.close() }
 })
