@@ -120,10 +120,12 @@ const coordinationPageTemplate = `<!doctype html>
 <title>主 Agent</title>
 <style>
 *{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden}body{font:16px/1.6 system-ui,sans-serif;color:#202c32;background:#edf1f3}button,input,textarea{font:inherit}button{cursor:pointer;border:1px solid #cbd5da;border-radius:12px;padding:.5rem .85rem;background:#fff;color:inherit;touch-action:manipulation}button:disabled{opacity:.45;cursor:default}button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:2px solid #087d69;outline-offset:2px}[hidden]{display:none!important}h1,h2,p,ul{margin:0}ul{padding:0;list-style:none}#app{height:100vh;height:100dvh}#im-layout{display:flex;height:100%}
-#sidebar{width:280px;flex:none;background:#f4f7f8;border-right:1px solid #dee5e8;display:flex;flex-direction:column;min-height:0}.sidebar-head{padding:.85rem 1rem;border-bottom:1px solid #e2e8eb}h1{font-size:1.05rem}#app-tagline{font-size:.72rem;color:#63737b;margin-top:.15rem}
+#sidebar{width:280px;flex:none;background:#f4f7f8;border-right:1px solid #dee5e8;display:flex;flex-direction:column;min-height:0}.sidebar-head{padding:.85rem 1rem;border-bottom:1px solid #e2e8eb}h1{font-size:1.05rem}
 #conversation-list{flex:1;min-height:0;overflow-y:auto;padding:.5rem}.conv-item{display:flex;align-items:center;gap:.5rem;padding:.6rem .7rem;border-radius:12px;cursor:pointer;margin-bottom:.2rem}.conv-item:hover{background:#eaf0f2}.conv-item.active{background:#dcebe6}.conv-text{flex:1;min-width:0;display:flex;flex-direction:column}.conv-name{font-weight:600;font-size:.92rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.conv-preview{font-size:.75rem;color:#63737b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-height:1.1em}.conv-side{display:flex;align-items:center;gap:.3rem;flex:none}.conv-badge{font-size:.68rem;border-radius:999px;padding:.05rem .45rem;background:#e3e9ec;color:#52636c;white-space:nowrap}.conv-badge.urgent{background:#fde8e8;color:#a12525}.conv-warn{width:.95rem;height:.95rem;border-radius:50%;background:#d98e04;color:#fff;font-size:.62rem;display:inline-flex;align-items:center;justify-content:center;flex:none}
-.sidebar-foot{border-top:1px solid #e2e8eb;padding:.55rem 1rem;font-size:.8rem;display:grid;gap:.45rem}#version-switch{display:flex;align-items:center;justify-content:space-between;gap:.4rem}#version-current{color:#63737b;font-size:.75rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#to-stable{color:#087d69;text-decoration:none;border:1px solid #b8d9d1;border-radius:999px;padding:.15rem .55rem;white-space:nowrap}
-#settings summary{cursor:pointer;font-size:.85rem;color:#52636c}.settings-body{padding:.4rem 0 .2rem;font-size:.85rem}.settings-body p{color:#63737b;margin:.5rem 0}.settings-body textarea{display:block;width:100%;min-height:7rem;resize:vertical;max-height:24vh;padding:.6rem;border:1px solid #cbd5da;border-radius:10px}.settings-body button{margin-top:.5rem}
+.sidebar-foot{border-top:1px solid #e2e8eb;padding:.55rem 1rem;font-size:.8rem;display:grid;gap:.45rem}.capability{font-size:.72rem;color:#63737b}#version-switch{display:flex;align-items:center;flex-wrap:wrap;gap:.3rem .5rem}#version-current{color:#63737b;font-size:.75rem;flex:1 1 100%;overflow-wrap:anywhere}#to-stable{color:#087d69;text-decoration:none;border:1px solid #b8d9d1;border-radius:999px;padding:.15rem .55rem;white-space:nowrap}#open-settings{justify-self:start;font-size:.85rem;padding:.35rem .9rem}
+.modal-backdrop{position:fixed;inset:0;z-index:20;background:#20303040;display:flex;align-items:center;justify-content:center;padding:1rem}.modal{background:#fff;border-radius:16px;width:100%;max-width:520px;max-height:85vh;overflow:auto;padding:1rem 1.25rem;box-shadow:0 8px 40px #20303030}.modal-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:.4rem}#close-settings{border:none;font-size:1.2rem;line-height:1;padding:.25rem .55rem}
+.settings-body{padding:.4rem 0 .2rem;font-size:.85rem}.settings-body p{color:#63737b;margin:.5rem 0}.settings-body textarea{display:block;width:100%;min-height:7rem;resize:vertical;max-height:24vh;padding:.6rem;border:1px solid #cbd5da;border-radius:10px}.settings-body button{margin-top:.5rem}
+#sidebar-handle{width:5px;flex:none;cursor:col-resize;background:transparent;touch-action:none}#sidebar-handle:hover,#sidebar-handle:active{background:#b8d9d1}
 #chat-panel{flex:1;min-width:0;display:flex;flex-direction:column;background:#f7f9fa}#chat-header{display:flex;align-items:center;gap:.7rem;padding:.55rem 1rem;border-bottom:1px solid #dee5e8;background:#fff;flex:none}#back-to-list{display:none;font-size:.85rem;padding:.3rem .6rem}.chat-heading{flex:1;min-width:0}#chat-title{font-size:1rem}#chat-subtitle{font-size:.72rem;color:#63737b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#todo-jump{font-size:.75rem;padding:.25rem .6rem;flex:none}.status{font-size:.78rem;color:#63737b;white-space:nowrap;flex:none}
 .control-banner{flex:none;background:#fdf6e3;border-bottom:1px solid #f0e2b6;color:#8a5a00;font-size:.82rem;padding:.45rem 1rem}.control-banner p{margin:.1rem 0}
 .todo-area{flex:none;background:#fff;border-bottom:1px solid #dee5e8;padding:.5rem 1rem;max-height:30vh;overflow:auto}
@@ -137,19 +139,20 @@ const coordinationPageTemplate = `<!doctype html>
 .composer{flex:none;background:#fff;border-top:1px solid #dee5e8;padding:.65rem 1rem max(.65rem,env(safe-area-inset-bottom))}.chat{display:flex;align-items:flex-end;gap:.6rem;min-width:0}.chat textarea{display:block;flex:1;min-width:0;width:0;resize:none;min-height:46px;max-height:160px;overflow-y:auto;border:1px solid #cbd5da;border-radius:14px;padding:.6rem .75rem;line-height:1.5}.chat button{background:#087d69;color:#fff;border-color:#087d69;min-height:46px}.turn-dot{width:.55rem;height:.55rem;border-radius:50%;background:#d98e04;align-self:center;flex:none}.hint{font-size:.72rem;color:#63737b;margin-top:.25rem}
 #reload-chat{align-self:center;margin:.5rem}
 #login-panel{position:fixed;inset:0;z-index:10;background:#f7f9fa;padding:1.5rem;overflow:auto}#login-panel form{display:grid;gap:.8rem;max-width:400px}#login-panel input{display:block;width:100%;min-width:0;border:1px solid #cbd5da;padding:.6rem;border-radius:10px}#login-panel p{margin-top:.75rem;font-size:.85rem}
-@media(max-width:767px){#sidebar{display:none;width:100%;border-right:none}body.show-list #sidebar{display:flex}body.show-list #chat-panel{display:none}#back-to-list{display:inline-block}.messages{padding:.8rem}.bubble-wrap{max-width:88%}.hint{display:none}#chat-subtitle{display:none}}
+@media(max-width:767px){#sidebar{display:none;width:100%!important;border-right:none}#sidebar-handle{display:none}body.show-list #sidebar{display:flex}body.show-list #chat-panel{display:none}#back-to-list{display:inline-block}.messages{padding:.8rem}.bubble-wrap{max-width:88%}.hint{display:none}#chat-subtitle{display:none}}
 @media(pointer:coarse){.hint{display:none}}
 </style>
 <main id="app">
 <section id="login-panel" hidden><h2 id="login-title">登录</h2><form id="login"><label id="setup-credential-panel" hidden>初始化凭据<input id="setup-credential" type="password" aria-label="初始化凭据" autocomplete="off" maxlength="200"></label><input id="password" type="password" aria-label="密码" autocomplete="current-password" minlength="8" maxlength="256" required><button id="login-button">登录</button></form><p id="login-notice"></p><p id="login-error" class="error" role="alert"></p></section>
 <div id="im-layout" hidden>
 <aside id="sidebar">
-<div class="sidebar-head"><h1>主 Agent</h1><p id="app-tagline">模拟 / 联调 · 无真实项目执行</p></div>
+<div class="sidebar-head"><h1>主 Agent</h1></div>
 <ul id="conversation-list" aria-label="会话列表"></ul>
-<div class="sidebar-foot"><nav id="version-switch" hidden><span id="version-current">当前：__PREVIEW_LABEL__</span><a id="to-stable" href="/">稳定版</a></nav>
-<details id="settings"><summary>设置</summary><div class="settings-body"><h2>主人上下文</h2><p>你明确维护的稳定背景，不是自动记忆。保存后仅影响未来回合。</p><textarea id="owner" aria-label="主人上下文" maxlength="12000"></textarea><button id="save-owner" type="button">明确保存主人上下文</button><p id="owner-status" role="status"></p><p>预览通道与稳定版数据相互独立。</p><button id="logout" type="button">退出登录</button></div></details>
+<div class="sidebar-foot"><p id="app-capability" class="capability">模拟 / 联调 · 无真实项目执行</p><nav id="version-switch" hidden><span id="version-current">当前：__PREVIEW_LABEL__</span><a id="to-stable" href="/">稳定版</a></nav>
+<button id="open-settings" type="button">设置</button>
 </div>
 </aside>
+<div id="sidebar-handle" aria-hidden="true"></div>
 <section id="chat-panel">
 <header id="chat-header"><button id="back-to-list" type="button">‹ 会话</button><div class="chat-heading"><h2 id="chat-title">主 Agent</h2><p id="chat-subtitle">一对一 · 置顶</p></div><button id="todo-jump" type="button" hidden>待办 0</button><p id="status" class="status" role="status">正在连接…</p></header>
 <div id="control-banner" class="control-banner" role="alert" hidden></div>
@@ -159,6 +162,7 @@ const coordinationPageTemplate = `<!doctype html>
 <div class="composer"><form id="chat" class="chat"><textarea id="message" rows="1" aria-label="消息" placeholder="聊点什么…" autocomplete="off" maxlength="8000" enterkeyhint="enter"></textarea><span id="turn-dot" class="turn-dot" hidden title="回合进行中"></span><button id="send" disabled>发送</button></form><p class="hint">Enter 发送 · Shift + Enter 换行</p></div>
 </section>
 </div>
+<div id="settings-modal" class="modal-backdrop" hidden><div class="modal" role="dialog" aria-modal="true" aria-label="设置"><div class="modal-head"><h2>设置</h2><button id="close-settings" type="button" aria-label="关闭设置">×</button></div><div class="settings-body"><h2>主人上下文</h2><p>你明确维护的稳定背景，不是自动记忆。保存后仅影响未来回合。</p><textarea id="owner" aria-label="主人上下文" maxlength="12000"></textarea><button id="save-owner" type="button">明确保存主人上下文</button><p id="owner-status" role="status"></p><p>预览通道与稳定版数据相互独立。</p><button id="logout" type="button">退出登录</button></div></div></div>
 </main>
 <script>
 const appConfig=__COORDINATION_PAGE_CONFIG__;
@@ -259,7 +263,7 @@ function showLogin(configured=true){
   drafts.clear();answerDrafts.clear();answerFocus.clear();controlKeys.clear();uncertainControls.clear();rejectedControls.clear();cancelling.clear();cardSnapshot='';
   for(const card of cardNodes.values())card.remove();cardNodes.clear();document.querySelector('#todo-area').replaceChildren();
   conversations.length=0;convState.clear();listEl.replaceChildren();banner.replaceChildren();banner.hidden=true;
-  latest.hidden=true;reloadButton.hidden=true;ownerStatus.textContent='';document.querySelector('#settings').open=false;document.querySelector('#save-owner').disabled=false;document.querySelector('#login-button').disabled=false;
+  latest.hidden=true;reloadButton.hidden=true;ownerStatus.textContent='';document.querySelector('#settings-modal').hidden=true;document.querySelector('#save-owner').disabled=false;document.querySelector('#login-button').disabled=false;
   renderSendErrors();renderTodoEntry();resizeInput();updateSend();if(configured)clearSetupToken();
   document.querySelector('#setup-credential-panel').hidden=configured;document.querySelector('#setup-credential').value=setupToken||'';document.querySelector('#login-title').textContent=configured?'登录':'设置登录密码';document.querySelector('#login-button').textContent=configured?'登录':'设置密码';password.autocomplete=configured?'current-password':'new-password';
   document.querySelector('#login-notice').textContent=configured?'登录状态保持 30 天。':'请设置至少 8 个字符的密码。若没有初始化凭据，请从服务器本次启动日志中的 #setup_token= 后复制凭据并填入上方。';
@@ -300,7 +304,6 @@ if(typeof window!=='undefined'){
   window.addEventListener('resize',syncChatSize);
   window.visualViewport?.addEventListener('resize',syncChatSize);
 }
-document.querySelector('#settings').addEventListener('toggle',syncChatSize);
 latest.addEventListener('click',goLatest);
 function formatTime(value){const d=new Date(value);if(isNaN(d.getTime()))return'';return (d.getMonth()+1)+'月'+d.getDate()+'日 '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')}
 function add(message){
@@ -510,6 +513,27 @@ function setupVersionSwitch(){
     if(leaveDirty()&&!confirm('离开预览将丢弃未提交内容。'))event.preventDefault();
   });
 }
+// 设置弹窗：按钮打开，Esc / 点遮罩 / × 关闭；退出登录守卫不变。
+const settingsModal=document.querySelector('#settings-modal');
+document.querySelector('#open-settings').addEventListener('click',()=>{settingsModal.hidden=false});
+document.querySelector('#close-settings').addEventListener('click',()=>{settingsModal.hidden=true});
+settingsModal.addEventListener('click',event=>{if(event.target===settingsModal)settingsModal.hidden=true});
+window.addEventListener('keydown',event=>{if(event.key==='Escape')settingsModal.hidden=true});
+// 左栏宽度拖拽：200–400px，localStorage 记忆；窄屏单栏不出现也不生效。
+const sidebarEl=document.querySelector('#sidebar'),sidebarHandle=document.querySelector('#sidebar-handle'),sidebarWidthKey='agents-preview-sidebar-width';
+function narrowLayout(){return typeof matchMedia==='function'&&matchMedia('(max-width: 767px)').matches}
+function clampSidebarWidth(w){return Math.min(400,Math.max(200,Math.round(w)))}
+try{const savedWidth=Number(localStorage.getItem(sidebarWidthKey));if(savedWidth>=200&&savedWidth<=400)sidebarEl.style.width=clampSidebarWidth(savedWidth)+'px'}catch(e){}
+sidebarHandle.addEventListener('pointerdown',event=>{
+  if(narrowLayout())return;
+  event.preventDefault();
+  const move=moveEvent=>{sidebarEl.style.width=clampSidebarWidth(moveEvent.clientX)+'px'};
+  const up=upEvent=>{
+    window.removeEventListener('pointermove',move);window.removeEventListener('pointerup',up);
+    try{localStorage.setItem(sidebarWidthKey,String(clampSidebarWidth(upEvent.clientX)))}catch(e){}
+  };
+  window.addEventListener('pointermove',move);window.addEventListener('pointerup',up);
+});
 window.addEventListener('beforeunload',event=>{if(leaveBlock()){event.preventDefault();event.returnValue=''}});
 setupVersionSwitch();
 initialize();

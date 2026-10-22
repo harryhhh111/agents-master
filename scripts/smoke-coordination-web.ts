@@ -52,7 +52,7 @@ with sync_playwright() as p:
     expect(page.locator('#messages')).to_contain_text('模拟/联调回传', timeout=15000)
     page.reload()
     page.locator('#message').wait_for(state='visible')
-    page.locator('#settings').evaluate('(e)=>e.open=true')
+    page.locator('#open-settings').click()
     page.locator('#logout').click()
     page.locator('#password').wait_for(state='visible')
     assert page.request.get(url+'/api/status').status == 401
