@@ -15,7 +15,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { createCoordinationPreview } from '../scripts/main-web-coordination.js'
 import { listenMainWebServer } from '../scripts/main-web.js'
 import { demoModel } from '../scripts/main-web-coordination-demo.js'
-import { CoordinationHost } from '../src/main/coordination/model-host.js'
+import { CoordinationHost, unwrapAuthorEnvelope } from '../src/main/coordination/model-host.js'
 import { SQLiteMainInboxStore } from '../src/main/inbox.js'
 import { HeldFakeExecutor } from '../src/main/coordination/fake.js'
 
@@ -86,4 +86,22 @@ it('v2 preview reopen preserves waiting questions and cancellation is source bou
     expect(()=>app.store.coordination.control('fake-work','late','A','answer',q.id)).toThrow('Stale')
     expect(()=>app.store.coordination.control('main','cancel','cancel synthetic','cancel','other')).toThrow('conflict')
   } finally {await app.close();rmSync(directory,{recursive:true})}
+})
+
+it('unwrapAuthorEnvelope 只剥完整信封，普通文本与非信封 JSON 原样保留', () => {
+  expect(unwrapAuthorEnvelope('{"author":"main-agent","text":"正文"}')).toBe('正文')
+  expect(unwrapAuthorEnvelope('普通文本')).toBe('普通文本')
+  expect(unwrapAuthorEnvelope('{"foo":1}')).toBe('{"foo":1}')
+  expect(unwrapAuthorEnvelope('{"author":"m","text":"a","extra":1}')).toContain('extra')
+  expect(unwrapAuthorEnvelope('前缀 {"author":"m","text":"x"} 后缀')).toContain('前缀')
+})
+
+it('模型模仿上下文信封格式的回复在存储前剥壳', async () => {
+  const owner = new SQLiteMainInboxStore(':memory:',{coordination:{mode:'preview-fresh'}}),s=owner.coordination
+  const host=new CoordinationHost(s,{complete:async()=>({content:'{"author":"main-agent","text":"剥壳后的正文"}'})},demoModel(),new HeldFakeExecutor())
+  try {
+    host.start();host.submit('main','env-1','你好')
+    await until(()=>s.history('main').some(m=>m.presentation==='chat'))
+    expect(s.history('main').find(m=>m.presentation==='chat')!.content).toBe('剥壳后的正文')
+  } finally { await host.close();owner.close() }
 })

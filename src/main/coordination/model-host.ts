@@ -6,6 +6,19 @@ import { FakeBackgroundScheduler, type FakeExecutor } from './fake.js'
 export function addressedMain(conversation: string, content: string): boolean {
   return conversation === 'main' || content.startsWith('@main ') || content.startsWith('@主 Agent ')
 }
+
+/** 上下文以 {author,text} 信封喂给模型（见 step 的 initial）；真实模型偶尔模仿该格式回复。
+ *  存储与展示前剥掉信封：仅当全文恰是单个 JSON 对象且只有 author/text 键、text 为字符串时。 */
+export function unwrapAuthorEnvelope(content: string): string {
+  const trimmed = content.trim()
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return content
+  try {
+    const parsed = JSON.parse(trimmed) as Record<string, unknown>
+    if (parsed && typeof parsed === 'object' && typeof parsed.text === 'string'
+        && Object.keys(parsed).every(k => k === 'author' || k === 'text')) return parsed.text
+  } catch { /* 非信封，按原文处理 */ }
+  return content
+}
 export interface CoordinationHostLabels {
   policy: string
   deliverPrefix: string
@@ -89,7 +102,7 @@ export class CoordinationHost {
         load: () => this.store.protocol<ScopedState>(current), save: s => this.store.saveProtocol(current, s),
         commit: work => this.store.commitProtocol(current, work, s => s),
       })
-      if (!this.stopped) this.store.finishChat(turn, reply, author)
+      if (!this.stopped) this.store.finishChat(turn, unwrapAuthorEnvelope(reply), author)
     } catch (error) {
       if (turn) {
         const state = this.store.protocol<ScopedState>(turn)

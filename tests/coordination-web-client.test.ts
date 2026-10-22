@@ -299,3 +299,12 @@ it('U1-b 提交期间往返同一会话：迟到的失败立即显示错误与�
   // 占用已释放，离开检查不再拦截
   expect(h.run('leaveBlock()')).toBeUndefined()
 })
+
+it('存量信封消息展示层剥壳：气泡显示正文，非信封 JSON 原样显示', async () => {
+  const h = await settledHarness()
+  const envelope = { id: 'env-m1', conversation_id: 'main', author: 'main-agent', role: 'assistant', presentation: 'chat', content: '{"author":"main-agent","text":"剥壳后的正文"}', createdAt: '2026-10-22T01:00:00.000Z' }
+  const plainJson = { ...envelope, id: 'env-m2', content: '{"foo":1}' }
+  h.run(`add(${JSON.stringify(envelope)});add(${JSON.stringify(plainJson)})`)
+  const texts = h.run(`(function(){const out=[];const walk=n=>{if(String(n.className||'').includes('bubble-text'))out.push(n.textContent);for(const c of n.children)walk(c)};walk(document.querySelector('#messages'));return out})()`) as string[]
+  expect(texts).toEqual(['剥壳后的正文', '{"foo":1}'])
+})
