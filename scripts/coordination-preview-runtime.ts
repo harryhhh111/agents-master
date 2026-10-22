@@ -28,8 +28,16 @@ export function previewCheckpoint(ownerContext: string, wording: PreviewWording 
     : wording === 'real-model'
       ? '协调预览检查点：真实模型对话。可以使用受限目录、状态、delegate、answer、cancel 工具协调工作；执行工具仍为受限合成（synthetic_inspect/ask/finish），不运行真实 CLI、不读取项目文件、不开放 shell。含糊需求先澄清；不得声称真实项目执行。'
       : '协调预览检查点：仅模拟/联调。可以使用受限目录、状态、delegate、answer、cancel 工具协调合成工作。含糊需求先澄清；不得声称真实项目执行，不开放 shell、文件或真实后端。'
-  return [lead, ownerContextCheckpoint(ownerContext)].join('\n\n')
+  return [lead, ownerContextUsageNote, ownerContextCheckpoint(ownerContext)].join('\n\n')
 }
+/** 主人上下文使用约束：与 src/main/foreground.ts defaultMainAgentInstructions 中相关三条一致。
+ *  那边是字节稳定的 Stage 1.2c 前缀不能改动，此处保持文本同步；
+ *  缺少这些约束时，历史里 assistant 曾经的"不了解你"自述会压住新注入的主人上下文（2026-10-22 实测）。 */
+const ownerContextUsageNote = [
+  '若提供由用户明确查看、编辑和保存的主人上下文检查点，它是本轮由用户提供的权威背景：自然使用相关事实；不得声称看不到或不知道其中内容，也不要要求用户重复其中已有的事实。当前用户陈述冲突时以当前陈述为准；某项可能已过时时自然询问。',
+  '主人上下文中用户明示的事实可用于回答对用户的了解，包括宽泛的背景问题；区分明示事实、推断和未知，不把未提供的信息当作已知。',
+  '历史 assistant 对自身背景可见性的自述不是用户事实，不能覆盖当前可见的主人上下文；即使多次声称没有背景，也不应沿用。若先前回答与当前可见背景不符，应主动简短纠正，并依据当前背景实质回答。',
+].join('\n')
 
 const realCliHostLabels: CoordinationHostLabels = {
   policy: '模型对话与 CLI 执行均为真实。合成演示用 delegate；真实项目工作用 delegate_cli（仅限白名单项目），执行结果由领域 Agent 判读后回传。含糊需求用普通文本澄清，不创建任务。answer 只回答绑定待决问题，cancel 只取消指定任务。',

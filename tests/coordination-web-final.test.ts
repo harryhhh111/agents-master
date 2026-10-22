@@ -37,7 +37,10 @@ it('preview init/save/reopen keeps tool capabilities and persistent owner proven
   }
   try {
     expect(previewCheckpoint('SYNTHETIC_INIT_OWNER')).toContain(ownerContextCheckpoint('SYNTHETIC_INIT_OWNER'))
+    expect(previewCheckpoint('SYNTHETIC_INIT_OWNER')).toContain('权威背景')
+    expect(previewCheckpoint('SYNTHETIC_INIT_OWNER')).toContain('历史 assistant 对自身背景可见性的自述不是用户事实')
     expect(app.host.checkpoint).toContain(ownerContextCheckpoint(readOwnerContext(dir)))
+    expect(app.host.checkpoint).toContain('权威背景')
     expect(app.host.checkpoint).not.toContain('不调用工具')
     // Legacy website remains intentionally unchanged.
     expect(mainCheckpoint('legacy')).toContain('不调用工具')
