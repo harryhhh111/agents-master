@@ -23,13 +23,13 @@ export type PreviewWording = 'synthetic' | 'real-model'
 /** synthetic: 合成执行器；cli: 白名单项目的真实 CLI 执行（要求 wording=real-model）。 */
 export type PreviewExecution = 'synthetic' | 'cli'
 
-export function previewCheckpoint(ownerContext: string, wording: PreviewWording = 'synthetic', execution: PreviewExecution = 'synthetic', memories: readonly MemoryRecord[] = []): string {
+export function previewCheckpoint(ownerContext: string, wording: PreviewWording = 'synthetic', execution: PreviewExecution = 'synthetic', memories: readonly MemoryRecord[] = [], memoryTombstones: readonly MemoryRecord[] = []): string {
   const lead = execution === 'cli'
     ? '协调预览检查点：真实模型对话与真实 CLI 执行（仅限白名单项目）。使用受限目录、状态、delegate、delegate_cli、answer、cancel 工具。CLI 任务有预算与超时，产物落项目 .agent-artifacts/；不 push、不删工作区外文件、不碰凭据。含糊需求先澄清；不得声称白名单外的执行能力。'
     : wording === 'real-model'
       ? '协调预览检查点：真实模型对话。可以使用受限目录、状态、delegate、answer、cancel 工具协调工作；执行工具仍为受限合成（synthetic_inspect/ask/finish），不运行真实 CLI、不读取项目文件、不开放 shell。含糊需求先澄清；不得声称真实项目执行。'
       : '协调预览检查点：仅模拟/联调。可以使用受限目录、状态、delegate、answer、cancel 工具协调合成工作。含糊需求先澄清；不得声称真实项目执行，不开放 shell、文件或真实后端。'
-  return [lead, ownerContextUsageNote, memorySuggestionNote, ownerContextCheckpoint(ownerContext), memoriesCheckpoint(memories)].filter(Boolean).join('\n\n')
+  return [lead, ownerContextUsageNote, memoryCapabilityNote, ownerContextCheckpoint(ownerContext), memoriesCheckpoint(memories, memoryTombstones)].filter(Boolean).join('\n\n')
 }
 /** 主人上下文使用约束：与 src/main/foreground.ts defaultMainAgentInstructions 中相关三条一致。
  *  那边是字节稳定的 Stage 1.2c 前缀不能改动，此处保持文本同步；
@@ -39,8 +39,14 @@ const ownerContextUsageNote = [
   '主人上下文中用户明示的事实可用于回答对用户的了解，包括宽泛的背景问题；区分明示事实、推断和未知，不把未提供的信息当作已知。',
   '历史 assistant 对自身背景可见性的自述不是用户事实，不能覆盖当前可见的主人上下文；即使多次声称没有背景，也不应沿用。若先前回答与当前可见背景不符，应主动简短纠正，并依据当前背景实质回答。',
 ].join('\n')
-/** 提议制记忆的使用约束：工具仅在主对话存在；提议不是记住，用户确认后才进入检查点。 */
-const memorySuggestionNote = '用户明示的关于其自身的稳定事实，可调用 suggest_memory 提议记住；仅复述用户明示内容，不做推测，每回合至多一条，普通对话不要提议。提议需用户确认后才会被记住；已确认的记忆列在下方"已确认的记忆"中（如有）。'
+/** 记忆能力约束（docs/main-agent-memory-repair-plan-2026-10-24.md）：工具仅在主对话存在。
+ *  明确告诉模型记忆可读、可经工具核对——没有通用文件访问能力不等于无法读取应用提供的记忆。 */
+const memoryCapabilityNote = [
+  '记忆能力：用户明示的关于其自身的稳定事实，可调用 suggest_memory 提议记住（仅复述用户明示内容，不做推测，每回合至多一条，普通对话不要提议）；提议经用户确认后才真正被记住。',
+  '记忆保存在本应用的私有数据目录，用户可在设置的记忆列表查看；你可以用 read_memories 自查记忆的 ID、内容与状态。回答"你记住了什么""刚才确认成功了吗"等问题时以 read_memories 的返回为准，不要声称无法读取。',
+  '用户明确说确认/改正/忘记某条记忆时，用 confirm_memory/correct_memory/forget_memory 按记录 ID 执行；目标不清先询问，普通讨论、假设或你的推测都不是修改授权。操作结果以工具返回为准：只有成功才能说已确认/已修改/已忘记，失败要如实说明。',
+  '已确认的记忆列在下方"已确认的记忆"中（如有）；"已失效的记忆"（如有）是用户已忘记或更正的内容，不再是当前事实。',
+].join('\n')
 
 const realCliHostLabels: CoordinationHostLabels = {
   policy: '模型对话与 CLI 执行均为真实。合成演示用 delegate；真实项目工作用 delegate_cli（仅限白名单项目），执行结果由领域 Agent 判读后回传。含糊需求用普通文本澄清，不创建任务。answer 只回答绑定待决问题，cancel 只取消指定任务。',
@@ -137,13 +143,21 @@ export function createCoordinationRuntime(options: {
         }))
       : syntheticExecutor())
     const memories = new AgentMemories(directory)
-    const refreshCheckpoint = () => { host.checkpoint = previewCheckpoint(readOwnerContext(directory), wording, execution, memories.confirmed()) }
+    const refreshCheckpoint = () => { host.checkpoint = previewCheckpoint(readOwnerContext(directory), wording, execution, memories.confirmed(), memories.tombstones()) }
     const host = new CoordinationHost(store.coordination, options.model, options.domainModel ?? options.model,
       executor,
       () => {
       for (const [c, bus] of buses) for (const m of store.coordination.history(c)) if (!emitted.has(m.id)) { emitted.add(m.id); bus.publish({ type: m.author === 'user' ? 'submitted' : 'reply', message: { ...m, createdAt: m.created_at } }) }
     }, hostLabels, turnTimeoutMs, protocolCorrection, execution === 'cli' ? Object.keys(options.cli!.projects) : undefined,
-      (fact, sourceEvent) => memories.suggest(fact, sourceEvent))
+      {
+        suggest: (fact, sourceEvent) => memories.suggest(fact, sourceEvent),
+        read: () => memories.active().map(m => ({ id: m.id, fact: m.fact, status: m.status, sourceEvent: m.sourceEvent, updatedAt: m.updatedAt })),
+        manage: (action, id, newFact, operationId, sourceEvent) => {
+          const result = action === 'confirm' ? memories.confirm(id) : action === 'correct' ? memories.correct(id, newFact!, operationId, sourceEvent) : memories.forget(id)
+          refreshCheckpoint()
+          return result
+        },
+      })
     refreshCheckpoint()
     host.start()
     const closeConnections = () => { for (const bus of buses.values()) bus.close() }
@@ -176,12 +190,14 @@ export function createCoordinationRuntime(options: {
             try {
               const body = await readJson(request)
               if (Object.keys(body).sort().join() !== 'action,id' || typeof body.id !== 'string') throw new Error('Unexpected fields')
-              if (body.action === 'confirm') memories.confirm(body.id)
-              else if (body.action === 'dismiss') memories.dismiss(body.id)
-              else if (body.action === 'delete') memories.remove(body.id)
-              else throw new Error('Invalid action')
+              // forget 即界面"忘记/不再使用"：墓碑化，不物理删除；结果携带真实最终状态。
+              const op = body.action === 'confirm' ? memories.confirm(body.id)
+                : body.action === 'dismiss' ? memories.dismiss(body.id)
+                : body.action === 'forget' ? memories.forget(body.id)
+                : undefined
+              if (!op) throw new Error('Invalid action')
               refreshCheckpoint()
-              json(response, 200, { ok: true })
+              json(response, 200, { ok: true, applied: op.applied, record: op.record })
             } catch { json(response, 400, { error: '记忆操作未接受：记录不存在或状态无效。' }) }
             return true
           }

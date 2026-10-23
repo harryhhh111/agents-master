@@ -163,7 +163,7 @@ const coordinationPageTemplate = `<!doctype html>
 <div class="composer"><form id="chat" class="chat"><textarea id="message" rows="1" aria-label="消息" placeholder="聊点什么…" autocomplete="off" maxlength="8000" enterkeyhint="enter"></textarea><span id="turn-dot" class="turn-dot" hidden title="回合进行中"></span><button id="send" disabled>发送</button></form><p class="hint">Enter 发送 · Shift + Enter 换行</p></div>
 </section>
 </div>
-<div id="settings-modal" class="modal-backdrop" hidden><div class="modal" role="dialog" aria-modal="true" aria-label="设置"><div class="modal-head"><h2>设置</h2><button id="close-settings" type="button" aria-label="关闭设置">×</button></div><div class="settings-body"><h2>主人上下文</h2><p>你明确维护的稳定背景，不是自动记忆。保存后仅影响未来回合。</p><textarea id="owner" aria-label="主人上下文" maxlength="12000"></textarea><button id="save-owner" type="button">明确保存主人上下文</button><p id="owner-status" role="status"></p><p>预览通道与稳定版数据相互独立。</p><h2>清空对话</h2><p>删除该会话的全部消息记录，不可恢复；清空工作项目群会同时删除其中的任务与问题记录。对话正在处理中时不能清空。</p><button id="clear-main" type="button">清空主 Agent 对话</button> <button id="clear-group" type="button">清空工作项目群</button><p id="clear-status" role="status"></p><h2>已确认的记忆</h2><p>模型提议、你明确确认过的关于你的事实，会进入后续对话的背景。删除后不再使用。</p><ul id="memory-list"></ul><button id="logout" type="button">退出登录</button></div></div></div>
+<div id="settings-modal" class="modal-backdrop" hidden><div class="modal" role="dialog" aria-modal="true" aria-label="设置"><div class="modal-head"><h2>设置</h2><button id="close-settings" type="button" aria-label="关闭设置">×</button></div><div class="settings-body"><h2>主人上下文</h2><p>你明确维护的稳定背景，不是自动记忆。保存后仅影响未来回合。</p><textarea id="owner" aria-label="主人上下文" maxlength="12000"></textarea><button id="save-owner" type="button">明确保存主人上下文</button><p id="owner-status" role="status"></p><p>预览通道与稳定版数据相互独立。</p><h2>清空对话</h2><p>删除该会话的全部消息记录，不可恢复；清空工作项目群会同时删除其中的任务与问题记录。对话正在处理中时不能清空。</p><button id="clear-main" type="button">清空主 Agent 对话</button> <button id="clear-group" type="button">清空工作项目群</button><p id="clear-status" role="status"></p><h2>已确认的记忆</h2><p>模型提议、你明确确认过的关于你的事实，会进入后续对话的背景。忘记后不再作为当前事实使用，原始聊天记录不受影响。也可以在对话里直接说"把某条改成……"或"忘记某条"。</p><ul id="memory-list"></ul><button id="logout" type="button">退出登录</button></div></div></div>
 </main>
 <script>
 const appConfig=__COORDINATION_PAGE_CONFIG__;
@@ -478,7 +478,7 @@ async function clearConversation(id,label){
 }
 document.querySelector('#clear-main').addEventListener('click',()=>clearConversation('main','主 Agent 对话'));
 document.querySelector('#clear-group').addEventListener('click',()=>clearConversation('fake-work','工作项目群'));
-// 提议制记忆：pending 提议在主对话顶部成卡片，确认/忽略后服务端刷新检查点；已确认记忆在设置里可删。
+// 提议制记忆：pending 提议在主对话顶部成卡片，确认/忽略后服务端刷新检查点；已确认记忆在设置里可忘记（墓碑化，不物理删除）。
 function renderMemorySuggestions(){
   const area=document.querySelector('#memory-area');area.replaceChildren();
   if(conversation!=='main'||!memorySuggestions.length){area.hidden=true;return}
@@ -504,8 +504,8 @@ async function loadMemories(){
   try{const data=await request('/api/memories');list.replaceChildren();
     for(const m of (data.memories||[]).filter(m=>m.status==='confirmed')){
       const item=document.createElement('li');item.append(document.createTextNode(m.fact+' '));
-      const del=document.createElement('button');del.type='button';del.textContent='删除';
-      del.addEventListener('click',async()=>{del.disabled=true;try{await request('/api/memories',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:m.id,action:'delete'})});await loadMemories()}catch(e){del.disabled=false}});
+      const del=document.createElement('button');del.type='button';del.textContent='忘记';
+      del.addEventListener('click',async()=>{del.disabled=true;try{await request('/api/memories',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:m.id,action:'forget'})});await loadMemories()}catch(e){del.disabled=false}});
       item.append(del);list.append(item);
     }
     if(!list.children.length){const empty=document.createElement('li');empty.textContent='暂无已确认的记忆。';list.append(empty)}

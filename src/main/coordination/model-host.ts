@@ -52,6 +52,13 @@ export const defaultCoordinationHostLabels: CoordinationHostLabels = {
   clarifyNote: defaultScopedTurnTexts.clarify,
   failedNote: defaultScopedTurnTexts.failed,
 }
+/** 主对话记忆工具的服务端桥接（docs/main-agent-memory-repair-plan-2026-10-24.md）：
+ *  查询/写入的事件来源与操作标识由宿主绑定（turn.event.id），模型不能伪造用户指令来源。 */
+export interface MemoryToolSink {
+  suggest(fact: string, sourceEvent: string): unknown
+  read(): unknown
+  manage(action: 'confirm' | 'correct' | 'forget', id: string, newFact: string | undefined, operationId: string, sourceEvent: string): unknown
+}
 export class CoordinationHost {
   private readonly busy = new Set<string>()
   private readonly blocked = new Set<string>()
@@ -66,7 +73,7 @@ export class CoordinationHost {
     private readonly executor: FakeExecutor & { stop?(id: string): void }, private readonly changed: () => void = () => {},
     private readonly labels: CoordinationHostLabels = defaultCoordinationHostLabels, private readonly turnTimeoutMs?: number,
     private readonly protocolCorrection = false, private readonly cliProjects?: readonly string[],
-    private readonly onSuggestMemory?: (fact: string, sourceEvent: string) => unknown) {
+    private readonly memory?: MemoryToolSink) {
     this.background = new FakeBackgroundScheduler(store, executor, changed)
   }
   start(): void {
@@ -96,10 +103,19 @@ export class CoordinationHost {
       } : {}),
       answer: { fields: { questionId: 'text' }, terminal: true, execute: a => this.store.answer(FAKE_GROUP, String(a.questionId), turn.conversation, turn.event.id) },
       cancel: { fields: { assignmentId: 'text' }, terminal: true, execute: a => this.store.cancel(FAKE_GROUP, String(a.assignmentId)) },
-      // 提议制记忆：仅主对话、仅组装方注入接收器时存在；非终止工具，模型提议后继续回复。
-      ...(this.onSuggestMemory && turn.conversation === 'main' ? {
+      // 提议制记忆：仅主对话、仅组装方注入桥接时存在；均为非终止工具，模型操作后继续回复。
+      // 事件来源与 correct 操作标识由宿主绑定（turn.event.id），模型不能伪造用户指令来源。
+      ...(this.memory && turn.conversation === 'main' ? {
         suggest_memory: { fields: { fact: 'text' }, description: '提议记住用户在对话中明示的关于其自身的稳定事实（如居住、偏好、长期计划）。仅复述用户明确说过的内容，不做推测；每回合至多一条；普通对话、临时事项、任务相关内容不要使用。',
-          execute: a => ({ suggested: (this.onSuggestMemory!(String(a.fact), turn.event.id) as { id: string }).id }) },
+          execute: a => this.memory!.suggest(String(a.fact), turn.event.id) },
+        read_memories: { fields: {}, description: '读取当前记忆列表（记录 ID、内容、状态、来源、更新时间）。回答"你记住了什么""刚才确认成功了吗"等状态问题前调用自查，以返回结果为准。',
+          execute: () => this.memory!.read() },
+        confirm_memory: { fields: { id: 'text' }, description: '用户明确说确认某条记忆提议时调用，id 为记录 ID。仅在返回 applied=true 或记录已是 confirmed 时说已确认。',
+          execute: a => this.memory!.manage('confirm', String(a.id), undefined, '', turn.event.id) },
+        correct_memory: { fields: { id: 'text', newFact: 'text' }, description: '用户明确说把某条记忆改成新内容时调用：旧记录作废，newFact 成为当前事实。普通讨论、假设或你的推测都不是修改授权；目标不清时先用普通文本询问。',
+          execute: a => this.memory!.manage('correct', String(a.id), String(a.newFact), `${turn.event.id}:${String(a.id)}:${String(a.newFact)}`, turn.event.id) },
+        forget_memory: { fields: { id: 'text' }, description: '用户明确说忘记/不再使用某条记忆时调用，id 为记录 ID。忘记后该事实不再作为当前事实使用，但原始聊天记录不受影响。',
+          execute: a => this.memory!.manage('forget', String(a.id), undefined, '', turn.event.id) },
       } : {}),
     }
   }

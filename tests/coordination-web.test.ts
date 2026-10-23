@@ -204,11 +204,11 @@ it('清空对话路由：需登录、清空后历史为空、幂等键可重用'
   } finally {await app.close();rmSync(directory,{recursive:true})}
 })
 
-it('suggest_memory 工具把提议送入接收器且回合正常完成', async () => {
+it('suggest_memory 工具把提议送入桥接且回合正常完成', async () => {
   const owner = new SQLiteMainInboxStore(':memory:',{coordination:{mode:'preview-fresh'}}),s=owner.coordination
   const suggestions: Array<{fact:string,source:string}> = []
   let calls=0
-  const host=new CoordinationHost(s,{complete:async()=>{calls++;if(calls===1)return {content:null,tool_calls:[{id:'sm',type:'function',function:{name:'suggest_memory',arguments:'{"fact":"主人旅居昆明"}'}}]};return {content:'好的'}}},demoModel(),new HeldFakeExecutor(),undefined,undefined,undefined,undefined,undefined,(fact:string,source:string)=>{suggestions.push({fact,source});return {id:'m1'}})
+  const host=new CoordinationHost(s,{complete:async()=>{calls++;if(calls===1)return {content:null,tool_calls:[{id:'sm',type:'function',function:{name:'suggest_memory',arguments:'{"fact":"主人旅居昆明"}'}}]};return {content:'好的'}}},demoModel(),new HeldFakeExecutor(),undefined,undefined,undefined,undefined,undefined,{suggest:(fact:string,source:string)=>{suggestions.push({fact,source});return {record:{id:'m1',status:'pending'},created:true}},read:()=>[],manage:()=>{throw new Error('unexpected')}})
   try {
     host.start();host.submit('main','mem-1','我2026年5月底在昆明租了房子')
     await until(()=>s.history('main').some(m=>m.presentation==='chat'))
@@ -219,7 +219,7 @@ it('suggest_memory 工具把提议送入接收器且回合正常完成', async (
   } finally { await host.close();owner.close() }
 })
 
-it('记忆路由：提议进状态、确认后进检查点、删除后移出、未知记录 400', async () => {
+it('记忆路由：提议进状态、确认后进检查点、忘记后墓碑化进失效段、未知记录 400', async () => {
   const suggestingModel: ScopedModel = { complete: async (messages, tools) =>
     tools.some(t=>t.function.name==='suggest_memory') && !messages.some(m=>m.role==='tool')
       ? { content:null, tool_calls:[{id:'sm',type:'function',function:{name:'suggest_memory',arguments:'{"fact":"主人旅居昆明"}'}}] }
@@ -246,10 +246,68 @@ it('记忆路由：提议进状态、确认后进检查点、删除后移出、�
     expect((await request('/api/memories',{id,action:'confirm'})).status).toBe(200)
     expect(app.host.checkpoint).toContain('已确认的记忆')
     expect(app.host.checkpoint).toContain('主人旅居昆明')
-    expect((await request('/api/memories',{id,action:'delete'})).status).toBe(200)
-    expect(app.host.checkpoint).not.toContain('主人旅居昆明')
+    expect((await request('/api/memories',{id,action:'forget'})).status).toBe(200)
+    // 忘记是墓碑化：有效段不再含该事实，失效段列出"已被主人明确忘记"；记录本身仍在。
+    expect(app.host.checkpoint).not.toContain('- 主人旅居昆明')
+    expect(app.host.checkpoint).toContain('已失效的记忆')
+    expect(app.host.checkpoint).toContain('「主人旅居昆明」已被主人明确忘记')
+    const forgotten=JSON.parse(await (await request('/api/memories',{id,action:'forget'})).text())
+    expect(forgotten.applied).toBe(false);expect(forgotten.record.status).toBe('forgotten')
     expect((await request('/api/memories',{id:'unknown',action:'confirm'})).status).toBe(400)
     const page=await (await request('/')).text()
     expect(page).toContain('memory-area');expect(page).toContain('已确认的记忆')
+    expect(page).toContain("action:'forget'")
   } finally {await app.close();rmSync(directory,{recursive:true})}
+})
+
+it('记忆工具组：read/correct/forget 经真实桥接落库并立即刷新检查点', async () => {
+  // 回合预算为 3 轮模型调用，真实用法是每条指令一个操作：回合 1 read→correct→答复；回合 2 read→forget→答复。
+  const { AgentMemories }=await import('../src/main/coordination/memories.js')
+  let pendingId=''
+  const readResults: string[] = []
+  const model: ScopedModel = { complete: async (messages, tools) => {
+    expect(tools.some(t=>t.function.name==='read_memories')).toBe(true)
+    expect(tools.some(t=>t.function.name==='suggest_memory')).toBe(true)
+    const reads=messages.filter(m=>m.role==='tool')
+    if (reads.length===0) return { content:null, tool_calls:[{id:'r',type:'function',function:{name:'read_memories',arguments:'{}'}}] }
+    // read_memories 的返回必须携带记录 ID/状态，模型据此操作
+    readResults.push(String(reads.at(-1)!.content))
+    const lastUser=[...messages].reverse().find(m=>m.role==='user'&&typeof m.content==='string'&&(m.content.includes('改成绿色')||m.content.includes('忘记那条')))
+    if (lastUser && String(lastUser.content).includes('改成绿色')) {
+      if (reads.length===1) return { content:null, tool_calls:[{id:'x',type:'function',function:{name:'correct_memory',arguments:JSON.stringify({id:pendingId,newFact:'主人喜欢绿色'})}}] }
+      const op=JSON.parse(reads.at(-1)!.content ?? '{}') as {record:{status:string},applied:boolean}
+      expect(op.applied).toBe(true);expect(op.record.status).toBe('confirmed')
+      return { content:'已改成绿色' }
+    }
+    if (reads.length===1) {
+      const list=JSON.parse(String(reads[0]!.content)) as Array<{id:string,fact:string,status:string}>
+      const green=list.find(r=>r.fact==='主人喜欢绿色')!
+      expect(green.status).toBe('confirmed')
+      return { content:null, tool_calls:[{id:'f',type:'function',function:{name:'forget_memory',arguments:JSON.stringify({id:green.id})}}] }
+    }
+    const op=JSON.parse(reads.at(-1)!.content ?? '{}') as {record:{status:string},applied:boolean}
+    expect(op.applied).toBe(true);expect(op.record.status).toBe('forgotten')
+    return { content:'已忘记' }
+  } }
+  const app=createCoordinationPreview({model});const directory=app.directory
+  try {
+    const memories=new AgentMemories(directory)
+    pendingId=memories.suggest('主人喜欢蓝色','evt-seed').record.id
+    app.host.submit('main','mem-t1','把那条蓝色记忆改成绿色')
+    await until(()=>app.store.coordination.history('main').some(m=>m.presentation==='chat'))
+    const old=memories.list().find(r=>r.id===pendingId)!
+    expect(old.status).toBe('superseded')
+    const green=memories.list().find(r=>r.fact==='主人喜欢绿色')!
+    // correct 幂等标识与事件来源都由宿主绑定到回合事件，模型入参里没有来源字段
+    expect(green.operationId).toBe(`${green.sourceEvent}:${pendingId}:主人喜欢绿色`)
+    expect(green.supersedes).toBe(pendingId)
+    expect(app.host.checkpoint).toContain('- 主人喜欢绿色')
+    expect(app.host.checkpoint).toContain('「主人喜欢蓝色」已被主人更正')
+    app.host.submit('main','mem-t2','忘记那条绿色的')
+    await until(()=>app.store.coordination.history('main').filter(m=>m.presentation==='chat').length===2)
+    expect(memories.list().find(r=>r.fact==='主人喜欢绿色')!.status).toBe('forgotten')
+    expect(app.host.checkpoint).not.toContain('- 主人喜欢绿色')
+    expect(app.host.checkpoint).toContain('「主人喜欢绿色」已被主人明确忘记')
+    expect(readResults.length).toBeGreaterThan(0)
+  } finally { await app.close();rmSync(directory,{recursive:true}) }
 })
