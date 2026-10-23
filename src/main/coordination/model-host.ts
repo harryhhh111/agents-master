@@ -43,6 +43,8 @@ export interface CoordinationHostLabels {
   recordedNote: string
   clarifyNote: string
   failedNote: string
+  /** 回合失败但此前已执行过非终止工具（如记忆操作已落库）时的诚实文案：不能再说"未接受新的操作"。 */
+  partialNote: string
 }
 export const defaultCoordinationHostLabels: CoordinationHostLabels = {
   policy: '仅模拟联调，不能声称真实项目执行。仅明确工作委托使用 delegate；含糊需求用普通文本澄清，不创建任务。answer 只回答绑定待决问题，cancel 只取消指定任务。',
@@ -51,6 +53,7 @@ export const defaultCoordinationHostLabels: CoordinationHostLabels = {
   recordedNote: defaultScopedTurnTexts.recorded,
   clarifyNote: defaultScopedTurnTexts.clarify,
   failedNote: defaultScopedTurnTexts.failed,
+  partialNote: '模拟回合回复未完成，但此前的查询或记忆操作可能已生效；请询问当前状态以实际情况为准。',
 }
 /** 主对话记忆工具的服务端桥接（docs/main-agent-memory-repair-plan-2026-10-24.md）：
  *  查询/写入的事件来源与操作标识由宿主绑定（turn.event.id），模型不能伪造用户指令来源。 */
@@ -136,7 +139,7 @@ export class CoordinationHost {
       const initial: WireMessage[] = [{ role: 'system', content: (main ? (c === 'main' ? this.checkpoint : '群内主 Agent，仅使用本群上下文。') : '工作项目 Agent，仅使用本群上下文；可通过受限协调工具委派合成工作。') + '\n' + policy + '\n' + contextFormatNote }, ...turn.context.map(m => renderContextMessage(m, author))]
       const current = turn
       const reply = await scopedTurn({ model: main ? this.mainModel : this.domainModel, initial, tools: this.tools(turn), signal: controller.signal, timeoutMs: this.turnTimeoutMs,
-        texts: { recorded: this.labels.recordedNote, clarify: this.labels.clarifyNote, failed: this.labels.failedNote },
+        texts: { recorded: this.labels.recordedNote, clarify: this.labels.clarifyNote, failed: this.labels.failedNote, partial: this.labels.partialNote },
         protocolCorrection: this.protocolCorrection,
         load: () => this.store.protocol<ScopedState>(current), save: s => this.store.saveProtocol(current, s),
         commit: work => this.store.commitProtocol(current, work, s => s),
@@ -152,7 +155,9 @@ export class CoordinationHost {
           // durable result intact; retry only the reply, never the action.
           this.store.releaseChat(turn); if (!this.stopped) this.blocked.add(c)
         } else if (!this.stopped && (error instanceof ScopedProtocolError || !transient || (state?.rounds ?? 0) >= 3)) {
-          const failed: ScopedState = state?.failure ? state : { ...(state ?? { messages: [], rounds: 0, ids: [] }), final: this.labels.failedNote, failure: { kind: 'provider', reason: 'Provider request failed or attempts exhausted' } }
+          // 已执行过非终止工具（ids 非空，如记忆操作已落库）时不能声称"未接受新的操作"。
+          const note = (state?.ids.length ?? 0) > 0 ? this.labels.partialNote : this.labels.failedNote
+          const failed: ScopedState = state?.failure ? state : { ...(state ?? { messages: [], rounds: 0, ids: [] }), final: note, failure: { kind: 'provider', reason: 'Provider request failed or attempts exhausted' } }
           this.store.commitProtocol(turn, () => this.store.finishChat(turn!, failed.final!, author), () => failed)
         } else { this.store.releaseChat(turn); if (!this.stopped) this.blocked.add(c) }
       }

@@ -70,11 +70,21 @@ export class AgentMemories {
     return { record, created: true }
   }
 
+  /** ID 解析：精确匹配优先；允许唯一前缀（模型在回复中展示短 ID 后可能回用，2026-10-24 线上实测）。
+   *  前缀不命中抛 Unknown memory，命中多条抛 Ambiguous memory id。 */
+  private resolve(records: MemoryRecord[], id: string): MemoryRecord {
+    const exact = records.find(r => r.id === id)
+    if (exact) return exact
+    const prefixed = records.filter(r => r.id.startsWith(id))
+    if (prefixed.length > 1) throw new Error('Ambiguous memory id')
+    if (prefixed.length === 1) return prefixed[0]!
+    throw new Error('Unknown memory')
+  }
+
   /** 确认：pending/dismissed/forgotten → confirmed；已 confirmed 幂等返回；superseded 不适用（事实已被新记录替代）。 */
   confirm(id: string): MemoryOp {
     const records = this.list()
-    const target = records.find(r => r.id === id)
-    if (!target) throw new Error('Unknown memory')
+    const target = this.resolve(records, id)
     if (target.status === 'confirmed' || target.status === 'superseded') return { record: target, applied: false }
     target.status = 'confirmed'; target.updatedAt = this.clock()
     this.save(records)
@@ -83,8 +93,7 @@ export class AgentMemories {
 
   dismiss(id: string): MemoryOp {
     const records = this.list()
-    const target = records.find(r => r.id === id)
-    if (!target) throw new Error('Unknown memory')
+    const target = this.resolve(records, id)
     if (target.status !== 'pending') return { record: target, applied: false }
     target.status = 'dismissed'; target.updatedAt = this.clock()
     this.save(records)
@@ -94,8 +103,7 @@ export class AgentMemories {
   /** 忘记：pending/confirmed/dismissed → forgotten 墓碑；该记录停止作为用户事实使用，但不物理删除、不改写旧聊天。 */
   forget(id: string): MemoryOp {
     const records = this.list()
-    const target = records.find(r => r.id === id)
-    if (!target) throw new Error('Unknown memory')
+    const target = this.resolve(records, id)
     if (target.status === 'forgotten' || target.status === 'superseded') return { record: target, applied: false }
     target.status = 'forgotten'; target.updatedAt = this.clock()
     this.save(records)
@@ -109,13 +117,12 @@ export class AgentMemories {
     if (typeof newFact !== 'string' || !newFact.trim() || newFact.length > maxMemoryFactCharacters) throw new Error('Invalid memory fact')
     if (!operationId) throw new Error('Invalid memory operation')
     const records = this.list()
-    const target = records.find(r => r.id === id)
-    if (!target) throw new Error('Unknown memory')
     const priorOp = records.find(r => r.operationId === operationId)
     if (priorOp) return { record: priorOp, applied: false }
+    const target = this.resolve(records, id)
     if (target.status !== 'pending' && target.status !== 'confirmed') return { record: target, applied: false }
     const now = this.clock(), normalized = newFact.trim()
-    const existing = records.find(r => r.id !== id && (r.status === 'pending' || r.status === 'confirmed') && r.fact === normalized)
+    const existing = records.find(r => r.id !== target.id && (r.status === 'pending' || r.status === 'confirmed') && r.fact === normalized)
     let replacement: MemoryRecord
     if (existing) {
       existing.supersedes = target.id; existing.operationId = operationId; existing.updatedAt = now

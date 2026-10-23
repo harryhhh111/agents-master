@@ -55,6 +55,7 @@ const realCliHostLabels: CoordinationHostLabels = {
   recordedNote: '已记录受限操作。',
   clarifyNote: '请补充具体需求。',
   failedNote: '本轮未能完成，未接受新的操作。请重新说明需求。',
+  partialNote: '本轮回复未能完成，但此前的查询或记忆操作可能已生效；请以当前实际状态为准（可问我"现在记住了什么"）。',
 }
 
 const realModelHostLabels: CoordinationHostLabels = {
@@ -64,6 +65,7 @@ const realModelHostLabels: CoordinationHostLabels = {
   recordedNote: '已记录受限操作。',
   clarifyNote: '请补充具体需求。',
   failedNote: '本轮未能完成，未接受新的操作。请重新说明需求。',
+  partialNote: '本轮回复未能完成，但此前的查询或记忆操作可能已生效；请以当前实际状态为准（可问我"现在记住了什么"）。',
 }
 const realModelStoreLabels: CoordinationStoreLabels = {
   dispatchPrefix: '委派：',

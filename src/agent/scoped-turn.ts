@@ -1,10 +1,12 @@
 import { boundedRounds, deadline, pairedToolResult, strictArgs, validateCalls, ScopedProtocolError, type ModelReply, type ScopedModel, type ToolCall, type WireMessage, tool } from './scoped-protocol.js'
 export const safeFailedTurn = '模拟/联调：本轮未能完成，未接受新的操作。请重新说明需求。'
-export type ScopedTurnTexts = { recorded: string; clarify: string; failed: string }
+export type ScopedTurnTexts = { recorded: string; clarify: string; failed: string; partial: string }
 export const defaultScopedTurnTexts: ScopedTurnTexts = {
   recorded: '模拟/联调：已记录受限操作。',
   clarify: '模拟/联调：请补充具体需求。',
   failed: safeFailedTurn,
+  /** 回合失败但此前已执行过非终止工具（ids 非空）时的诚实文案：不能声称"未接受新的操作"。 */
+  partial: '模拟/联调：本轮回复未能完成；此前的查询或操作可能已生效，请以当前状态为准。',
 }
 export type ScopedState = { messages: WireMessage[]; rounds: number; ids: string[]; pending?: ModelReply; final?: string; failure?: { kind: 'protocol' | 'provider'; reason: string }
   /** 本回合已用的协议修正次数与每次被拒的原始输出；持久化以保证重启后不重复给修正机会、不丢证据。 */
@@ -29,7 +31,8 @@ export async function scopedTurn(options: {
     options.save(state)
     if (state.final) return state.final
     const reject = (reason: string): never => {
-      state = { ...state, failure: { kind: 'protocol', reason }, final: texts.failed }
+      // 已执行过工具（ids 非空）时如实说明部分操作可能已生效，不谎报"未接受新的操作"。
+      state = { ...state, failure: { kind: 'protocol', reason }, final: state.ids.length ? texts.partial : texts.failed }
       options.save(state)
       throw new ScopedProtocolError(reason)
     }

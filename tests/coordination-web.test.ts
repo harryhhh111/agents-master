@@ -8,7 +8,7 @@ vi.mock('node:fs', async importOriginal => {
     return (fs.lstatSync as (...a: unknown[])=>unknown)(p,...args)
   }) }
 })
-import { rmSync } from 'node:fs'
+import { rmSync, mkdtempSync } from 'node:fs'
 import { EventEmitter } from 'node:events'
 import { Readable } from 'node:stream'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -310,4 +310,37 @@ it('记忆工具组：read/correct/forget 经真实桥接落库并立即刷新�
     expect(app.host.checkpoint).toContain('「主人喜欢绿色」已被主人明确忘记')
     expect(readResults.length).toBeGreaterThan(0)
   } finally { await app.close();rmSync(directory,{recursive:true}) }
+})
+
+it('记忆操作落库后回合失败用诚实文案：不谎报"未接受新的操作"', async () => {
+  // 复现 2026-10-24 线上时序：短 ID 被拒（修正机会）→ read → correct 成功 → 轮次预算耗尽。
+  // 操作已落库，回合失败的文案必须承认部分操作可能已生效。
+  const { AgentMemories }=await import('../src/main/coordination/memories.js')
+  const directory=mkdtempSync('/dev/shm/mem-partial-')
+  const owner=new SQLiteMainInboxStore(':memory:',{coordination:{mode:'preview-fresh'}}),s=owner.coordination
+  const memories=new AgentMemories(directory)
+  const pendingId=memories.suggest('主人喜欢蓝色','evt-seed').record.id
+  const sink={ suggest:(f:string,e:string)=>memories.suggest(f,e), read:()=>memories.active(),
+    manage:(action:'confirm'|'correct'|'forget',id:string,newFact:string|undefined,operationId:string,sourceEvent:string)=>
+      action==='confirm'?memories.confirm(id):action==='correct'?memories.correct(id,newFact!,operationId,sourceEvent):memories.forget(id) }
+  const model: ScopedModel = { complete: async messages => {
+    const corrected=messages.some(m=>typeof m.content==='string'&&m.content.includes('未通过协议校验'))
+    const reads=messages.filter(m=>m.role==='tool')
+    if(!corrected)return { content:null, tool_calls:[{id:'bad',type:'function',function:{name:'correct_memory',arguments:JSON.stringify({id:'不存在的记录',newFact:'主人喜欢绿色'})}}] }
+    if(reads.length===0)return { content:null, tool_calls:[{id:'r',type:'function',function:{name:'read_memories',arguments:'{}'}}] }
+    if(reads.length===1)return { content:null, tool_calls:[{id:'x',type:'function',function:{name:'correct_memory',arguments:JSON.stringify({id:pendingId.slice(0,8),newFact:'主人喜欢绿色'})}}] }
+    return { content:'不应到达：轮次预算应先耗尽' }
+  } }
+  const host=new CoordinationHost(s,model,demoModel(),new HeldFakeExecutor(),undefined,undefined,undefined,true,undefined,sink)
+  try {
+    host.start();host.submit('main','p-1','把蓝色那条改成绿色')
+    await until(()=>s.history('main').some(m=>m.presentation==='chat'))
+    const reply=s.history('main').find(m=>m.presentation==='chat')!.content
+    // 短 ID 前缀解析生效：纠正实际落库
+    expect(memories.list().some(r=>r.fact==='主人喜欢绿色'&&r.status==='confirmed')).toBe(true)
+    expect(memories.list().find(r=>r.id===pendingId)!.status).toBe('superseded')
+    // 文案诚实：承认部分操作可能已生效，不谎报"未接受新的操作"
+    expect(reply).toContain('可能已生效')
+    expect(reply).not.toContain('未接受新的操作')
+  } finally { await host.close();owner.close();rmSync(directory,{recursive:true}) }
 })

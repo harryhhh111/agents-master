@@ -76,6 +76,27 @@ it('纠正：旧记录墓碑化并关联新记录，同一操作重试返回同�
   } finally { rmSync(directory, { recursive: true }) }
 })
 
+it('ID 前缀解析：唯一前缀可操作，未知与歧义前缀拒绝', () => {
+  const directory = mkdtempSync('/dev/shm/memories-test-')
+  try {
+    writeFileSync(path.join(directory, 'agent-memories.json'), JSON.stringify([
+      { id: 'aaaa1111-0000-0000-0000-000000000001', fact: '合成事实甲', sourceEvent: 'e1', status: 'pending', createdAt: '2026-10-24T00:00:00Z', updatedAt: '2026-10-24T00:00:00Z' },
+      { id: 'aaaa2222-0000-0000-0000-000000000002', fact: '合成事实乙', sourceEvent: 'e2', status: 'confirmed', createdAt: '2026-10-24T00:00:00Z', updatedAt: '2026-10-24T00:00:00Z' },
+      { id: 'bbbb3333-0000-0000-0000-000000000003', fact: '合成事实丙', sourceEvent: 'e3', status: 'confirmed', createdAt: '2026-10-24T00:00:00Z', updatedAt: '2026-10-24T00:00:00Z' },
+    ]))
+    const memories = new AgentMemories(directory)
+    // 唯一前缀等价于完整 ID（模型在回复里展示短 ID 后会回用）
+    expect(memories.confirm('aaaa1111').record.status).toBe('confirmed')
+    expect(memories.forget('bbbb3333').record.status).toBe('forgotten')
+    const op = memories.correct('aaaa2222', '合成事实乙改', 'op-prefix', 'evt-u')
+    expect(op.applied).toBe(true)
+    expect(op.record.supersedes).toBe('aaaa2222-0000-0000-0000-000000000002')
+    // 歧义前缀与未知前缀都拒绝
+    expect(() => memories.confirm('aaaa')).toThrow('Ambiguous memory id')
+    expect(() => memories.forget('cccc')).toThrow('Unknown memory')
+  } finally { rmSync(directory, { recursive: true }) }
+})
+
 it('忘记进检查点失效段且有界；默认查询与墓碑隔离；旧格式文件兼容读取', () => {
   const directory = mkdtempSync('/dev/shm/memories-test-')
   try {
