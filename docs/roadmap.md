@@ -314,6 +314,16 @@ Chromium 验收设计稿 §7 全链路与全部复核分支。commit `8fd928a`�
 [主 Agent 记忆闭环修复方案](main-agent-memory-repair-plan-2026-10-24.md)。建议下一迭代
 收尾查询、明确确认/纠正/忘记、状态一致与真实对话验收；目前仅方案已准备，尚未实现或派活。
 
+2026-10-24 记忆闭环修复已上线（release `web-memory-loop-20261024-93d8b07`，commit
+`8768cc2` + 验收返工 `93d8b07`）：主对话新增 read/confirm/correct/forget 记忆工具组，
+事件来源与 correct 幂等标识由宿主绑定；forget/correct 墓碑化（forgotten/superseded +
+supersedes 关联），检查点失效段有界（最近 5 条）防历史锚住，存储层拦截旧来源重提；
+界面"删除"改"忘记"。验收返工两处：记忆操作支持唯一 ID 前缀（模型回用自己展示的短 ID
+曾被拒）；回合失败但已有工具落库时改诚实文案（不再谎称"未接受新的操作"）。
+typecheck + 405/405。真实模型验收：提议→界面确认→自查（主动纠正"待确认"错误自述、
+准确说明存储位置）→对话纠正落库（蓝色 superseded/绿色 confirmed）→对话忘记→
+问颜色偏好正确回答"没有生效记录"；模型两次对矛盾指令主动澄清 correct/forget 边界。
+
 ### Runtime 接线约束
 
 - **当前模型别名与历史迁移**：`config.toml` 当前保留用户已批准的
