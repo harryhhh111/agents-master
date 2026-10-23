@@ -252,7 +252,7 @@ async function pollSidebar(generation){
         const pending=grouped&&(statusData.questions||[]).some(q=>q.status==='pending');
         const running=grouped&&(statusData.assignments||[]).some(a=>['queued','running','waiting_input'].includes(a.status));
         const warn=Array.from(uncertainControls).concat(Array.from(rejectedControls.keys())).some(sig=>{try{return JSON.parse(sig)[0]===c.id}catch(e){return false}});
-        convState.set(c.id,{preview:last?unwrapEnvelope(String(last.content)).slice(0,40):'',badge:pending?'待回答':running?'进行中':'',warn});
+        convState.set(c.id,{preview:last?(last.author==='user'?String(last.content):unwrapEnvelope(String(last.content))).slice(0,40):'',badge:pending?'待回答':running?'进行中':'',warn});
       }catch(e){}
     }));
     if(active(generation))renderConversations();
@@ -308,12 +308,12 @@ if(typeof window!=='undefined'){
 }
 latest.addEventListener('click',goLatest);
 function formatTime(value){const d=new Date(value);if(isNaN(d.getTime()))return'';return (d.getMonth()+1)+'月'+d.getDate()+'日 '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')}
-// 与 model-host.unwrapAuthorEnvelope 同规则：全文恰为 {author,text} 信封时取 text。
-function unwrapEnvelope(content){const t=content.trim();if(!t.startsWith('{')||!t.endsWith('}'))return content;try{const p=JSON.parse(t);if(p&&typeof p==='object'&&typeof p.text==='string'&&Object.keys(p).every(k=>k==='author'||k==='text'))return p.text}catch(e){}return content}
+// 与 model-host.unwrapAuthorEnvelope 同规则：全文恰为 {author,text} 信封（两键均为字符串）时取 text。
+function unwrapEnvelope(content){const t=content.trim();if(!t.startsWith('{')||!t.endsWith('}'))return content;try{const p=JSON.parse(t);if(p&&typeof p==='object'&&typeof p.author==='string'&&typeof p.text==='string'&&Object.keys(p).every(k=>k==='author'||k==='text'))return p.text}catch(e){}return content}
 function add(message){
   if(message.conversation_id!==conversation||seen.has(message.id))return;
-  // 存量消息可能存的是 {author,text} 信封原文（真实模型模仿上下文格式所致）；展示层剥掉信封。
-  message={...message,content:unwrapEnvelope(String(message.content))};
+  // 存量 Agent 消息可能存的是 {author,text} 信封原文（真实模型模仿上下文格式所致）；展示层剥掉信封。用户消息保持原文——用户可能本来就在讨论 JSON。
+  message={...message,content:message.author==='user'?String(message.content):unwrapEnvelope(String(message.content))};
   const follow=sizeChanged()?followingLatest:nearBottom();followingLatest=follow;seen.add(message.id);
   const at=message.createdAt||message.created_at||'';const time=Date.parse(at);
   if(time&&time-lastMessageTime>300000){const divider=document.createElement('div');divider.className='time-divider';divider.textContent=formatTime(at);messages.append(divider)}
@@ -473,7 +473,7 @@ function resetConversationView(id){
 async function clearConversation(id,label){
   const clearStatus=document.querySelector('#clear-status');clearStatus.textContent='';
   if(!window.confirm('确定清空「'+label+'」的全部消息记录吗？此操作不可恢复。'+(id==='fake-work'?'其中的任务与问题记录也会一并删除。':'')))return;
-  try{await request('/api/clear?conversation='+encodeURIComponent(id),{method:'POST'});resetConversationView(id);clearStatus.textContent='「'+label+'」已清空。'}
+  try{await request('/api/clear?conversation='+encodeURIComponent(id),{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});resetConversationView(id);clearStatus.textContent='「'+label+'」已清空。'}
   catch(e){clearStatus.textContent=e.message}
 }
 document.querySelector('#clear-main').addEventListener('click',()=>clearConversation('main','主 Agent 对话'));

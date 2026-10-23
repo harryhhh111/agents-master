@@ -9,13 +9,14 @@ export function addressedMain(conversation: string, content: string): boolean {
 
 /** 早期上下文以 {author,text} 信封喂给模型，真实模型会模仿该格式回复（2026-10-22 线上事故）。
  *  新上下文改用 lorca 式渲染（见 renderContextMessage）；此函数保留作兜底：
- *  存储与展示前剥掉信封，仅当全文恰是单个 JSON 对象且只有 author/text 键、text 为字符串时。 */
+ *  存储与展示前剥掉信封，仅当全文恰是单个 JSON 对象、只有 author/text 两键且均为字符串时。
+ *  仅 {text} 的 JSON 不算信封——用户可能本来就在讨论 JSON（2026-10-23 复核 C2）。 */
 export function unwrapAuthorEnvelope(content: string): string {
   const trimmed = content.trim()
   if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return content
   try {
     const parsed = JSON.parse(trimmed) as Record<string, unknown>
-    if (parsed && typeof parsed === 'object' && typeof parsed.text === 'string'
+    if (parsed && typeof parsed === 'object' && typeof parsed.author === 'string' && typeof parsed.text === 'string'
         && Object.keys(parsed).every(k => k === 'author' || k === 'text')) return parsed.text
   } catch { /* 非信封，按原文处理 */ }
   return content
@@ -24,14 +25,14 @@ export function unwrapAuthorEnvelope(content: string): string {
 const speakerNames: Record<string, string> = { user: '你', 'main-agent': '主 Agent', 'fake-work-agent': '工作项目 Agent' }
 export function speakerName(author: string): string { return speakerNames[author] ?? author }
 /** 上下文渲染（lorca 式，依据 docs/open-agent-reference-study-2026-10-22.md 第四节）：
- *  自己的历史是 assistant 原文——模型没有信封模板可模仿；他人消息以 user 角色携带
- *  `[名字]: ` 前缀；存量 JSON 信封内容先剥壳；他人内容行首 [ 转义为 ［，防止伪造归属行。 */
+ *  自己的历史是 assistant 原文——模型没有信封模板可模仿；其他 Agent 消息以 user 角色携带
+ *  `[名字]: ` 前缀，存量 JSON 信封内容先剥壳；行首 [ 转义为 ［，防止伪造归属行。
+ *  用户消息保持原文：用户可能本来就在发送 JSON，剥壳会改掉用户输入（2026-10-23 复核 C2）。 */
 export function renderContextMessage(m: { author: string; content: string }, self: string): WireMessage {
+  if (m.author === 'user') return { role: 'user', content: m.content.replace(/^(\s*)\[/gm, '$1［') }
   const text = unwrapAuthorEnvelope(m.content)
   if (m.author === self) return { role: 'assistant', content: text }
-  const escaped = text.replace(/^(\s*)\[/gm, '$1［')
-  if (m.author === 'user') return { role: 'user', content: escaped }
-  return { role: 'user', content: `[${speakerName(m.author)}]: ${escaped}` }
+  return { role: 'user', content: `[${speakerName(m.author)}]: ${text.replace(/^(\s*)\[/gm, '$1［')}` }
 }
 /** 系统提示中声明上下文格式，配合 renderContextMessage。 */
 const contextFormatNote = '上下文中其他成员的发言以 [名字]: 前缀出现在 user 消息里；你的历史回复是 assistant 原文。回复只说正文，不要加任何前缀或 JSON 包装。'
