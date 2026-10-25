@@ -324,14 +324,29 @@ typecheck + 405/405。真实模型验收：提议→界面确认→自查（主�
 准确说明存储位置）→对话纠正落库（蓝色 superseded/绿色 confirmed）→对话忘记→
 问颜色偏好正确回答"没有生效记录"；模型两次对矛盾指令主动澄清 correct/forget 边界。
 
-### 下一交付：主 Agent 基础工作能力（2026-10-24 规划）
+### 下一交付：主 Agent 基础工作能力（2026-10-24 规划，2026-10-25 已交付上线）
 
 用户明确指出主 Agent 应拥有完整工作视野和对执行者的调度权，不能让用户搬运项目背景。
-当前主对话仍缺少文件读取/搜索、真实项目目录与完整任务/产物查询，既有 CLI 执行能力不能
-代替这些能力。下一切片见 [主 Agent 基础工作能力方案](main-agent-workspace-plan-2026-10-24.md)：
-先接通项目发现、文件读取/搜索和项目状态，再复用任务账本与执行器完成委派后的检查。
-将 agents-master 纳入可了解和可委派的项目；讨论不误启动修改，后台执行不占住主对话。
-目前方案已准备，尚未派活、实现或部署；权限配置与发布按方案及用户授权执行。
+方案见 [主 Agent 基础工作能力方案](main-agent-workspace-plan-2026-10-24.md)。
+
+2026-10-25 已上线（release `web-workspace-20261025-0e07305`）：主对话新增只读工作区
+工具组（list_projects/list_files/read_file/search_files/project_status/task_detail/
+read_artifact），主对话回合预算升至 6 次模型调用（45s 总时限不变）；agents-master 入册
+可委派。Codex 复核 `aaab3b0` 三项定点返工并入 `0e07305`：CLI 原始日志边界收紧
+（通用读取/搜索不开放 `*.stdout.log`/`*.stderr.log`，read_artifact 仅开放当前任务绑定
+stdout，realpath 逐组件校验堵符号链接别名绕过）；只读工具全部异步化并在写事务外 await，
+Git/搜索受回合信号约束，慢查询不再阻塞 worker；directory 工具接入真实项目目录（替换
+FAKE-project），新增 `[workspace] roots` 发现根配置（授权根下未注册目录可读不可委派）。
+typecheck + 415/415。
+
+同日真实模型验收（预览通道 socket 直测）五项全过：项目认知（自主读
+docs/product-discovery-v0.md 与 roadmap，引用具体切片与 commit 作答）；信息时效
+（实时读到对话期间新建的标记文件与暗号，非复述旧背景）；讨论不误执行（subagent 设计
+讨论后 assignments 无新增）；凭据边界（读 .env 被工具层拒绝并如实说明、给出替代建议）；
+sandbox 真实闭环（delegate_cli → codex 执行 23.4s → 文件落盘 → 领域 Agent 判读回执 →
+主 Agent 用 task_detail/list_files/read_file 亲自核对后回报）。已知展示瑕疵：主对话里
+delegate_cli 受理回执仍是"已记录受限操作。{JSON}"原始形态，未做界面卡片化，后续随
+任务卡展示迭代收尾。做梦机制（夜间蒸馏）仍为认可的后续方向，未排期。
 
 ### Runtime 接线约束
 
