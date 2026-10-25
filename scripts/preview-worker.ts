@@ -208,8 +208,8 @@ export async function runPreviewWorker(args: string[]): Promise<void> {
     const config = loadConfig()
     // createLlmClient 在缺 DEEPSEEK_API_KEY 时抛出;此处不捕获,启动直接失败,不静默降级 demo。
     const realModel = createCoordinationModel(config, { timeoutMs: 45_000 })
-    // 只读工作区视野覆盖全部注册项目；可委派范围只看 delegable 标记。
-    model = { mode: 'real', realModel, modelName: config.llm.model, workspace: new Workspace(config.projects) }
+    // 只读工作区视野覆盖注册项目 + 发现根下的项目目录；可委派范围只看 delegable 标记。
+    model = { mode: 'real', realModel, modelName: config.llm.model, workspace: new Workspace(config.projects, config.workspace.roots) }
     if (parsed.execution === 'cli') {
       const { CodexBackend } = await import('../src/backends/CodexBackend.js')
       const { KimiBackend } = await import('../src/backends/KimiBackend.js')

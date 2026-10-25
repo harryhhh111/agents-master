@@ -21,6 +21,11 @@ const ConfigSchema = z.object({
       delegable: z.boolean().default(false),
     }),
   ),
+  /** 项目发现根：其下一级目录自动成为主 Agent 的可读项目（只读视野）；
+   *  delegate_cli 可执行范围仍仅由 [[projects]] 的 delegable 决定。 */
+  workspace: z.object({
+    roots: z.array(z.string()).default([]),
+  }).default({ roots: [] }),
   backends: z
     .object({
       codex: z

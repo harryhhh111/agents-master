@@ -28,7 +28,9 @@ export function previewCheckpoint(ownerContext: string, wording: PreviewWording 
   const lead = execution === 'cli'
     ? '协调预览检查点：真实模型对话与真实 CLI 执行（仅限白名单项目）。使用受限目录、状态、delegate、delegate_cli、answer、cancel 工具。CLI 任务有预算与超时，产物落项目 .agent-artifacts/；不 push、不删工作区外文件、不碰凭据。含糊需求先澄清；不得声称白名单外的执行能力。'
     : wording === 'real-model'
-      ? '协调预览检查点：真实模型对话。可以使用受限目录、状态、delegate、answer、cancel 工具协调工作；执行工具仍为受限合成（synthetic_inspect/ask/finish），不运行真实 CLI、不读取项目文件、不开放 shell。含糊需求先澄清；不得声称真实项目执行。'
+      ? (workspace
+        ? '协调预览检查点：真实模型对话。可以使用受限目录、状态、delegate、answer、cancel 工具协调工作；主对话另有只读工作区工具（见下方"工作区能力"）。执行工具仍为受限合成（synthetic_inspect/ask/finish），不运行真实 CLI、不开放 shell。含糊需求先澄清；不得声称真实项目执行。'
+        : '协调预览检查点：真实模型对话。可以使用受限目录、状态、delegate、answer、cancel 工具协调工作；执行工具仍为受限合成（synthetic_inspect/ask/finish），不运行真实 CLI、不读取项目文件、不开放 shell。含糊需求先澄清；不得声称真实项目执行。')
       : '协调预览检查点：仅模拟/联调。可以使用受限目录、状态、delegate、answer、cancel 工具协调合成工作。含糊需求先澄清；不得声称真实项目执行，不开放 shell、文件或真实后端。'
   return [lead, ownerContextUsageNote, memoryCapabilityNote, workspace ? workspaceCapabilityNote : '', ownerContextCheckpoint(ownerContext), memoriesCheckpoint(memories, memoryTombstones)].filter(Boolean).join('\n\n')
 }
@@ -51,7 +53,7 @@ const memoryCapabilityNote = [
 /** 工作区能力约束（docs/main-agent-workspace-plan-2026-10-24.md）：只读视野 + 动态事实用工具获取。
  *  工具仅在主对话且组装方注入工作区时存在；提示词不把限制当全部职责。 */
 const workspaceCapabilityNote = [
-  '工作区能力：你是用户的管家与协调者，可以主动了解用户的工作。主对话可用 list_projects 发现已注册项目，list_files/read_file/search_files 只读查看项目文件，project_status 查 Git 状态（分支、HEAD、未提交改动、近期提交），task_detail/read_artifact 核对工作群任务与产物。',
+  '工作区能力：你是用户的管家与协调者，可以主动了解用户的工作。主对话可用 list_projects 发现工作区项目（注册项目与授权根目录下的项目目录），list_files/read_file/search_files 只读查看项目文件，project_status 查 Git 状态（分支、HEAD、未提交改动、近期提交），task_detail/read_artifact 核对工作群任务与产物。只有标记"可委派"的项目才能 delegate_cli 真实执行。',
   '当前系统本身就是项目 agents-master（本产品）：产品原则在 docs/product-discovery-v0.md，进度在 docs/roadmap.md。',
   '项目进度、文件内容、任务状态等动态事实必须用工具实时获取后回答，不要凭记忆或旧对话编造；读取结果注明来源与时间。未找到、截断、超时要如实说明；只读查询失败不能描述成执行失败。',
   '讨论代码或提到开发不等于要修改：只有用户明确要求修改时才委派 delegate_cli；委派前先用 project_status 检查工作区状态。push、部署、重启现网必须等用户逐项明确授权。',

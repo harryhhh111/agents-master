@@ -32,6 +32,11 @@ path = "/home/vinci/projects/agents-sandbox"
 summary = "合成验收沙箱"
 delegable = true
 
+# 项目发现根：其下一级目录自动成为主 Agent 的可读项目（只读视野）；
+# 可执行范围仍仅由上面 [[projects]] 的 delegable 决定，发现的项目不能委派
+[workspace]
+roots = ["/home/vinci/projects"]
+
 # 驱动 codex 时的沙箱模式（安全相关默认值，改这里要过用户）
 [backends.codex]
 sandbox_mode = "workspace-write"

@@ -379,6 +379,27 @@ it('工作区工具组：主对话可见、群聊不可见；研究流在预算�
   } finally { await app.close();rmSync(directory,{recursive:true});rmSync(project,{recursive:true}) }
 })
 
+// W3 复核回归：注入工作区后 directory 返回真实项目目录，不再出现 FAKE-project 合成事实。
+it('directory 工具：注入工作区后返回真实项目目录', async () => {
+  const { Workspace }=await import('../src/main/coordination/workspace.js')
+  const project=mkdtempSync('/dev/shm/ws-dir-')
+  const ws=new Workspace([{name:'proj',path:project,summary:'合成项目',delegable:false}])
+  const model: ScopedModel = { complete: async messages => {
+    const reads=messages.filter(m=>m.role==='tool')
+    if (reads.length===0) return { content:null, tool_calls:[{id:'d',type:'function',function:{name:'directory',arguments:'{}'}}] }
+    const directory=String(reads[0]!.content)
+    expect(directory).toContain('"name":"proj"')
+    expect(directory).not.toContain('FAKE-project')
+    return { content:'当前工作区有 proj 项目。' }
+  } }
+  const app=createCoordinationPreview({model,workspace:ws})
+  try {
+    app.host.submit('main','dir-1','看看有哪些项目')
+    await until(()=>app.store.coordination.history('main').some(m=>m.presentation==='chat'))
+    expect(app.store.coordination.history('main').find(m=>m.presentation==='chat')!.content).toContain('proj')
+  } finally { await app.close();rmSync(project,{recursive:true}) }
+})
+
 it('task_detail/read_artifact：任务留痕与产物核对（含短 ID 前缀）', async () => {
   const { Workspace }=await import('../src/main/coordination/workspace.js')
   const project=mkdtempSync('/dev/shm/ws-art-')

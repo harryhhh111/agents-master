@@ -139,6 +139,24 @@ describe('bounded durable model protocol', () => {
       expect(state!.rounds).toBe(1)
     }
   })
+  it('只读异步工具在事务外 await：慢查询不阻塞事件循环，回合计时确实终止回合', async () => {
+    let state: ScopedState | undefined, calls = 0
+    const started = Date.now()
+    let timerDelay = -1
+    const timer = new Promise<void>(resolve => setTimeout(() => { timerDelay = Date.now() - started; resolve() }, 20))
+    const model: ScopedModel = { complete: async () => ++calls === 1
+      ? { content: null, tool_calls: [call('slow', 'slowRead', {})] }
+      : { content: 'late final' } }
+    await expect(scopedTurn({
+      model, initial: [],
+      tools: { slowRead: { fields: {}, readonly: true, execute: async () => { await new Promise(r => setTimeout(r, 300)); return { ok: true } } } },
+      timeoutMs: 50,
+      load: () => state, save: s => { state = s }, commit: work => { state = work(); return state },
+    })).rejects.toThrow('timed out')
+    await timer
+    // 20ms 旁路定时器在慢工具 await 期间准点推进；同步实现会把它拖到工具结束之后（W2 复核回归）
+    expect(timerDelay).toBeLessThan(150)
+  })
   it('preview refuses legacy/v1 opens and ordinary v2 access', () => {
     const dir=mkdtempSync(path.join(tmpdir(),'preview-schema-')),db=path.join(dir,'db')
     const v1=new SQLiteMainInboxStore(db,{coordination:{mode:'fresh'}});v1.close()

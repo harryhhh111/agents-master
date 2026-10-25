@@ -100,7 +100,9 @@ export class CoordinationHost {
   }
   private tools(turn: FrontTurn): Record<string, ScopedTool> {
     return {
-      directory: { fields: {}, execute: () => ({ conversation: FAKE_GROUP, project: 'FAKE-project', scope: 'synthetic' }) },
+      // 注入工作区后 directory 返回真实项目目录（替换 FAKE-project 合成事实）；合成/demo 模式保持原样。
+      directory: { fields: {}, readonly: true, description: this.workspace ? '列出当前工作区的真实项目目录（注册项目与授权根目录下发现的项目）。' : undefined,
+        execute: async () => this.workspace ? { projects: await this.workspace.listProjects() } : { conversation: FAKE_GROUP, project: 'FAKE-project', scope: 'synthetic' } },
       status: { fields: {}, execute: () => ({ assignments: this.store.assignments(FAKE_GROUP).map(a => ({ id: a.id, status: a.status })), questions: this.store.questions(FAKE_GROUP) }) },
       delegate: { fields: { objective: 'text', completionCriteria: 'texts' }, terminal: true, execute: a => this.store.accept(turn.conversation, turn.event.id, { action: 'fake-check', objective: String(a.objective), scope: ['synthetic'], completionCriteria: a.completionCriteria as string[] }) },
       // 真实 CLI 委派仅在组装方注入白名单时存在；store 侧再校验一次（纵深防御）。
@@ -128,16 +130,16 @@ export class CoordinationHost {
       // 只读工作区视野（docs/main-agent-workspace-plan-2026-10-24.md）：仅主对话、仅组装方注入工作区时存在。
       // 全部 readonly：在写事务外执行；未找到/截断/超时以错误对象如实返回，不抛协议错误。
       ...(this.workspace && turn.conversation === 'main' ? {
-        list_projects: { fields: {}, readonly: true, description: '列出已注册项目：名称、路径、一句话说明、是否可委派真实执行。当前系统本身就是 agents-master 项目（本产品）。',
+        list_projects: { fields: {}, readonly: true, description: '列出工作区项目：名称、路径、一句话说明、是否可委派真实执行。包含注册项目与授权根目录下发现的项目目录；当前系统本身就是 agents-master 项目（本产品）。',
           execute: () => this.workspace!.listProjects() },
         list_files: { fields: { project: 'text', path: 'text' }, readonly: true, description: '列出项目内目录内容（名称、大小、修改时间）；project 为项目名，path 为项目内相对路径，填 "." 表示项目根。',
           execute: a => this.workspace!.listFiles(String(a.project), String(a.path)) },
-        read_file: { fields: { project: 'text', path: 'text', startLine: 'text' }, readonly: true, description: '按行读取项目内文本文件（返回带行号，每次至多 400 行，截断会注明）；startLine 填 "1" 表示从头读。凭据与密钥文件不可读。',
+        read_file: { fields: { project: 'text', path: 'text', startLine: 'text' }, readonly: true, description: '按行读取项目内文本文件（返回带行号，每次至多 400 行，截断会注明）；startLine 填 "1" 表示从头读。凭据与密钥文件、CLI 原始日志不可读。',
           execute: a => this.workspace!.readFile(String(a.project), String(a.path), Number.parseInt(String(a.startLine), 10) || 1) },
-        search_files: { fields: { project: 'text', query: 'text' }, readonly: true, description: '在项目内搜索文件名与文本内容（跳过依赖目录与 Git 对象库），返回匹配文件、行号与摘录；结果截断会注明。',
-          execute: a => this.workspace!.searchFiles(String(a.project), String(a.query)) },
+        search_files: { fields: { project: 'text', query: 'text' }, readonly: true, description: '在项目内搜索文件名与文本内容（跳过依赖目录、Git 对象库与 CLI 原始日志），返回匹配文件、行号与摘录；结果截断会注明。',
+          execute: (a, signal) => this.workspace!.searchFiles(String(a.project), String(a.query), signal) },
         project_status: { fields: { project: 'text' }, readonly: true, description: '读取项目的 Git 状态：当前分支、HEAD、未提交改动数、近期 5 条提交，附读取时间。',
-          execute: a => this.workspace!.projectStatus(String(a.project)) },
+          execute: (a, signal) => this.workspace!.projectStatus(String(a.project), signal) },
         task_detail: { fields: { id: 'text' }, readonly: true, description: '按任务 ID 或 run ID（可唯一前缀）查询工作群任务：目标、项目、状态、待答问题、执行留痕与结果摘要。',
           execute: a => this.taskDetail(String(a.id)) },
         read_artifact: { fields: { id: 'text', path: 'text' }, readonly: true, description: '读取任务绑定的公开产物核对实际输出；id 为任务或 run ID，path 为产物目录内相对路径，填 "stdout" 取 CLI 标准输出。stderr 原始日志不开放。',
@@ -173,7 +175,7 @@ export class CoordinationHost {
     return { id: a.id, status: a.status, version: a.version, objective: decision.objective, action: decision.action,
       project: decision.project ?? a.project_key, backend: decision.backend, completionCriteria: decision.completionCriteria, runs, questions }
   }
-  private runArtifact(id: string, rel: string): unknown {
+  private async runArtifact(id: string, rel: string): Promise<unknown> {
     const r = this.resolveTaskId(id)
     if ('error' in r) return r
     const run = r.run ?? this.store.runs(FAKE_GROUP).filter(x => x.assignment_id === r.assignment!.id).at(-1)

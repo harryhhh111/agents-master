@@ -11,8 +11,9 @@ export const defaultScopedTurnTexts: ScopedTurnTexts = {
 export type ScopedState = { messages: WireMessage[]; rounds: number; ids: string[]; pending?: ModelReply; final?: string; failure?: { kind: 'protocol' | 'provider'; reason: string }
   /** 本回合已用的协议修正次数与每次被拒的原始输出；持久化以保证重启后不重复给修正机会、不丢证据。 */
   corrections?: number; rejected?: ModelReply[] }
-export type ScopedTool = { fields: Record<string, 'text' | 'texts'>; execute(args: Record<string, unknown>): unknown; terminal?: boolean; /** 模型可见的工具说明（含允许取值）；缺省为工具名。 */ description?: string
-  /** 只读工具（文件/搜索/状态查询）：在 commit 写事务外执行，结果仍随事务落账；不改变任何状态。 */ readonly?: boolean }
+export type ScopedTool = { fields: Record<string, 'text' | 'texts'>; execute(args: Record<string, unknown>, signal?: AbortSignal): unknown | Promise<unknown>; terminal?: boolean; /** 模型可见的工具说明（含允许取值）；缺省为工具名。 */ description?: string
+  /** 只读工具（文件/搜索/状态查询）：在 commit 写事务外执行（可异步，受回合信号约束），
+   *  结果仍随事务落账；不改变任何状态。仅只读工具允许返回 Promise。 */ readonly?: boolean }
 /** 模型可见的修正反馈；协议校验失败发生在任何工具执行之前，给一次修正机会不等于重放操作。 */
 export const scopedCorrectionPrompt = '上一次输出未通过协议校验，未执行任何操作。请严格按工具定义修正后重新输出。原因：'
 /** Bounded scoped runner sharing only AgentCore's iteration/pairing primitives.
@@ -75,18 +76,18 @@ export async function scopedTurn(options: {
       }
       // A terminal action ends this foreground turn; no subsequent model poll.
       try {
-        // 只读工具在 SQLite 写事务外执行：文件搜索/读取不进事务、不阻塞写路径；
-        // 其结果与状态变更工具的落账仍在同一 commit 内，顺序与 calls 一致。
+        // 只读工具在 SQLite 写事务外异步执行：文件搜索/读取/Git 查询不阻塞事件循环、不进事务，
+        // 并接收回合取消/超时信号；其结果与状态变更工具的落账仍在同一 commit 内，顺序与 calls 一致。
         const preResults = new Map<string, unknown>()
         for (const [i, c] of calls.entries()) {
           const t = options.tools[c.function.name]!
-          if (t.readonly) preResults.set(c.id, t.execute(parsed[i]!))
+          if (t.readonly) preResults.set(c.id, await t.execute(parsed[i]!, signal))
         }
         state = options.commit(() => {
         const next: ScopedState = { messages: [...state.messages, { role: 'assistant', content: reply!.content, ...(calls.length ? { tool_calls: calls } : {}) }], rounds: state.rounds, ids: [...state.ids], ...(state.corrections !== undefined ? { corrections: state.corrections } : {}), ...(state.rejected !== undefined ? { rejected: state.rejected } : {}) }
         let terminal: unknown
         calls.forEach((c: ToolCall, i) => {
-          const result = preResults.has(c.id) ? preResults.get(c.id) : options.tools[c.function.name]!.execute(parsed[i]!)
+          const result = preResults.has(c.id) ? preResults.get(c.id) : options.tools[c.function.name]!.execute(parsed[i]!, signal)
           next.messages.push(pairedToolResult(c.id, JSON.stringify(result)))
           next.ids.push(c.id)
           if (options.tools[c.function.name]!.terminal) terminal = result
