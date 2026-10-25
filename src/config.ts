@@ -15,6 +15,10 @@ const ConfigSchema = z.object({
     z.object({
       name: z.string(),
       path: z.string(),
+      /** 给主 Agent 的一句话项目说明（list_projects 返回）。 */
+      summary: z.string().default(''),
+      /** 是否允许 delegate_cli 真实执行；阅读范围不因 false 而收窄。 */
+      delegable: z.boolean().default(false),
     }),
   ),
   backends: z

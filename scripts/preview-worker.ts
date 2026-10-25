@@ -13,6 +13,7 @@ import { demoModel } from './main-web-coordination-demo.js'
 import { coordinationPage } from '../src/main/coordination/web-page.js'
 import { coordinationPreviewReleaseId, json, readPackagedReleaseId } from './main-web.js'
 import type { ScopedModel } from '../src/agent/scoped-protocol.js'
+import type { Workspace } from '../src/main/coordination/workspace.js'
 
 export const previewWorkerLockFilename = '.preview-worker.lock.sqlite'
 export const previewPreviewLabelReal = '预览版 · 真实模型（受限工具）'
@@ -27,6 +28,8 @@ export interface PreviewWorkerModelOption {
   /** cli 需要真实模型 + 白名单项目与 backend 工厂。 */
   execution?: PreviewExecution
   cli?: { backends: CliBackendFactory; projects: Record<string, string> }
+  /** 主对话只读工作区视野（项目/文件/搜索/Git/产物）。 */
+  workspace?: Workspace
 }
 
 export const previewPreviewLabelCli = '预览版 · 真实模型与执行（白名单项目）'
@@ -109,7 +112,7 @@ export async function startPreviewWorker(options: { dataDirectory: string; socke
     // （synthetic_inspect/ask/finish），绝不触发真实 CLI 或子进程；它能完成 ask→回答→finish
     // 的合成闭环。HeldFakeExecutor 会无限挂起任务，仅限单元测试显式驱动，不能用于常驻 worker。
     // real 模式换用真实模型实例,执行工具保持不变;cli 模式再叠加白名单项目的真实 CLI 执行。
-    runtime = createCoordinationRuntime({ directory, mode, model: modelOption.mode === 'real' ? modelOption.realModel! : demoModel(), wording, execution, cli: modelOption.cli })
+    runtime = createCoordinationRuntime({ directory, mode, model: modelOption.mode === 'real' ? modelOption.realModel! : demoModel(), wording, execution, cli: modelOption.cli, workspace: modelOption.workspace })
   } catch (error) {
     lock.release()
     throw error
@@ -201,10 +204,12 @@ export async function runPreviewWorker(args: string[]): Promise<void> {
     await import('dotenv/config')
     const { loadConfig } = await import('../src/config.js')
     const { createCoordinationModel } = await import('../src/frontbrain/coordination-model.js')
+    const { Workspace } = await import('../src/main/coordination/workspace.js')
     const config = loadConfig()
     // createLlmClient 在缺 DEEPSEEK_API_KEY 时抛出;此处不捕获,启动直接失败,不静默降级 demo。
     const realModel = createCoordinationModel(config, { timeoutMs: 45_000 })
-    model = { mode: 'real', realModel, modelName: config.llm.model }
+    // 只读工作区视野覆盖全部注册项目；可委派范围只看 delegable 标记。
+    model = { mode: 'real', realModel, modelName: config.llm.model, workspace: new Workspace(config.projects) }
     if (parsed.execution === 'cli') {
       const { CodexBackend } = await import('../src/backends/CodexBackend.js')
       const { KimiBackend } = await import('../src/backends/KimiBackend.js')
@@ -215,7 +220,7 @@ export async function runPreviewWorker(args: string[]): Promise<void> {
         if (name === 'claude') return new ClaudeBackend({ binary: config.backends.claude.binary, permissionMode: config.backends.claude.permission_mode })
         throw new Error(`未知 backend：${name}`)
       }
-      const projects = Object.fromEntries(config.projects.map(p => [p.name, path.resolve(p.path)]))
+      const projects = Object.fromEntries(config.projects.filter(p => p.delegable).map(p => [p.name, path.resolve(p.path)]))
       model = { ...model, execution: 'cli', cli: { backends, projects } }
     }
   }

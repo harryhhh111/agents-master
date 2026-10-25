@@ -1,7 +1,8 @@
 import { ScopedProtocolError, ScopedTimeoutError, type ScopedModel, type WireMessage } from '../../agent/scoped-protocol.js'
 import { defaultScopedTurnTexts, scopedTurn, type ScopedState, type ScopedTool } from '../../agent/scoped-turn.js'
-import { CoordinationStore, FAKE_GROUP, type FrontTurn } from './store.js'
+import { CoordinationStore, FAKE_GROUP, type Assignment, type FrontTurn, type Run } from './store.js'
 import { FakeBackgroundScheduler, type FakeExecutor } from './fake.js'
+import type { Workspace } from './workspace.js'
 
 export function addressedMain(conversation: string, content: string): boolean {
   return conversation === 'main' || content.startsWith('@main ') || content.startsWith('@主 Agent ')
@@ -76,7 +77,11 @@ export class CoordinationHost {
     private readonly executor: FakeExecutor & { stop?(id: string): void }, private readonly changed: () => void = () => {},
     private readonly labels: CoordinationHostLabels = defaultCoordinationHostLabels, private readonly turnTimeoutMs?: number,
     private readonly protocolCorrection = false, private readonly cliProjects?: readonly string[],
-    private readonly memory?: MemoryToolSink) {
+    private readonly memory?: MemoryToolSink,
+    /** 主对话只读工作区视野（项目/文件/搜索/Git/任务产物）；undefined 时工具不暴露。 */
+    private readonly workspace?: Workspace,
+    /** 主对话回合的模型调用预算（默认 3）；研究流需要更高预算，群聊保持默认。 */
+    private readonly mainMaxRounds?: number) {
     this.background = new FakeBackgroundScheduler(store, executor, changed)
   }
   start(): void {
@@ -120,7 +125,63 @@ export class CoordinationHost {
         forget_memory: { fields: { id: 'text' }, description: '用户明确说忘记/不再使用某条记忆时调用，id 为记录 ID。忘记后该事实不再作为当前事实使用，但原始聊天记录不受影响。',
           execute: a => this.memory!.manage('forget', String(a.id), undefined, '', turn.event.id) },
       } : {}),
+      // 只读工作区视野（docs/main-agent-workspace-plan-2026-10-24.md）：仅主对话、仅组装方注入工作区时存在。
+      // 全部 readonly：在写事务外执行；未找到/截断/超时以错误对象如实返回，不抛协议错误。
+      ...(this.workspace && turn.conversation === 'main' ? {
+        list_projects: { fields: {}, readonly: true, description: '列出已注册项目：名称、路径、一句话说明、是否可委派真实执行。当前系统本身就是 agents-master 项目（本产品）。',
+          execute: () => this.workspace!.listProjects() },
+        list_files: { fields: { project: 'text', path: 'text' }, readonly: true, description: '列出项目内目录内容（名称、大小、修改时间）；project 为项目名，path 为项目内相对路径，填 "." 表示项目根。',
+          execute: a => this.workspace!.listFiles(String(a.project), String(a.path)) },
+        read_file: { fields: { project: 'text', path: 'text', startLine: 'text' }, readonly: true, description: '按行读取项目内文本文件（返回带行号，每次至多 400 行，截断会注明）；startLine 填 "1" 表示从头读。凭据与密钥文件不可读。',
+          execute: a => this.workspace!.readFile(String(a.project), String(a.path), Number.parseInt(String(a.startLine), 10) || 1) },
+        search_files: { fields: { project: 'text', query: 'text' }, readonly: true, description: '在项目内搜索文件名与文本内容（跳过依赖目录与 Git 对象库），返回匹配文件、行号与摘录；结果截断会注明。',
+          execute: a => this.workspace!.searchFiles(String(a.project), String(a.query)) },
+        project_status: { fields: { project: 'text' }, readonly: true, description: '读取项目的 Git 状态：当前分支、HEAD、未提交改动数、近期 5 条提交，附读取时间。',
+          execute: a => this.workspace!.projectStatus(String(a.project)) },
+        task_detail: { fields: { id: 'text' }, readonly: true, description: '按任务 ID 或 run ID（可唯一前缀）查询工作群任务：目标、项目、状态、待答问题、执行留痕与结果摘要。',
+          execute: a => this.taskDetail(String(a.id)) },
+        read_artifact: { fields: { id: 'text', path: 'text' }, readonly: true, description: '读取任务绑定的公开产物核对实际输出；id 为任务或 run ID，path 为产物目录内相对路径，填 "stdout" 取 CLI 标准输出。stderr 原始日志不开放。',
+          execute: a => this.runArtifact(String(a.id), String(a.path)) },
+      } : {}),
     }
+  }
+  /** 任务/run 的唯一前缀解析（模型会回用自己展示过的短 ID，与记忆工具同规则）。 */
+  private resolveTaskId(id: string): { assignment?: Assignment; run?: Run } | { error: string } {
+    const match = <T extends { id: string }>(items: T[]): T | undefined =>
+      items.find(x => x.id === id) ?? (items.filter(x => x.id.startsWith(id)).length === 1 ? items.find(x => x.id.startsWith(id)) : undefined)
+    const run = match(this.store.runs(FAKE_GROUP))
+    const assignment = match(this.store.assignments(FAKE_GROUP)) ?? (run ? this.store.assignments(FAKE_GROUP).find(a => a.id === run.assignment_id) : undefined)
+    if (!assignment) return { error: '未找到该任务或 run；任务列表可用 status 工具查看。' }
+    return { assignment, run }
+  }
+  private taskDetail(id: string): unknown {
+    const r = this.resolveTaskId(id)
+    if ('error' in r) return r
+    const a = r.assignment!
+    const decision = JSON.parse(a.decision) as { action: string; objective: string; project?: string; backend?: string; completionCriteria?: string[] }
+    const runs = this.store.runs(FAKE_GROUP).filter(x => x.assignment_id === a.id).map(run => {
+      const execution = (JSON.parse(run.context) as { execution?: Record<string, unknown> }).execution
+      const result = run.result ? JSON.parse(run.result) as { kind?: string; body?: string } : null
+      return {
+        id: run.id, status: run.status, executor: run.executor,
+        execution: execution ? { backend: execution.backend, sessionId: execution.sessionId, exitCode: execution.exitCode, durationMs: execution.durationMs, artifactStdoutPath: execution.artifactStdoutPath, cancelConfirmed: execution.cancelConfirmed } : undefined,
+        result: result ? { kind: result.kind, body: typeof result.body === 'string' ? result.body.slice(0, 2000) : undefined } : undefined,
+      }
+    })
+    const questions = this.store.questions(FAKE_GROUP).filter(q => q.assignment_id === a.id)
+      .map(q => ({ id: q.id, status: q.status, body: q.body.slice(0, 500), answer: q.answer?.slice(0, 500) }))
+    return { id: a.id, status: a.status, version: a.version, objective: decision.objective, action: decision.action,
+      project: decision.project ?? a.project_key, backend: decision.backend, completionCriteria: decision.completionCriteria, runs, questions }
+  }
+  private runArtifact(id: string, rel: string): unknown {
+    const r = this.resolveTaskId(id)
+    if ('error' in r) return r
+    const run = r.run ?? this.store.runs(FAKE_GROUP).filter(x => x.assignment_id === r.assignment!.id).at(-1)
+    if (!run) return { error: '该任务还没有执行记录。' }
+    const execution = (JSON.parse(run.context) as { execution?: { artifactStdoutPath?: string; artifactStderrPath?: string } }).execution
+    if (!execution?.artifactStdoutPath) return { error: '该任务没有产物记录（可能不是 CLI 执行或执行未启动）。' }
+    const target = rel === 'stdout' ? execution.artifactStdoutPath.split('/').pop()! : rel
+    return this.workspace!.readArtifact(execution.artifactStdoutPath, execution.artifactStderrPath, target)
   }
   private async step(c: string): Promise<boolean> {
     let turn: FrontTurn | undefined
@@ -141,6 +202,7 @@ export class CoordinationHost {
       const reply = await scopedTurn({ model: main ? this.mainModel : this.domainModel, initial, tools: this.tools(turn), signal: controller.signal, timeoutMs: this.turnTimeoutMs,
         texts: { recorded: this.labels.recordedNote, clarify: this.labels.clarifyNote, failed: this.labels.failedNote, partial: this.labels.partialNote },
         protocolCorrection: this.protocolCorrection,
+        maxRounds: turn.conversation === 'main' ? this.mainMaxRounds : undefined,
         load: () => this.store.protocol<ScopedState>(current), save: s => this.store.saveProtocol(current, s),
         commit: work => this.store.commitProtocol(current, work, s => s),
       })

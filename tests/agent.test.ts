@@ -30,7 +30,7 @@ function testConfig(): Config {
   return {
     llm: { base_url: 'https://fake.example', model: 'fake-model' },
     delegation: { level: 'supervised' },
-    projects: [{ name: 'proj', path: tmp }],
+    projects: [{ name: 'proj', path: tmp, summary: '', delegable: true }],
     backends: {
       codex: { sandbox_mode: 'workspace-write' },
       kimi: {},

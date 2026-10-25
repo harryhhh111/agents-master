@@ -8,7 +8,8 @@ vi.mock('node:fs', async importOriginal => {
     return (fs.lstatSync as (...a: unknown[])=>unknown)(p,...args)
   }) }
 })
-import { rmSync, mkdtempSync } from 'node:fs'
+import { rmSync, mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
 import { EventEmitter } from 'node:events'
 import { Readable } from 'node:stream'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -343,4 +344,74 @@ it('记忆操作落库后回合失败用诚实文案：不谎报"未接受新的
     expect(reply).toContain('可能已生效')
     expect(reply).not.toContain('未接受新的操作')
   } finally { await host.close();owner.close();rmSync(directory,{recursive:true}) }
+})
+
+it('工作区工具组：主对话可见、群聊不可见；研究流在预算内完成并引用真实文件', async () => {
+  const { Workspace }=await import('../src/main/coordination/workspace.js')
+  const project=mkdtempSync('/dev/shm/ws-host-')
+  writeFileSync(path.join(project,'ROADMAP.md'),'# 路线图\n第二阶段已完成。\n')
+  const ws=new Workspace([{name:'proj',path:project,summary:'合成项目',delegable:false}])
+  const groupTools: string[][]=[]
+  const model: ScopedModel = { complete: async (messages, tools) => {
+    const names=tools.map(t=>t.function.name)
+    if (messages.some(m=>typeof m.content==='string'&&m.content.includes('群里问'))) { groupTools.push(names); return { content:'好' } }
+    expect(names).toEqual(expect.arrayContaining(['list_projects','list_files','read_file','search_files','project_status','task_detail','read_artifact']))
+    const reads=messages.filter(m=>m.role==='tool')
+    if (reads.length===0) return { content:null, tool_calls:[{id:'lp',type:'function',function:{name:'list_projects',arguments:'{}'}}] }
+    if (reads.length===1) return { content:null, tool_calls:[{id:'sf',type:'function',function:{name:'search_files',arguments:JSON.stringify({project:'proj',query:'第二阶段'})}}] }
+    if (reads.length===2) return { content:null, tool_calls:[{id:'rf',type:'function',function:{name:'read_file',arguments:JSON.stringify({project:'proj',path:'ROADMAP.md',startLine:'1'})}}] }
+    const readResult=String(reads.at(-1)!.content)
+    expect(readResult).toContain('第二阶段已完成')
+    return { content:'根据 ROADMAP.md：第二阶段已完成。' }
+  } }
+  const app=createCoordinationPreview({model,workspace:ws})
+  const directory=app.directory
+  try {
+    app.host.submit('main','ws-1','项目进度如何？')
+    await until(()=>app.store.coordination.history('main').some(m=>m.presentation==='chat'))
+    expect(app.store.coordination.history('main').find(m=>m.presentation==='chat')!.content).toContain('第二阶段已完成')
+    // 群聊回合不暴露工作区工具（私人视野不泄入工作群）
+    app.host.submit('fake-work','ws-2','群里问问项目')
+    await until(()=>app.store.coordination.history('fake-work').length>1)
+    expect(groupTools[0]).toBeDefined()
+    expect(groupTools[0]!).not.toContain('list_projects')
+    expect(groupTools[0]!).not.toContain('read_file')
+  } finally { await app.close();rmSync(directory,{recursive:true});rmSync(project,{recursive:true}) }
+})
+
+it('task_detail/read_artifact：任务留痕与产物核对（含短 ID 前缀）', async () => {
+  const { Workspace }=await import('../src/main/coordination/workspace.js')
+  const project=mkdtempSync('/dev/shm/ws-art-')
+  const artifactDir=path.join(project,'.agent-artifacts','run-x')
+  mkdirSync(artifactDir,{recursive:true})
+  writeFileSync(path.join(artifactDir,'stdout.log'),'CLI 输出：已修改 3 个文件\n')
+  const ws=new Workspace([{name:'proj',path:project,summary:'合成项目',delegable:true}])
+  const owner=new SQLiteMainInboxStore(':memory:',{coordination:{mode:'preview-fresh'}}),s=owner.coordination
+  s.allowedProjects=['proj']
+  // 铺一条 CLI 任务：admit → accept(cli-task) → claim → 绑定执行留痕 → receipt 完成
+  const { event }=s.admit('main','td-1','修复合成问题')
+  const accepted=s.accept('main',event.id,{action:'cli-task',objective:'修复合成问题',scope:['project'],project:'proj',completionCriteria:['测试通过']})
+  const run=s.claim('fake-work')!
+  s.started('fake-work',run.id)
+  s.bindExecution('fake-work',run.id,{backend:'kimi',pid:1234,sessionId:null,artifactStdoutPath:path.join(artifactDir,'stdout.log'),artifactStderrPath:path.join(artifactDir,'stderr.log')})
+  // 与生产一致：判读前把含退出码的完整留痕补绑进运行记录
+  s.bindExecution('fake-work',run.id,{backend:'kimi',pid:1234,sessionId:null,exitCode:0,durationMs:100,artifactStdoutPath:path.join(artifactDir,'stdout.log'),artifactStderrPath:path.join(artifactDir,'stderr.log')})
+  s.receipt('fake-work',run.id,{kind:'completed',body:'修复完成',execution:{backend:'kimi',pid:1234,sessionId:null,exitCode:0,durationMs:100,artifactStdoutPath:path.join(artifactDir,'stdout.log'),artifactStderrPath:path.join(artifactDir,'stderr.log')}})
+  const model: ScopedModel = { complete: async messages => {
+    const reads=messages.filter(m=>m.role==='tool')
+    if (reads.length===0) return { content:null, tool_calls:[{id:'t',type:'function',function:{name:'task_detail',arguments:JSON.stringify({id:accepted.assignmentId.slice(0,8)})}}] }
+    const detail=String(reads[0]!.content)
+    expect(detail).toContain('修复合成问题')
+    expect(detail).toContain('"exitCode":0')
+    if (reads.length===1) return { content:null, tool_calls:[{id:'a',type:'function',function:{name:'read_artifact',arguments:JSON.stringify({id:accepted.assignmentId.slice(0,8),path:'stdout'})}}] }
+    const artifact=String(reads.at(-1)!.content)
+    expect(artifact).toContain('已修改 3 个文件')
+    return { content:'任务已完成，产物显示修改了 3 个文件。' }
+  } }
+  const host=new CoordinationHost(s,model,demoModel(),new HeldFakeExecutor(),undefined,undefined,undefined,undefined,undefined,undefined,ws,6)
+  try {
+    host.start();host.submit('main','td-2','那个任务结果怎样？')
+    await until(()=>s.history('main').some(m=>m.presentation==='chat'))
+    expect(s.history('main').find(m=>m.presentation==='chat')!.content).toContain('修改了 3 个文件')
+  } finally { await host.close();owner.close();rmSync(project,{recursive:true}) }
 })

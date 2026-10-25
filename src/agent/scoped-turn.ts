@@ -11,7 +11,8 @@ export const defaultScopedTurnTexts: ScopedTurnTexts = {
 export type ScopedState = { messages: WireMessage[]; rounds: number; ids: string[]; pending?: ModelReply; final?: string; failure?: { kind: 'protocol' | 'provider'; reason: string }
   /** 本回合已用的协议修正次数与每次被拒的原始输出；持久化以保证重启后不重复给修正机会、不丢证据。 */
   corrections?: number; rejected?: ModelReply[] }
-export type ScopedTool = { fields: Record<string, 'text' | 'texts'>; execute(args: Record<string, unknown>): unknown; terminal?: boolean; /** 模型可见的工具说明（含允许取值）；缺省为工具名。 */ description?: string }
+export type ScopedTool = { fields: Record<string, 'text' | 'texts'>; execute(args: Record<string, unknown>): unknown; terminal?: boolean; /** 模型可见的工具说明（含允许取值）；缺省为工具名。 */ description?: string
+  /** 只读工具（文件/搜索/状态查询）：在 commit 写事务外执行，结果仍随事务落账；不改变任何状态。 */ readonly?: boolean }
 /** 模型可见的修正反馈；协议校验失败发生在任何工具执行之前，给一次修正机会不等于重放操作。 */
 export const scopedCorrectionPrompt = '上一次输出未通过协议校验，未执行任何操作。请严格按工具定义修正后重新输出。原因：'
 /** Bounded scoped runner sharing only AgentCore's iteration/pairing primitives.
@@ -24,8 +25,11 @@ export async function scopedTurn(options: {
   protocolCorrection?: boolean;
   load(): ScopedState | undefined; save(state: ScopedState): void;
   commit(work: () => ScopedState): ScopedState;
+  /** 本回合最大模型调用次数（默认 3）。只读研究流（发现→搜索→读取→总结）需要更高预算。 */
+  maxRounds?: number;
 }): Promise<string> {
   const texts: ScopedTurnTexts = { ...defaultScopedTurnTexts, ...options.texts }
+  const maxRounds = options.maxRounds ?? 3
   return deadline(async signal => {
     let state = options.load() ?? { messages: options.initial, rounds: 0, ids: [] }
     options.save(state)
@@ -37,10 +41,10 @@ export async function scopedTurn(options: {
       throw new ScopedProtocolError(reason)
     }
     const names = Object.keys(options.tools)
-    for (const _ of boundedRounds(4)) {
+    for (const _ of boundedRounds(maxRounds + 1)) {
       if (signal.aborted) throw new Error('Aborted')
       if (!state.pending) {
-        if (state.rounds >= 3) reject('Round budget exceeded')
+        if (state.rounds >= maxRounds) reject('Round budget exceeded')
         // Persist attempts before calling so restarts cannot reset budgets.
         state.rounds++; options.save(state)
         const reply = await options.model.complete(state.messages, names.map(n => tool(n, options.tools[n]!.fields, options.tools[n]!.description)), signal)
@@ -70,11 +74,19 @@ export async function scopedTurn(options: {
         reject(reason)
       }
       // A terminal action ends this foreground turn; no subsequent model poll.
-      try { state = options.commit(() => {
+      try {
+        // 只读工具在 SQLite 写事务外执行：文件搜索/读取不进事务、不阻塞写路径；
+        // 其结果与状态变更工具的落账仍在同一 commit 内，顺序与 calls 一致。
+        const preResults = new Map<string, unknown>()
+        for (const [i, c] of calls.entries()) {
+          const t = options.tools[c.function.name]!
+          if (t.readonly) preResults.set(c.id, t.execute(parsed[i]!))
+        }
+        state = options.commit(() => {
         const next: ScopedState = { messages: [...state.messages, { role: 'assistant', content: reply!.content, ...(calls.length ? { tool_calls: calls } : {}) }], rounds: state.rounds, ids: [...state.ids], ...(state.corrections !== undefined ? { corrections: state.corrections } : {}), ...(state.rejected !== undefined ? { rejected: state.rejected } : {}) }
         let terminal: unknown
         calls.forEach((c: ToolCall, i) => {
-          const result = options.tools[c.function.name]!.execute(parsed[i]!)
+          const result = preResults.has(c.id) ? preResults.get(c.id) : options.tools[c.function.name]!.execute(parsed[i]!)
           next.messages.push(pairedToolResult(c.id, JSON.stringify(result)))
           next.ids.push(c.id)
           if (options.tools[c.function.name]!.terminal) terminal = result

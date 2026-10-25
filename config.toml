@@ -11,15 +11,26 @@ model = "deepseek-flash"
 level = "supervised"
 
 # 项目注册表：path 是两个 CLI 共享的工作区
-# 预览 worker 的真实 CLI 执行（--executor cli）也以此名单为白名单，不在名单的项目直接拒绝
+# summary 供主 Agent 的 list_projects 展示；delegable = true 才允许 delegate_cli 真实执行
+# （预览 worker --executor cli 的白名单即 delegable 项目），阅读范围含全部注册项目
+[[projects]]
+name = "agents-master"
+path = "/home/vinci/projects/agents-master"
+summary = "本产品自身：通用个人 Agent。产品原则 docs/product-discovery-v0.md，进度 docs/roadmap.md"
+delegable = true
+
 [[projects]]
 name = "stock_data"
 path = "/home/vinci/projects/stock_data"
+summary = "股票数据项目"
+delegable = true
 
 # 合成验收沙箱：仅供预览 CLI 执行的端到端验证，不含真实数据
 [[projects]]
 name = "sandbox"
 path = "/home/vinci/projects/agents-sandbox"
+summary = "合成验收沙箱"
+delegable = true
 
 # 驱动 codex 时的沙箱模式（安全相关默认值，改这里要过用户）
 [backends.codex]

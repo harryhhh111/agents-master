@@ -13,11 +13,11 @@ import { createMainWebServer, handleMainWebRequest, type MainWebServerOptions, M
 export { previewCheckpoint } from './coordination-preview-runtime.js'
 
 /** 独立合成演示入口:临时/显式私有目录 + 独立认证 + TCP 监听。常驻 worker 请用 preview-worker。 */
-export function createCoordinationPreview(options: { model: ScopedModel; domainModel?: ScopedModel; executor?: FakeExecutor & { stop?(id: string): void }; reopen?: string; newDirectoryParent?: string }) {
+export function createCoordinationPreview(options: { model: ScopedModel; domainModel?: ScopedModel; executor?: FakeExecutor & { stop?(id: string): void }; reopen?: string; newDirectoryParent?: string; workspace?: import('../src/main/coordination/workspace.js').Workspace }) {
   // Do not inherit TMPDIR: test runners may point it inside the Git worktree.
   const directory = options.reopen ?? mkdtempSync(path.join(options.newDirectoryParent ?? '/tmp', 'coordination-web-preview-'))
   const mode = options.reopen ? openPreviewDirectory(directory) : createFreshPreviewDirectory(directory)
-  const runtime = createCoordinationRuntime({ directory, mode, model: options.model, domainModel: options.domainModel, executor: options.executor })
+  const runtime = createCoordinationRuntime({ directory, mode, model: options.model, domainModel: options.domainModel, executor: options.executor, workspace: options.workspace })
   const auth = new MainWebAuth(directory), events = new MainWebEventBus()
   const serverOptions: MainWebServerOptions = { preview: { page: coordinationPage(), close: runtime.closeConnections, handle: runtime.handle }, auth, events, dataDirectory: directory, readHistory: () => [], host: {
     start: () => 0, submit: () => { throw new Error('Scoped route required') }, recover: () => 0, getStatus: () => runtime.host.status('main'),

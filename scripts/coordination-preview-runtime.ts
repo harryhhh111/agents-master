@@ -6,6 +6,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { SQLiteMainInboxStore } from '../src/main/inbox.js'
 import { initializeOwnerContext, readOwnerContext, ownerContextCheckpoint, saveOwnerContext } from '../src/main/owner-context.js'
 import { AgentMemories, memoriesCheckpoint, type MemoryRecord } from '../src/main/coordination/memories.js'
+import type { Workspace } from '../src/main/coordination/workspace.js'
 import { CoordinationHost, defaultCoordinationHostLabels, type CoordinationHostLabels } from '../src/main/coordination/model-host.js'
 import { defaultCoordinationStoreLabels, type CoordinationStoreLabels } from '../src/main/coordination/store.js'
 import { defaultDomainSystemPrompt, ScopedDomainExecutor } from '../src/agent/scoped-domain.js'
@@ -23,13 +24,13 @@ export type PreviewWording = 'synthetic' | 'real-model'
 /** synthetic: 合成执行器；cli: 白名单项目的真实 CLI 执行（要求 wording=real-model）。 */
 export type PreviewExecution = 'synthetic' | 'cli'
 
-export function previewCheckpoint(ownerContext: string, wording: PreviewWording = 'synthetic', execution: PreviewExecution = 'synthetic', memories: readonly MemoryRecord[] = [], memoryTombstones: readonly MemoryRecord[] = []): string {
+export function previewCheckpoint(ownerContext: string, wording: PreviewWording = 'synthetic', execution: PreviewExecution = 'synthetic', memories: readonly MemoryRecord[] = [], memoryTombstones: readonly MemoryRecord[] = [], workspace = false): string {
   const lead = execution === 'cli'
     ? '协调预览检查点：真实模型对话与真实 CLI 执行（仅限白名单项目）。使用受限目录、状态、delegate、delegate_cli、answer、cancel 工具。CLI 任务有预算与超时，产物落项目 .agent-artifacts/；不 push、不删工作区外文件、不碰凭据。含糊需求先澄清；不得声称白名单外的执行能力。'
     : wording === 'real-model'
       ? '协调预览检查点：真实模型对话。可以使用受限目录、状态、delegate、answer、cancel 工具协调工作；执行工具仍为受限合成（synthetic_inspect/ask/finish），不运行真实 CLI、不读取项目文件、不开放 shell。含糊需求先澄清；不得声称真实项目执行。'
       : '协调预览检查点：仅模拟/联调。可以使用受限目录、状态、delegate、answer、cancel 工具协调合成工作。含糊需求先澄清；不得声称真实项目执行，不开放 shell、文件或真实后端。'
-  return [lead, ownerContextUsageNote, memoryCapabilityNote, ownerContextCheckpoint(ownerContext), memoriesCheckpoint(memories, memoryTombstones)].filter(Boolean).join('\n\n')
+  return [lead, ownerContextUsageNote, memoryCapabilityNote, workspace ? workspaceCapabilityNote : '', ownerContextCheckpoint(ownerContext), memoriesCheckpoint(memories, memoryTombstones)].filter(Boolean).join('\n\n')
 }
 /** 主人上下文使用约束：与 src/main/foreground.ts defaultMainAgentInstructions 中相关三条一致。
  *  那边是字节稳定的 Stage 1.2c 前缀不能改动，此处保持文本同步；
@@ -46,6 +47,14 @@ const memoryCapabilityNote = [
   '记忆保存在本应用的私有数据目录，用户可在设置的记忆列表查看；你可以用 read_memories 自查记忆的 ID、内容与状态。回答"你记住了什么""刚才确认成功了吗"等问题时以 read_memories 的返回为准，不要声称无法读取。',
   '用户明确说确认/改正/忘记某条记忆时，用 confirm_memory/correct_memory/forget_memory 按记录 ID 执行；目标不清先询问，普通讨论、假设或你的推测都不是修改授权。操作结果以工具返回为准：只有成功才能说已确认/已修改/已忘记，失败要如实说明。',
   '已确认的记忆列在下方"已确认的记忆"中（如有）；"已失效的记忆"（如有）是用户已忘记或更正的内容，不再是当前事实。',
+].join('\n')
+/** 工作区能力约束（docs/main-agent-workspace-plan-2026-10-24.md）：只读视野 + 动态事实用工具获取。
+ *  工具仅在主对话且组装方注入工作区时存在；提示词不把限制当全部职责。 */
+const workspaceCapabilityNote = [
+  '工作区能力：你是用户的管家与协调者，可以主动了解用户的工作。主对话可用 list_projects 发现已注册项目，list_files/read_file/search_files 只读查看项目文件，project_status 查 Git 状态（分支、HEAD、未提交改动、近期提交），task_detail/read_artifact 核对工作群任务与产物。',
+  '当前系统本身就是项目 agents-master（本产品）：产品原则在 docs/product-discovery-v0.md，进度在 docs/roadmap.md。',
+  '项目进度、文件内容、任务状态等动态事实必须用工具实时获取后回答，不要凭记忆或旧对话编造；读取结果注明来源与时间。未找到、截断、超时要如实说明；只读查询失败不能描述成执行失败。',
+  '讨论代码或提到开发不等于要修改：只有用户明确要求修改时才委派 delegate_cli；委派前先用 project_status 检查工作区状态。push、部署、重启现网必须等用户逐项明确授权。',
 ].join('\n')
 
 const realCliHostLabels: CoordinationHostLabels = {
@@ -105,6 +114,8 @@ export function createCoordinationRuntime(options: {
   /** cli 执行：真实 CLI backend 工厂与项目白名单（name → 绝对路径）。要求 wording='real-model'。 */
   execution?: PreviewExecution
   cli?: { backends: CliBackendFactory; projects: Record<string, string> }
+  /** 主对话只读工作区（项目/文件/搜索/Git/产物）；注入后工具与预算生效。 */
+  workspace?: Workspace
 }) {
   const { directory } = options
   const wording: PreviewWording = options.wording ?? 'synthetic'
@@ -145,7 +156,7 @@ export function createCoordinationRuntime(options: {
         }))
       : syntheticExecutor())
     const memories = new AgentMemories(directory)
-    const refreshCheckpoint = () => { host.checkpoint = previewCheckpoint(readOwnerContext(directory), wording, execution, memories.confirmed(), memories.tombstones()) }
+    const refreshCheckpoint = () => { host.checkpoint = previewCheckpoint(readOwnerContext(directory), wording, execution, memories.confirmed(), memories.tombstones(), !!options.workspace) }
     const host = new CoordinationHost(store.coordination, options.model, options.domainModel ?? options.model,
       executor,
       () => {
@@ -159,7 +170,8 @@ export function createCoordinationRuntime(options: {
           refreshCheckpoint()
           return result
         },
-      })
+      },
+      options.workspace, options.workspace ? 6 : undefined)
     refreshCheckpoint()
     host.start()
     const closeConnections = () => { for (const bus of buses.values()) bus.close() }
