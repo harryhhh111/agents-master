@@ -129,17 +129,18 @@ const coordinationPageTemplate = `<!doctype html>
 #chat-panel{flex:1;min-width:0;display:flex;flex-direction:column;background:#f7f9fa}#chat-header{display:flex;align-items:center;gap:.7rem;padding:.55rem 1rem;border-bottom:1px solid #dee5e8;background:#fff;flex:none}#back-to-list{display:none;font-size:.85rem;padding:.3rem .6rem}.chat-heading{flex:1;min-width:0}#chat-title{font-size:1rem}#chat-subtitle{font-size:.72rem;color:#63737b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#todo-jump{font-size:.75rem;padding:.25rem .6rem;flex:none}.status{font-size:.78rem;color:#63737b;white-space:nowrap;flex:none}
 .control-banner{flex:none;background:#fdf6e3;border-bottom:1px solid #f0e2b6;color:#8a5a00;font-size:.82rem;padding:.45rem 1rem}.control-banner p{margin:.1rem 0}
 .todo-area{flex:none;background:#fff;border-bottom:1px solid #dee5e8;padding:.5rem 1rem;max-height:30vh;overflow:auto}
-.conversation{position:relative;flex:1;min-height:0}.messages{height:100%;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;overflow-anchor:none;padding:1rem;padding-inline:max(1rem,calc((100% - 720px)/2))}
+.conversation{position:relative;flex:1;min-height:0}.messages{height:100%;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;overflow-anchor:none;padding:1rem;padding-inline:max(1rem,calc((100% - min(1120px,max(720px,64%)))/2))}
 .message{display:flex;flex-direction:column;align-items:flex-start;margin:0 0 .9rem;min-width:0}.message.user{align-items:flex-end}.message.runtime{align-items:center}.runtime-note{font-size:.75rem;color:#8a979e;text-align:center;max-width:80%}.time-divider{justify-content:center;font-size:.72rem;color:#8a979e;text-align:center;margin:.4rem 0 .9rem}
 .bubble-wrap{max-width:78%;min-width:0;display:flex;flex-direction:column;align-items:flex-start}.user .bubble-wrap{align-items:flex-end}.agent-head{display:flex;align-items:center;gap:.4rem;margin:0 .3rem .25rem}.avatar{width:1.6rem;height:1.6rem;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:.75rem;color:#fff;background:#087d69;flex:none}.avatar.work{background:#5b6abf}.agent-name{font-size:.72rem;color:#63737b}
 .bubble{min-width:0;padding:.55rem .8rem;border-radius:16px 16px 16px 4px;background:#fff;border:1px solid #e2e8eb;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6}.bubble.main{border-left:3px solid #087d69}.bubble.work{background:#f0f2fc;border-color:#dfe3f5;border-left:3px solid #5b6abf}.user .bubble{background:#d9f3e9;border-color:#c3e7da;border-radius:16px 16px 4px 16px}.chip{display:inline-block;font-size:.65rem;border-radius:6px;padding:0 .35rem;background:#087d69;color:#fff;margin-right:.4rem;vertical-align:.12em}.work .chip,.chip.work{background:#5b6abf}
 .card{border:1px solid #e2d9c8;background:#fffcf5;border-radius:12px;padding:.55rem .75rem;margin-top:.4rem;font-size:.85rem;max-width:100%;min-width:14rem}.message>.card{max-width:78%}.todo-area .card{margin:.35rem 0}.card-title{font-weight:600;font-size:.85rem}.card-meta,.card-body{margin:.15rem 0;font-size:.8rem;color:#52636c;overflow-wrap:anywhere}.card input{border:1px solid #cbd5da;border-radius:8px;padding:.35rem .5rem;margin-right:.4rem;font-size:.85rem;max-width:60%}.card button{font-size:.78rem;padding:.25rem .6rem;margin-top:.3rem}
 .empty-state{position:absolute;top:30%;left:1rem;right:1rem;text-align:center;color:#63737b;pointer-events:none}.latest{position:absolute;bottom:.75rem;left:50%;transform:translateX(-50%);box-shadow:0 2px 10px #20303020;white-space:nowrap;font-size:.85rem}
+#turn-rail{position:absolute;right:.4rem;top:50%;transform:translateY(-50%);z-index:5;display:flex;flex-direction:column;align-items:center;gap:.35rem;padding:.45rem .3rem;border-radius:999px;background:#fffffff2;border:1px solid #e2e8eb;box-shadow:0 1px 6px #20303018}#turn-rail button{width:.5rem;height:.5rem;border-radius:50%;border:none;padding:0;background:#c6d0d4;flex:none}#turn-rail button:hover{background:#8fa6ad}#turn-rail button.active{background:#087d69;transform:scale(1.3)}#turn-rail .rail-count{font-size:.6rem;color:#8a979e;white-space:nowrap}
 .feedback{flex:none;padding:0 1rem;background:#fff;max-height:25vh;overflow:auto;font-size:.85rem}.error{color:#a12525;overflow-wrap:anywhere}.error:not(:empty){padding:.4rem 0}.send-failure{padding:.5rem 0;border-bottom:1px solid #edf1f3;overflow-wrap:anywhere}.send-failure button{font-size:.8rem;padding:.2rem .5rem;margin-left:.5rem}
 .composer{flex:none;background:#fff;border-top:1px solid #dee5e8;padding:.65rem 1rem max(.65rem,env(safe-area-inset-bottom))}.chat{display:flex;align-items:flex-end;gap:.6rem;min-width:0}.chat textarea{display:block;flex:1;min-width:0;width:0;resize:none;min-height:46px;max-height:160px;overflow-y:auto;border:1px solid #cbd5da;border-radius:14px;padding:.6rem .75rem;line-height:1.5}.chat button{background:#087d69;color:#fff;border-color:#087d69;min-height:46px}.turn-dot{width:.55rem;height:.55rem;border-radius:50%;background:#d98e04;align-self:center;flex:none}.hint{font-size:.72rem;color:#63737b;margin-top:.25rem}
 #reload-chat{align-self:center;margin:.5rem}
 #login-panel{position:fixed;inset:0;z-index:10;background:#f7f9fa;padding:1.5rem;overflow:auto}#login-panel form{display:grid;gap:.8rem;max-width:400px}#login-panel input{display:block;width:100%;min-width:0;border:1px solid #cbd5da;padding:.6rem;border-radius:10px}#login-panel p{margin-top:.75rem;font-size:.85rem}
-@media(max-width:767px){#sidebar{display:none;width:100%!important;border-right:none}#sidebar-handle{display:none}body.show-list #sidebar{display:flex}body.show-list #chat-panel{display:none}#back-to-list{display:inline-block}.messages{padding:.8rem}.bubble-wrap{max-width:88%}.hint{display:none}#chat-subtitle{display:none}}
+@media(max-width:767px){#sidebar{display:none;width:100%!important;border-right:none}#sidebar-handle{display:none}body.show-list #sidebar{display:flex}body.show-list #chat-panel{display:none}#back-to-list{display:inline-block}.messages{padding:.8rem}.bubble-wrap{max-width:88%}.hint{display:none}#chat-subtitle{display:none}#turn-rail{display:none}}
 @media(pointer:coarse){.hint{display:none}}
 </style>
 <main id="app">
@@ -158,7 +159,7 @@ const coordinationPageTemplate = `<!doctype html>
 <div id="control-banner" class="control-banner" role="alert" hidden></div>
 <div id="todo-area" class="todo-area" hidden></div>
 <div id="memory-area" class="todo-area" hidden></div>
-<div class="conversation"><div id="messages" class="messages" role="log" aria-label="聊天记录" aria-live="polite" tabindex="0"></div><p id="empty-state" class="empty-state">正在加载聊天…</p><button id="latest" class="latest" type="button" hidden>回到最新</button></div>
+<div class="conversation"><div id="messages" class="messages" role="log" aria-label="聊天记录" aria-live="polite" tabindex="0"></div><nav id="turn-rail" aria-label="对话回合导航" hidden></nav><p id="empty-state" class="empty-state">正在加载聊天…</p><button id="latest" class="latest" type="button" hidden>回到最新</button></div>
 <div class="feedback"><p id="error" class="error" role="alert"></p><button id="recover" type="button" hidden>重试回复</button><div id="send-errors" aria-live="polite"></div></div><button id="reload-chat" type="button" hidden>重新加载聊天</button>
 <div class="composer"><form id="chat" class="chat"><textarea id="message" rows="1" aria-label="消息" placeholder="聊点什么…" autocomplete="off" maxlength="8000" enterkeyhint="enter"></textarea><span id="turn-dot" class="turn-dot" hidden title="回合进行中"></span><button id="send" disabled>发送</button></form><p class="hint">Enter 发送 · Shift + Enter 换行</p></div>
 </section>
@@ -261,6 +262,7 @@ async function pollSidebar(generation){
 function showLogin(configured=true){
   viewGeneration++;sessionRevision++;sendingConversations.clear();stopPolling();if(stream){stream.close();stream=null}
   messages.replaceChildren();seen.clear();lastMessageTime=0;owner.value='';savedOwnerContent='';input.value='';error.textContent='';status.textContent='';privatePanel.hidden=true;loginPanel.hidden=false;
+  rebuildRail();
   loaded=false;loading=false;recovering=false;composing=false;compositionEndedAt=-Infinity;draftRevision++;failedSends=[];replyState='idle';replyError='';connectionLost=false;liveDisconnected=false;unread=0;followingLatest=true;
   drafts.clear();answerDrafts.clear();answerFocus.clear();controlKeys.clear();uncertainControls.clear();rejectedControls.clear();cancelling.clear();cardSnapshot='';
   for(const card of cardNodes.values())card.remove();cardNodes.clear();document.querySelector('#todo-area').replaceChildren();
@@ -289,12 +291,35 @@ function goLatest(){followingLatest=true;rememberSize();messages.scrollTop=messa
 function syncChatSize(){
   if(privatePanel.hidden||!sizeChanged())return;
   rememberSize();if(followingLatest)goLatest();else showLatest();
+  renderRail();
 }
+// 回合导轨（仿 Codex 圆点导航）：每条用户发言一个点，高亮当前所处回合，悬停显示序号，点击跳转。
+const rail=document.querySelector('#turn-rail');
+let railTurns=[],railState={start:-1,active:-1,count:0};
+function activeTurnIndex(){const mark=messages.scrollTop+messages.clientHeight*0.35;let idx=0;for(let i=0;i<railTurns.length;i++){if(railTurns[i].offsetTop<=mark)idx=i;else break}return idx}
+function renderRail(){
+  const n=railTurns.length;
+  if(n<2){rail.hidden=true;railState={start:-1,active:-1,count:0};return}
+  rail.hidden=false;
+  // 停留在最新处时当前回合视为最后一轮（最后一条用户发言可能位于视口下半部，位置判定会偏小）。
+  const active=nearBottom()?n-1:activeTurnIndex(),MAX=31;
+  const start=n>MAX?Math.max(0,Math.min(active-(MAX>>1),n-MAX)):0;
+  if(railState.start===start&&railState.active===active&&railState.count===n)return;
+  railState={start,active,count:n};rail.textContent='';
+  for(let i=start;i<Math.min(n,start+MAX);i++){
+    const b=document.createElement('button');b.type='button';if(i===active)b.className='active';
+    b.title='第 '+(i+1)+' / '+n+' 次对话';
+    b.addEventListener('click',()=>{followingLatest=false;messages.scrollTop=Math.max(0,railTurns[i].offsetTop-8);showLatest();renderRail()});
+    rail.append(b);
+  }
+  const count=document.createElement('span');count.className='rail-count';count.textContent=(active+1)+'/'+n;rail.append(count);
+}
+function rebuildRail(){railTurns=typeof messages.querySelectorAll==='function'?Array.from(messages.querySelectorAll('.message.user')):[];railState={start:-1,active:-1,count:0};renderRail()}
 messages.addEventListener('scroll',()=>{
   // Reflow can itself dispatch scroll before ResizeObserver runs. Preserve the
   // previous intent in that case instead of treating it as reading history.
   if(sizeChanged()){syncChatSize();return}
-  followingLatest=nearBottom();if(followingLatest)unread=0;showLatest();
+  followingLatest=nearBottom();if(followingLatest)unread=0;showLatest();renderRail();
 });
 // An explicit move towards history wins even if a resize notification is pending.
 messages.addEventListener('wheel',event=>{if(event.deltaY<0)followingLatest=false},{passive:true});
@@ -343,6 +368,7 @@ function add(message){
     wrap.append(bubble);row.append(wrap);
   }
   messages.append(row);emptyState.hidden=true;
+  if(message.author==='user')rebuildRail();
   placeCards();
   if(follow)goLatest();else{unread++;showLatest()}
 }
@@ -466,6 +492,7 @@ function resetConversationView(id){
   convState.delete(id);
   if(id!==conversation){renderConversations();return}
   messages.replaceChildren();seen.clear();lastMessageTime=0;cardSnapshot='';
+  rebuildRail();
   for(const card of cardNodes.values())card.remove();cardNodes.clear();cancelling.clear();
   document.querySelector('#todo-area').replaceChildren();
   replyState='idle';replyError='';renderConversations();void load();
@@ -552,6 +579,7 @@ function switchConversation(next){
   const saved=drafts.get(next);input.value=saved?.text||'';failedSends=saved?.failed||[];
   if(saved&&saved.revision!==undefined)draftRevision=saved.revision;else draftRevision++;
   messages.replaceChildren();seen.clear();lastMessageTime=0;cardSnapshot='';
+  rebuildRail();
   for(const card of cardNodes.values())card.remove();cardNodes.clear();cancelling.clear();
   document.querySelector('#todo-area').replaceChildren();
   recovering=false;composing=false;eventRevision++;replyState='idle';replyError='';
