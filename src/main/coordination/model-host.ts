@@ -63,6 +63,17 @@ export interface MemoryToolSink {
   read(): unknown
   manage(action: 'confirm' | 'correct' | 'forget', id: string, newFact: string | undefined, operationId: string, sourceEvent: string): unknown
 }
+/** 权限档位（与 config.ts delegation.level 同源）。readonly 档不暴露真实执行委派。 */
+export type PermissionLevel = 'readonly' | 'supervised' | 'workspace'
+/** 宿主环境与权限的每回合实时来源（docs/main-agent-workspace-plan-2026-10-24.md 2026-10-27 约束）：
+ *  快照作为独立 user 消息注入主对话上下文，不写进 system checkpoint（保前缀稳定）；
+ *  工具清单、可委派范围、档位均来自本轮实际配置，不允许第二份手写名单。 */
+export interface HostEnvironment {
+  /** 生成本回合宿主环境快照文本；toolNames 为本回合实际注册的工具名。 */
+  snapshot(toolNames: readonly string[], level: PermissionLevel): string
+  /** 当前有效权限档位；每回合读取，界面切档后下一回合生效。 */
+  permissionLevel(): PermissionLevel
+}
 export class CoordinationHost {
   private readonly busy = new Set<string>()
   private readonly blocked = new Set<string>()
@@ -81,7 +92,9 @@ export class CoordinationHost {
     /** 主对话只读工作区视野（项目/文件/搜索/Git/任务产物）；undefined 时工具不暴露。 */
     private readonly workspace?: Workspace,
     /** 主对话回合的模型调用预算（默认 3）；研究流需要更高预算，群聊保持默认。 */
-    private readonly mainMaxRounds?: number) {
+    private readonly mainMaxRounds?: number,
+    /** 宿主环境快照与权限档位来源；undefined 时不注入快照、不做档位门控（合成/测试默认）。 */
+    private readonly hostEnv?: HostEnvironment) {
     this.background = new FakeBackgroundScheduler(store, executor, changed)
   }
   start(): void {
@@ -106,7 +119,8 @@ export class CoordinationHost {
       status: { fields: {}, execute: () => ({ assignments: this.store.assignments(FAKE_GROUP).map(a => ({ id: a.id, status: a.status })), questions: this.store.questions(FAKE_GROUP) }) },
       delegate: { fields: { objective: 'text', completionCriteria: 'texts' }, terminal: true, execute: a => this.store.accept(turn.conversation, turn.event.id, { action: 'fake-check', objective: String(a.objective), scope: ['synthetic'], completionCriteria: a.completionCriteria as string[] }) },
       // 真实 CLI 委派仅在组装方注入白名单时存在；store 侧再校验一次（纵深防御）。
-      ...(this.cliProjects ? {
+      // readonly 档位不暴露真实执行委派（宿主层门控，不依赖模型自觉）。
+      ...(this.cliProjects && this.hostEnv?.permissionLevel() !== 'readonly' ? {
         delegate_cli: { fields: { project: 'text', backend: 'text', objective: 'text', completionCriteria: 'texts' }, terminal: true,
           description: `真实 CLI 委派。project 仅限白名单：${this.cliProjects.join('、')}；backend 仅限：${this.store.allowedBackends.join('、')}。`,
           execute: (a: Record<string, unknown>) => this.store.accept(turn.conversation, turn.event.id, { action: 'cli-task', objective: String(a.objective), scope: ['project'], project: String(a.project), backend: String(a.backend), completionCriteria: a.completionCriteria as string[] }) },
@@ -198,10 +212,19 @@ export class CoordinationHost {
       this.busy.add(c); this.changed()
       const main = addressedMain(c, turn.context.at(-1)?.content ?? '')
       author = main ? 'main-agent' : 'fake-work-agent'
-      const policy = this.labels.policy + (this.cliProjects?.length ? `\ndelegate_cli 的 project 仅限白名单：${this.cliProjects.join('、')}；backend 仅限：${this.store.allowedBackends.join('、')}。` : '')
-      const initial: WireMessage[] = [{ role: 'system', content: (main ? (c === 'main' ? this.checkpoint : '群内主 Agent，仅使用本群上下文。') : '工作项目 Agent，仅使用本群上下文；可通过受限协调工具委派合成工作。') + '\n' + policy + '\n' + contextFormatNote }, ...turn.context.map(m => renderContextMessage(m, author))]
+      const tools = this.tools(turn)
+      const level = this.hostEnv?.permissionLevel()
+      const policy = this.labels.policy
+        + (this.cliProjects?.length && level !== 'readonly' ? `\ndelegate_cli 的 project 仅限白名单：${this.cliProjects.join('、')}；backend 仅限：${this.store.allowedBackends.join('、')}。` : '')
+        + (level === 'readonly' ? '\n当前为只读权限档位：不能发起真实执行委派，只能查询与讨论；如需执行请让用户在设置中调整档位。' : '')
+      // 宿主环境快照：独立 user 消息（动态事实不进 system checkpoint，保前缀稳定），仅主对话注入；
+      // 含本回合实际注册工具清单——能力说明以实际注册为准，不维护第二份手写名单。
+      const snapshot = c === 'main' && this.hostEnv && level
+        ? [{ role: 'user' as const, content: this.hostEnv.snapshot(Object.keys(tools), level) }]
+        : []
+      const initial: WireMessage[] = [{ role: 'system', content: (main ? (c === 'main' ? this.checkpoint : '群内主 Agent，仅使用本群上下文。') : '工作项目 Agent，仅使用本群上下文；可通过受限协调工具委派合成工作。') + '\n' + policy + '\n' + contextFormatNote }, ...snapshot, ...turn.context.map(m => renderContextMessage(m, author))]
       const current = turn
-      const reply = await scopedTurn({ model: main ? this.mainModel : this.domainModel, initial, tools: this.tools(turn), signal: controller.signal, timeoutMs: this.turnTimeoutMs,
+      const reply = await scopedTurn({ model: main ? this.mainModel : this.domainModel, initial, tools, signal: controller.signal, timeoutMs: this.turnTimeoutMs,
         texts: { recorded: this.labels.recordedNote, clarify: this.labels.clarifyNote, failed: this.labels.failedNote, partial: this.labels.partialNote },
         protocolCorrection: this.protocolCorrection,
         maxRounds: turn.conversation === 'main' ? this.mainMaxRounds : undefined,

@@ -124,7 +124,7 @@ const coordinationPageTemplate = `<!doctype html>
 #conversation-list{flex:1;min-height:0;overflow-y:auto;padding:.5rem}.conv-item{display:flex;align-items:center;gap:.5rem;padding:.6rem .7rem;border-radius:12px;cursor:pointer;margin-bottom:.2rem}.conv-item:hover{background:#eaf0f2}.conv-item.active{background:#dcebe6}.conv-text{flex:1;min-width:0;display:flex;flex-direction:column}.conv-name{font-weight:600;font-size:.92rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.conv-preview{font-size:.75rem;color:#63737b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-height:1.1em}.conv-side{display:flex;align-items:center;gap:.3rem;flex:none}.conv-badge{font-size:.68rem;border-radius:999px;padding:.05rem .45rem;background:#e3e9ec;color:#52636c;white-space:nowrap}.conv-badge.urgent{background:#fde8e8;color:#a12525}.conv-warn{width:.95rem;height:.95rem;border-radius:50%;background:#d98e04;color:#fff;font-size:.62rem;display:inline-flex;align-items:center;justify-content:center;flex:none}
 .sidebar-foot{border-top:1px solid #e2e8eb;padding:.55rem 1rem;font-size:.8rem;display:grid;gap:.45rem}.capability{font-size:.72rem;color:#63737b}#version-switch{display:flex;align-items:center;flex-wrap:wrap;gap:.3rem .5rem}#version-current{color:#63737b;font-size:.75rem;flex:1 1 100%;overflow-wrap:anywhere}#to-stable{color:#087d69;text-decoration:none;border:1px solid #b8d9d1;border-radius:999px;padding:.15rem .55rem;white-space:nowrap}#open-settings{justify-self:start;font-size:.85rem;padding:.35rem .9rem}
 .modal-backdrop{position:fixed;inset:0;z-index:20;background:#20303040;display:flex;align-items:center;justify-content:center;padding:1rem}.modal{background:#fff;border-radius:16px;width:100%;max-width:520px;max-height:85vh;overflow:auto;padding:1rem 1.25rem;box-shadow:0 8px 40px #20303030}.modal-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:.4rem}#close-settings{border:none;font-size:1.2rem;line-height:1;padding:.25rem .55rem}
-.settings-body{padding:.4rem 0 .2rem;font-size:.85rem}.settings-body p{color:#63737b;margin:.5rem 0}.settings-body textarea{display:block;width:100%;min-height:7rem;resize:vertical;max-height:24vh;padding:.6rem;border:1px solid #cbd5da;border-radius:10px}.settings-body button{margin-top:.5rem}
+.settings-body{padding:.4rem 0 .2rem;font-size:.85rem}.settings-body p{color:#63737b;margin:.5rem 0}.settings-body textarea{display:block;width:100%;min-height:7rem;resize:vertical;max-height:24vh;padding:.6rem;border:1px solid #cbd5da;border-radius:10px}.settings-body button{margin-top:.5rem}#level-options{display:grid;gap:.35rem;font-size:.85rem}#level-options input{margin-right:.4rem}
 #sidebar-handle{width:5px;flex:none;cursor:col-resize;background:transparent;touch-action:none}#sidebar-handle:hover,#sidebar-handle:active{background:#b8d9d1}
 #chat-panel{flex:1;min-width:0;display:flex;flex-direction:column;background:#f7f9fa}#chat-header{display:flex;align-items:center;gap:.7rem;padding:.55rem 1rem;border-bottom:1px solid #dee5e8;background:#fff;flex:none}#back-to-list{display:none;font-size:.85rem;padding:.3rem .6rem}.chat-heading{flex:1;min-width:0}#chat-title{font-size:1rem}#chat-subtitle{font-size:.72rem;color:#63737b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#todo-jump{font-size:.75rem;padding:.25rem .6rem;flex:none}.status{font-size:.78rem;color:#63737b;white-space:nowrap;flex:none}
 .control-banner{flex:none;background:#fdf6e3;border-bottom:1px solid #f0e2b6;color:#8a5a00;font-size:.82rem;padding:.45rem 1rem}.control-banner p{margin:.1rem 0}
@@ -164,7 +164,7 @@ const coordinationPageTemplate = `<!doctype html>
 <div class="composer"><form id="chat" class="chat"><textarea id="message" rows="1" aria-label="消息" placeholder="聊点什么…" autocomplete="off" maxlength="8000" enterkeyhint="enter"></textarea><span id="turn-dot" class="turn-dot" hidden title="回合进行中"></span><button id="send" disabled>发送</button></form><p class="hint">Enter 发送 · Shift + Enter 换行</p></div>
 </section>
 </div>
-<div id="settings-modal" class="modal-backdrop" hidden><div class="modal" role="dialog" aria-modal="true" aria-label="设置"><div class="modal-head"><h2>设置</h2><button id="close-settings" type="button" aria-label="关闭设置">×</button></div><div class="settings-body"><h2>主人上下文</h2><p>你明确维护的稳定背景，不是自动记忆。保存后仅影响未来回合。</p><textarea id="owner" aria-label="主人上下文" maxlength="12000"></textarea><button id="save-owner" type="button">明确保存主人上下文</button><p id="owner-status" role="status"></p><p>预览通道与稳定版数据相互独立。</p><h2>清空对话</h2><p>删除该会话的全部消息记录，不可恢复；清空工作项目群会同时删除其中的任务与问题记录。对话正在处理中时不能清空。</p><button id="clear-main" type="button">清空主 Agent 对话</button> <button id="clear-group" type="button">清空工作项目群</button><p id="clear-status" role="status"></p><h2>已确认的记忆</h2><p>模型提议、你明确确认过的关于你的事实，会进入后续对话的背景。忘记后不再作为当前事实使用，原始聊天记录不受影响。也可以在对话里直接说"把某条改成……"或"忘记某条"。</p><ul id="memory-list"></ul><button id="logout" type="button">退出登录</button></div></div></div>
+<div id="settings-modal" class="modal-backdrop" hidden><div class="modal" role="dialog" aria-modal="true" aria-label="设置"><div class="modal-head"><h2>设置</h2><button id="close-settings" type="button" aria-label="关闭设置">×</button></div><div class="settings-body"><h2>主人上下文</h2><p>你明确维护的稳定背景，不是自动记忆。保存后仅影响未来回合。</p><textarea id="owner" aria-label="主人上下文" maxlength="12000"></textarea><button id="save-owner" type="button">明确保存主人上下文</button><p id="owner-status" role="status"></p><p>预览通道与稳定版数据相互独立。</p><h2>清空对话</h2><p>删除该会话的全部消息记录，不可恢复；清空工作项目群会同时删除其中的任务与问题记录。对话正在处理中时不能清空。</p><button id="clear-main" type="button">清空主 Agent 对话</button> <button id="clear-group" type="button">清空工作项目群</button><p id="clear-status" role="status"></p><h2>权限档位</h2><p>主 Agent 写文件与执行命令的授权档位，切换即保存、下一回合生效。任何档位都不开放凭据原文、push/部署与外部联络。</p><div id="level-options"><label><input type="radio" name="perm-level" value="readonly"> 只读：视野查询，无写无执行</label><label><input type="radio" name="perm-level" value="supervised"> 审批：写/执行逐项待确认（默认）</label><label><input type="radio" name="perm-level" value="workspace"> 工作区自动：授权目录内自动执行，越界仍审批</label></div><p id="level-status" role="status"></p><h2>已确认的记忆</h2><p>模型提议、你明确确认过的关于你的事实，会进入后续对话的背景。忘记后不再作为当前事实使用，原始聊天记录不受影响。也可以在对话里直接说"把某条改成……"或"忘记某条"。</p><ul id="memory-list"></ul><button id="logout" type="button">退出登录</button></div></div></div>
 </main>
 <script>
 const appConfig=__COORDINATION_PAGE_CONFIG__;
@@ -600,7 +600,29 @@ function setupVersionSwitch(){
 }
 // 设置弹窗：按钮打开，Esc / 点遮罩 / × 关闭；退出登录守卫不变。
 const settingsModal=document.querySelector('#settings-modal');
-document.querySelector('#open-settings').addEventListener('click',()=>{settingsModal.hidden=false;void loadMemories()});
+// 权限档位：查看与切换（切换即保存，下一回合生效）；模型无路径触达此端点。
+const levelStatus=document.querySelector('#level-status');
+const levelRadios=typeof document.querySelectorAll==='function'?Array.from(document.querySelectorAll('input[name="perm-level"]')):[];
+async function loadPermissionLevel(){
+  try{
+    const data=await request('/api/permission-level');
+    const radio=levelRadios.find(r=>r.value===data.level);
+    if(radio)radio.checked=true;
+    levelStatus.textContent=data.level===data.configured?'':'（与配置默认值 '+data.configured+' 不同）';
+  }catch(e){levelStatus.textContent='当前通道不支持档位查询。'}
+}
+for(const radio of levelRadios){
+  radio.addEventListener('change',async()=>{
+    if(!radio.checked)return;
+    for(const r of levelRadios)r.disabled=true;
+    try{
+      const data=await request('/api/permission-level',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({level:radio.value})});
+      levelStatus.textContent='已切换到 '+(data.level==='readonly'?'只读':data.level==='workspace'?'工作区自动':'审批')+' 档，下一回合生效。';
+    }catch(e){levelStatus.textContent=e.message}
+    finally{for(const r of levelRadios)r.disabled=false;void loadPermissionLevel()}
+  });
+}
+document.querySelector('#open-settings').addEventListener('click',()=>{settingsModal.hidden=false;void loadMemories();void loadPermissionLevel()});
 document.querySelector('#close-settings').addEventListener('click',()=>{settingsModal.hidden=true});
 settingsModal.addEventListener('click',event=>{if(event.target===settingsModal)settingsModal.hidden=true});
 window.addEventListener('keydown',event=>{if(event.key==='Escape')settingsModal.hidden=true});

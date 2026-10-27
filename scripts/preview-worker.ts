@@ -7,7 +7,7 @@ import net from 'node:net'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { pathToFileURL } from 'node:url'
-import { createCoordinationRuntime, createFreshPreviewDirectory, openPreviewDirectory, type CoordinationRuntime, type PreviewDirectoryMode, type PreviewExecution, type PreviewWording } from './coordination-preview-runtime.js'
+import { createCoordinationRuntime, createFreshPreviewDirectory, openPreviewDirectory, type CoordinationRuntime, type HostEnvironmentFacts, type PreviewDirectoryMode, type PreviewExecution, type PreviewWording } from './coordination-preview-runtime.js'
 import type { CliBackendFactory } from '../src/agent/cli-domain-executor.js'
 import { demoModel } from './main-web-coordination-demo.js'
 import { coordinationPage } from '../src/main/coordination/web-page.js'
@@ -30,6 +30,8 @@ export interface PreviewWorkerModelOption {
   cli?: { backends: CliBackendFactory; projects: Record<string, string> }
   /** 主对话只读工作区视野（项目/文件/搜索/Git/产物）。 */
   workspace?: Workspace
+  /** 宿主环境快照与权限档位事实（real 模式注入）。 */
+  hostEnvironment?: HostEnvironmentFacts
 }
 
 export const previewPreviewLabelCli = '预览版 · 真实模型与执行（白名单项目）'
@@ -112,7 +114,7 @@ export async function startPreviewWorker(options: { dataDirectory: string; socke
     // （synthetic_inspect/ask/finish），绝不触发真实 CLI 或子进程；它能完成 ask→回答→finish
     // 的合成闭环。HeldFakeExecutor 会无限挂起任务，仅限单元测试显式驱动，不能用于常驻 worker。
     // real 模式换用真实模型实例,执行工具保持不变;cli 模式再叠加白名单项目的真实 CLI 执行。
-    runtime = createCoordinationRuntime({ directory, mode, model: modelOption.mode === 'real' ? modelOption.realModel! : demoModel(), wording, execution, cli: modelOption.cli, workspace: modelOption.workspace })
+    runtime = createCoordinationRuntime({ directory, mode, model: modelOption.mode === 'real' ? modelOption.realModel! : demoModel(), wording, execution, cli: modelOption.cli, workspace: modelOption.workspace, hostEnvironment: modelOption.hostEnvironment })
   } catch (error) {
     lock.release()
     throw error
@@ -222,6 +224,19 @@ export async function runPreviewWorker(args: string[]): Promise<void> {
       }
       const projects = Object.fromEntries(config.projects.filter(p => p.delegable).map(p => [p.name, path.resolve(p.path)]))
       model = { ...model, execution: 'cli', cli: { backends, projects } }
+    }
+    // 宿主环境快照事实：全部取自当前进程与有效配置；源码工作区即 agents-master 注册路径。
+    model = {
+      ...model,
+      hostEnvironment: {
+        releaseId: readPackagedReleaseId(process.cwd(), coordinationPreviewReleaseId),
+        modelName: config.llm.model,
+        projects: config.projects,
+        discoveryRoots: config.workspace.roots,
+        cliProjects: parsed.execution === 'cli' ? config.projects.filter(p => p.delegable).map(p => p.name) : [],
+        sourceWorkspace: config.projects.find(p => p.name === 'agents-master')?.path,
+        configuredLevel: config.delegation.level,
+      },
     }
   }
   const worker = await startPreviewWorker({ dataDirectory: parsed.dataDirectory, socketPath: parsed.socketPath, model })

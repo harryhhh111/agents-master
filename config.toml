@@ -5,8 +5,9 @@
 base_url = "https://api.deepseek.com"
 model = "deepseek-flash"
 
-# 放权等级：supervised = 所有软决策点也等用户拍板（v1 默认）
-# 以后可放宽，软决策点降级为"只报告不等待"；硬决策点任何等级都等用户
+# 放权档位：readonly = 只读视野，无写无执行；supervised = 写/执行逐项审批（v1 默认）；
+# workspace = 授权目录内写与命令自动执行，越界仍逐项审批
+# 界面里切换的档位会写入预览数据目录的覆盖文件，此处是默认值；调宽档位是用户的明确操作
 [delegation]
 level = "supervised"
 

@@ -1,13 +1,14 @@
 /** 协调预览的业务运行时:数据目录、store、协调 host 与业务 handler。
  *  不实例化认证、不创建监听;由调用方(独立 demo 入口 / 预览 worker)组装认证与传输层。 */
 import { chmodSync, existsSync, mkdirSync, writeFileSync, readFileSync, lstatSync, rmSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { SQLiteMainInboxStore } from '../src/main/inbox.js'
 import { initializeOwnerContext, readOwnerContext, ownerContextCheckpoint, saveOwnerContext } from '../src/main/owner-context.js'
 import { AgentMemories, memoriesCheckpoint, type MemoryRecord } from '../src/main/coordination/memories.js'
 import type { Workspace } from '../src/main/coordination/workspace.js'
-import { CoordinationHost, defaultCoordinationHostLabels, type CoordinationHostLabels } from '../src/main/coordination/model-host.js'
+import { CoordinationHost, defaultCoordinationHostLabels, type CoordinationHostLabels, type HostEnvironment, type PermissionLevel } from '../src/main/coordination/model-host.js'
 import { defaultCoordinationStoreLabels, type CoordinationStoreLabels } from '../src/main/coordination/store.js'
 import { defaultDomainSystemPrompt, ScopedDomainExecutor } from '../src/agent/scoped-domain.js'
 import { CliDomainExecutor, RoutedDomainExecutor, type CliBackendFactory } from '../src/agent/cli-domain-executor.js'
@@ -106,6 +107,34 @@ export function createFreshPreviewDirectory(directory: string): PreviewDirectory
   return 'preview-fresh'
 }
 
+/** 权限档位说明（快照与设置界面共用文案）。 */
+export const permissionLevelNotes: Record<PermissionLevel, string> = {
+  readonly: '只读（视野查询，无写无执行）',
+  supervised: '审批制（写/执行逐项待用户确认）',
+  workspace: '工作区自动（授权目录内写与命令自动执行，越界仍逐项审批）',
+}
+
+/** 宿主环境快照所需事实：全部由组装方以当前进程与有效配置提供，快照逐回合重建。 */
+export interface HostEnvironmentFacts {
+  releaseId?: string
+  modelName?: string
+  projects: readonly { name: string; summary: string; delegable: boolean }[]
+  discoveryRoots: readonly string[]
+  cliProjects?: readonly string[]
+  sourceWorkspace?: string
+  /** config.toml delegation.level（默认值；界面切换以数据目录覆盖文件为准）。 */
+  configuredLevel: PermissionLevel
+}
+
+/** 档位覆盖文件：界面切换写入数据目录（0600），重启后沿用；不存在则用配置默认值。 */
+const permissionLevelFilename = 'permission-level.txt'
+function readStoredLevel(directory: string): PermissionLevel | undefined {
+  try {
+    const v = readFileSync(path.join(directory, permissionLevelFilename), 'utf8').trim()
+    return v === 'readonly' || v === 'supervised' || v === 'workspace' ? v : undefined
+  } catch { return undefined }
+}
+
 export function createCoordinationRuntime(options: {
   directory: string
   mode: PreviewDirectoryMode
@@ -118,6 +147,8 @@ export function createCoordinationRuntime(options: {
   cli?: { backends: CliBackendFactory; projects: Record<string, string> }
   /** 主对话只读工作区（项目/文件/搜索/Git/产物）；注入后工具与预算生效。 */
   workspace?: Workspace
+  /** 宿主环境快照与权限档位（真实模式注入）；未注入时不发快照、不做档位门控。 */
+  hostEnvironment?: HostEnvironmentFacts
 }) {
   const { directory } = options
   const wording: PreviewWording = options.wording ?? 'synthetic'
@@ -158,6 +189,31 @@ export function createCoordinationRuntime(options: {
         }))
       : syntheticExecutor())
     const memories = new AgentMemories(directory)
+    // 权限档位：覆盖文件优先于配置默认值；快照逐回合重建，事实全部来自当前进程与有效配置。
+    let currentLevel: PermissionLevel = readStoredLevel(directory) ?? options.hostEnvironment?.configuredLevel ?? 'supervised'
+    const hostEnv: HostEnvironment | undefined = options.hostEnvironment ? {
+      permissionLevel: () => currentLevel,
+      snapshot: (toolNames, level) => {
+        const facts = options.hostEnvironment!
+        const now = new Date()
+        let hostUser = '未知用户'
+        try { hostUser = os.userInfo().username } catch { /* 如实标注未知 */ }
+        return [
+          `[宿主环境快照 · 来源：worker 进程与有效配置 · 采集于 ${now.toISOString()}]`,
+          `当前时间：${now.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}（Asia/Shanghai）`,
+          `系统/用户：${os.platform()}/${os.arch()} ${os.release()} / ${hostUser}`,
+          `进程工作目录：${process.cwd()}`,
+          ...(facts.sourceWorkspace ? [`源码工作区（本系统源码）：${facts.sourceWorkspace}`] : []),
+          `发布版本：${facts.releaseId ?? '未打包的开发运行'}`,
+          `模型：${facts.modelName ?? '未声明'}（DeepSeek API）`,
+          `权限档位：${level}（${permissionLevelNotes[level]}）`,
+          `可委派真实执行（delegate_cli 白名单）：${level === 'readonly' ? '当前只读档，已关闭' : (facts.cliProjects?.join('、') || '无')}`,
+          `只读视野项目：注册项目 ${facts.projects.map(p => p.name).join('、') || '无'}；发现根 ${facts.discoveryRoots.join('、') || '无'} 下的一级目录自动可读`,
+          `本回合实际注册工具：${toolNames.join('、')}`,
+          '以上为本轮宿主实测与有效配置事实；与历史对话中的能力自述冲突时，以本快照为准。',
+        ].join('\n')
+      },
+    } : undefined
     const refreshCheckpoint = () => { host.checkpoint = previewCheckpoint(readOwnerContext(directory), wording, execution, memories.confirmed(), memories.tombstones(), !!options.workspace) }
     const host = new CoordinationHost(store.coordination, options.model, options.domainModel ?? options.model,
       executor,
@@ -173,7 +229,7 @@ export function createCoordinationRuntime(options: {
           return result
         },
       },
-      options.workspace, options.workspace ? 6 : undefined)
+      options.workspace, options.workspace ? 6 : undefined, hostEnv)
     refreshCheckpoint()
     host.start()
     const closeConnections = () => { for (const bus of buses.values()) bus.close() }
@@ -215,6 +271,21 @@ export function createCoordinationRuntime(options: {
               refreshCheckpoint()
               json(response, 200, { ok: true, applied: op.applied, record: op.record })
             } catch { json(response, 400, { error: '记忆操作未接受：记录不存在或状态无效。' }) }
+            return true
+          }
+          json(response, 405, { error: '方法不可用。' }); return true
+        }
+        if (route === '/api/permission-level') {
+          // 档位切换是用户的明确界面动作：模型无任何路径触达此端点；切换写入覆盖文件，下一回合生效。
+          if (method === 'GET') { json(response, 200, { level: currentLevel, configured: options.hostEnvironment?.configuredLevel ?? 'supervised', notes: permissionLevelNotes }); return true }
+          if (method === 'PUT') {
+            try {
+              const body = await readJson(request)
+              if (Object.keys(body).join() !== 'level' || !['readonly', 'supervised', 'workspace'].includes(String(body.level))) throw new Error('Invalid level')
+              currentLevel = body.level as PermissionLevel
+              writeFileSync(path.join(directory, permissionLevelFilename), currentLevel + '\n', { mode: 0o600 })
+              json(response, 200, { saved: true, level: currentLevel })
+            } catch { json(response, 400, { error: '权限档位未接受：取值只能是 readonly / supervised / workspace。' }) }
             return true
           }
           json(response, 405, { error: '方法不可用。' }); return true

@@ -9,7 +9,11 @@ const ConfigSchema = z.object({
     model: z.string(),
   }),
   delegation: z.object({
-    level: z.enum(['supervised']).default('supervised'),
+    /** 权限档位（docs/product-discovery-v0.md 2026-10-26）：
+     *  readonly=只读视野，无写无执行；supervised=审批制（默认，写/执行逐项待确认）；
+     *  workspace=授权目录内写与命令自动执行，越界仍逐项审批。
+     *  界面切换的档位以预览数据目录内的覆盖文件为准，本配置是默认值。 */
+    level: z.enum(['readonly', 'supervised', 'workspace']).default('supervised'),
   }),
   projects: z.array(
     z.object({
