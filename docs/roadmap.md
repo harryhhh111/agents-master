@@ -365,6 +365,24 @@ delegate_cli 受理回执仍是"已记录受限操作。{JSON}"原始形态，�
 沿用用户确认的 `delegation.level` 三档与默认逐项审批；验收增加环境自知、切档后的能力
 说明一致性及脱敏输入体积记录，不以提示词长度作为能力达标标准。
 
+2026-10-27 已上线（release `web-host-env-20261027-7ab5386`，commit `7ab5386`）：宿主环境
+快照 + 权限档位基础设施。主对话每回合在 system 之后、历史之前注入独立 user 角色快照
+（系统/内核/用户、当前时间 Asia/Shanghai、进程与源码工作目录、发布版本、模型、档位、
+delegate_cli 白名单、发现根、本回合实际注册工具清单），事实全部取自 worker 进程与有效
+配置；档位三档（readonly/supervised/workspace，默认 supervised 不变），覆盖文件
+`permission-level.txt`（0600）优先于配置默认，GET/PUT `/api/permission-level` 与设置弹窗
+radio 切档、下一回合生效；readonly 档宿主层不注册 delegate_cli 且 policy 换只读说明。
+typecheck + 418/418。
+
+同日真实模型验收（预览通道 socket 直测）：环境自知通过（模型逐字引用快照：内核
+6.6.117-45.1.oc9、采集时间、releaseId、deepseek-flash、supervised 档，并主动纠正其历史
+"感知不到运行环境"的旧自述）；切档一致性通过（切 readonly 后 delegate_cli 从工具清单消失、
+快照白名单行变为"当前只读档"，模型如实报告只能查询与合成演示；切回 supervised 恢复）；
+档位持久化文件写入与重读通过。已知模型保真瑕疵：DeepSeek-Flash 对被历史自述锚定的
+"逐字引用"请求会沿用上一轮措辞（把 readonly 说成 supervised），能力门控本身以实际注册
+工具为准不受影响；用户重启后首发提问恰逢旧回合风格延续，表现为"还是没感知"，属历史
+锚定而非快照缺失。待 Codex 独立复核 `7ab5386`。
+
 ### Runtime 接线约束
 
 - **当前模型别名与历史迁移**：`config.toml` 当前保留用户已批准的
